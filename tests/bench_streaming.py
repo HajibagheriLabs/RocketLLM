@@ -48,6 +48,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_streaming_gpu import cap_vram  # noqa: E402
+from rocketllm.hw import HardwareProfile  # noqa: E402
+from rocketllm.hw import caps  # noqa: E402
 
 RESULTS_DIR = REPO_ROOT / "bench_results"
 SCHEMA_VERSION = 1
@@ -58,87 +60,28 @@ UNAVAILABLE = None  # a metric this backend cannot report; never silently report
 # ---------------------------------------------------------------------------------------------
 # capability queries
 #
-# Nothing below branches on a device *name*. Each fact is asked for directly, and every answer of
-# "no" has a defined behaviour rather than an exception.
+# These now come from rocketllm.hw.caps, which is the single place allowed to ask the machine
+# anything. The bench keeps only the measurements that are scoped to one run -- peak memory and
+# per-process read counters -- because those describe the run, not the hardware.
 # ---------------------------------------------------------------------------------------------
 
-def pick_device(requested=None):
-    """Resolve the device to run on, preferring the fastest backend actually present."""
-    if requested:
-        return torch.device(requested)
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        return torch.device("cuda:0")
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return torch.device("xpu:0")
-    if hasattr(torch, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def device_sync(device):
-    """Block until queued device work has finished, where the backend has a notion of that."""
-    kind = device.type
-    if kind == "cuda" and torch.cuda.is_available():
-        torch.cuda.synchronize(device)
-    elif kind == "xpu" and hasattr(torch, "xpu"):
-        torch.xpu.synchronize()
-    elif kind == "mps" and hasattr(torch, "mps"):
-        torch.mps.synchronize()
-
-
-def supports_bf16(device):
-    kind = device.type
-    if kind == "cuda":
-        try:
-            return bool(torch.cuda.is_bf16_supported())
-        except Exception:
-            return UNAVAILABLE
-    if kind in ("xpu", "mps", "cpu"):
-        # Ask the backend by trying the smallest possible allocation rather than assuming.
-        try:
-            torch.zeros(1, dtype=torch.bfloat16, device=device)
-            return True
-        except Exception:
-            return False
-    return UNAVAILABLE
+pick_device = caps.resolve_device
+device_sync = caps.synchronize
+device_name = caps.device_name
+supports_bf16 = caps.supports_bf16
 
 
 def compute_capability(device):
-    if device.type == "cuda" and torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability(device)
-        return f"{major}.{minor}"
-    return UNAVAILABLE
+    cc = caps.compute_capability(device)
+    return f"{cc[0]}.{cc[1]}" if cc else UNAVAILABLE
 
 
 def device_total_bytes(device):
-    kind = device.type
-    if kind == "cuda" and torch.cuda.is_available():
-        return int(torch.cuda.get_device_properties(device).total_memory)
-    if kind == "xpu" and hasattr(torch, "xpu"):
-        try:
-            return int(torch.xpu.get_device_properties(device).total_memory)
-        except Exception:
-            return UNAVAILABLE
-    if kind == "mps" and hasattr(torch, "mps"):
-        try:
-            return int(torch.mps.recommended_max_memory())
-        except Exception:
-            return UNAVAILABLE
-    return UNAVAILABLE
+    return caps.device_memory(device)[0]
 
 
-def device_name(device):
-    kind = device.type
-    if kind == "cuda" and torch.cuda.is_available():
-        return torch.cuda.get_device_name(device)
-    if kind == "xpu" and hasattr(torch, "xpu"):
-        try:
-            return torch.xpu.get_device_properties(device).name
-        except Exception:
-            return "xpu"
-    if kind == "mps":
-        return "Apple Silicon (MPS)"
-    return platform.processor() or platform.machine() or "cpu"
+def host_ram_total_bytes():
+    return caps.host_memory()[0]
 
 
 def peak_device_bytes(device):
@@ -164,27 +107,6 @@ def reset_peak_device_stats(device):
             torch.xpu.reset_peak_memory_stats()
         except Exception:
             pass
-
-
-def host_ram_total_bytes():
-    if os.name == "nt":
-        class _MemStatus(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong),
-                        ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong),
-                        ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        status = _MemStatus()
-        status.dwLength = ctypes.sizeof(_MemStatus)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            return int(status.ullTotalPhys)
-        return UNAVAILABLE
-    try:
-        return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
-    except (ValueError, OSError, AttributeError):
-        return UNAVAILABLE
 
 
 def peak_host_rss_bytes():
@@ -260,41 +182,46 @@ def storage_backing(path):
 
 
 # ---------------------------------------------------------------------------------------------
-# hardware profile (stub)
+# hardware profile
 #
-# rocketllm/hw/profile.py will own this and will measure bandwidths rather than only querying
-# sizes. Until then the bench probes what it can, and every record carries the result: a number
-# without the machine it came from cannot be compared to anything.
+# The real thing now, from rocketllm.hw: measured bandwidths for every tier plus every derived
+# tuning knob. A result without the machine it came from cannot be compared to anything, so the
+# whole profile goes into the record -- including what the engine decided to do with it, since a
+# future run that picks different knobs is not measuring the same configuration.
 # ---------------------------------------------------------------------------------------------
 
-def probe_hardware(device, checkpoint_hint=None):
-    profile = {
-        "schema": "stub-v0",
-        "note": "probed by the benchmark; superseded by rocketllm/hw/profile.py once it lands",
-        "backend": device.type,
-        "device": device_name(device),
-        "device_total_bytes": device_total_bytes(device),
-        "compute_capability": compute_capability(device),
-        "bf16_supported": supports_bf16(device),
-        "pinned_memory_available": bool(device.type == "cuda" and torch.cuda.is_available()),
-        "async_copy_streams_available": bool(device.type == "cuda" and torch.cuda.is_available()),
-        "host_ram_total_bytes": host_ram_total_bytes(),
-        "cpu_count": os.cpu_count(),
-        "platform": platform.platform(),
-        "machine": platform.machine(),
-        "weights_storage": storage_backing(checkpoint_hint) if checkpoint_hint else UNAVAILABLE,
-        # Not probed yet. These are what actually set the per-tier cost in the performance model,
-        # and guessing them would be worse than admitting they are missing.
-        "host_to_device_bandwidth_bytes_per_s": UNAVAILABLE,
-        "storage_read_bandwidth_bytes_per_s": UNAVAILABLE,
+def probe_hardware(device, weights_path=None, reprofile=False):
+    profile = HardwareProfile.load_or_probe(weights_path=weights_path, device=str(device),
+                                            reprofile=reprofile)
+    as_dict = profile.to_dict()
+    # `profile_key` is what the comparison guard and the result filename key off. Keeping the name
+    # means records written before this module existed still line up.
+    as_dict["profile_key"] = profile.fingerprint
+    return as_dict
+
+
+def hardware_identity(profile):
+    """The fields that decide whether two runs happened on the same machine.
+
+    Read from the profile rather than trusting its fingerprint: the fingerprint is a hash whose
+    recipe can change between versions, and when it does, every stored record would suddenly look
+    like a different machine. The underlying facts do not move like that.
+    """
+    def cc(value):
+        if isinstance(value, (list, tuple)):
+            return ".".join(str(part) for part in value)
+        return str(value) if value is not None else None
+
+    return {
+        "backend": profile.get("backend"),
+        # `device` is the older stub's spelling of the same field.
+        "device": profile.get("device_name") or profile.get("device"),
+        "device_total_bytes": profile.get("device_total_bytes"),
+        "compute_capability": cc(profile.get("compute_capability")),
+        "host_total_bytes": (profile.get("host_total_bytes")
+                             or profile.get("host_ram_total_bytes")),
+        "machine": (profile.get("versions") or {}).get("machine") or profile.get("machine"),
     }
-    # Identity of the machine, for the comparison guard. Deliberately excludes software versions:
-    # those matter, but they are a separate axis and warned about rather than refused.
-    identity = "|".join(str(profile[k]) for k in
-                        ("backend", "device", "device_total_bytes", "compute_capability",
-                         "host_ram_total_bytes", "machine"))
-    profile["profile_key"] = hashlib.sha256(identity.encode()).hexdigest()[:16]
-    return profile
 
 
 def software_env():
@@ -567,6 +494,12 @@ def run(args, device):
 
         device_tier_bytes = resident_bytes(model.model)
 
+        # Probe before the run, never after: the allocator probe resets peak memory stats, and the
+        # storage sweep reads through the checkpoint. Both would corrupt the numbers if they ran
+        # between generation and the point where those numbers are collected.
+        hardware = probe_hardware(device, weights_path=getattr(model, "checkpoint_path", None),
+                                  reprofile=args.reprofile)
+
         # Only the generation run is measured: the one-time checkpoint split and the resident
         # loads that precede it are setup, not per-token cost.
         meters.reset()
@@ -595,12 +528,12 @@ def run(args, device):
 
     return build_record(args, device, meters, marker, totals, device_tier_bytes,
                         prompt_tokens, new_tokens, wall_seconds, build_seconds,
-                        peak_device, physical_before, physical_after, text, model)
+                        peak_device, physical_before, physical_after, text, model, hardware)
 
 
 def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt_tokens,
                  new_tokens, wall_seconds, build_seconds, peak_device,
-                 physical_before, physical_after, text, model):
+                 physical_before, physical_after, text, model, hardware):
     # The first mark closes prefill; everything after it is decode. Counters are snapshotted at
     # each mark, so the prefill/decode byte split falls out without a second run.
     marks = marker.marks
@@ -630,7 +563,7 @@ def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt
     record = {
         "schema_version": SCHEMA_VERSION,
         "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "hardware_profile": probe_hardware(device, getattr(model, "checkpoint_path", None)),
+        "hardware_profile": hardware,
         "software": software_env(),
         "run": {
             "model": args.model,
@@ -750,15 +683,34 @@ def print_report(record):
     print(f"  model         {run_info['model']}")
     print(f"  tokens        {run_info['prompt_tokens']} prompt -> {run_info['new_tokens']} generated")
     print(f"  dtype         {run_info['dtype']}")
-    print(f"  device        {profile['device']}  [{profile['backend']}]  "
-          f"cc {fmt(profile['compute_capability'])}")
-    print(f"  device memory {human_bytes(profile['device_total_bytes'])}   "
-          f"host RAM {human_bytes(profile['host_ram_total_bytes'])}")
+    identity = hardware_identity(profile)
+    print(f"  device        {identity['device']}  [{identity['backend']}]  "
+          f"cc {fmt(identity['compute_capability'])}")
+    print(f"  device memory {human_bytes(identity['device_total_bytes'])}   "
+          f"host RAM {human_bytes(identity['host_total_bytes'])}")
     cap = "none requested" if run_info["max_vram_gb"] is None else f"{run_info['max_vram_gb']}GB"
-    print(f"  bf16          {fmt(profile['bf16_supported'])}    "
-          f"pinned {profile['pinned_memory_available']}    "
+    dtypes = profile.get("dtypes") or {}
+    print(f"  bf16          {fmt(dtypes.get('bf16'))}    "
+          f"pinned {fmt(profile.get('pinned_memory'))}    "
           f"vram cap {cap}")
-    print(f"  profile key   {profile['profile_key']}")
+    print(f"  profile key   {profile.get('profile_key')}")
+
+    # The knobs the profile chose for this run. A later run that derives different ones is not
+    # measuring the same configuration, so they belong next to the numbers they produced.
+    derived = profile.get("derived") or {}
+    if derived:
+        interesting = ("reserve_bytes", "host_cache_bytes", "io_workers",
+                       "compute_dtype", "kv_dtype", "quant_compute_path")
+        parts = []
+        for name in interesting:
+            entry = derived.get(name)
+            if not entry:
+                continue
+            value = entry["value"]
+            parts.append(f"{name}={human_bytes(value) if name.endswith('_bytes') else value}")
+        print(f"  knobs         {'  '.join(parts)}")
+    for warning in (profile.get("warnings") or []):
+        print(f"  ! {warning}")
 
     print()
     print("  BYTES PER TOKEN BY TIER  (the primary metric)")
@@ -851,12 +803,11 @@ def dig(record, path):
 def print_comparison(current, previous, forced):
     old_profile = previous.get("hardware_profile", {})
     new_profile = current["hardware_profile"]
-    if old_profile.get("profile_key") != new_profile.get("profile_key"):
-        differing = [key for key in ("backend", "device", "device_total_bytes",
-                                     "compute_capability", "host_ram_total_bytes", "machine")
-                     if old_profile.get(key) != new_profile.get(key)]
+    old_identity, new_identity = hardware_identity(old_profile), hardware_identity(new_profile)
+    if old_identity != new_identity:
+        differing = [key for key in old_identity if old_identity[key] != new_identity[key]]
         message = (f"hardware profiles differ ({', '.join(differing) or 'unknown fields'}): "
-                   f"{old_profile.get('device')} vs {new_profile.get('device')}")
+                   f"{old_identity.get('device')} vs {new_identity.get('device')}")
         if not forced:
             print(f"\nREFUSING TO COMPARE: {message}.\n"
                   f"Bytes per token is comparable across machines; timings are not. "
@@ -937,6 +888,8 @@ def main():
                         help="disable the prefetch worker so phase times stop overlapping")
     parser.add_argument("--no-sync-phases", action="store_true",
                         help="skip device synchronization; truer wall time, vaguer phase split")
+    parser.add_argument("--reprofile", action="store_true",
+                        help="re-measure the hardware profile instead of using the cached one")
     args = parser.parse_args()
 
     device = pick_device(args.device)

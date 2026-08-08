@@ -51,6 +51,9 @@ dev = [
     "pytest",
 ]
 
+[project.scripts]
+rocketllm = "rocketllm.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/hadihajibagheri/rocketllm"
 Source = "https://github.com/hadihajibagheri/rocketllm"

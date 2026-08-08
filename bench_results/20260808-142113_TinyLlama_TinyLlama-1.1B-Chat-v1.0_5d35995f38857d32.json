@@ -1,0 +1,270 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-08T14:21:13-0400",
+  "hardware_profile": {
+    "schema_version": 1,
+    "fingerprint": "5d35995f38857d32",
+    "probed_at": "2026-08-08T14:18:23-0400",
+    "probe_seconds": 0.6656089000025531,
+    "backend": "cuda",
+    "device_type": "cuda",
+    "device_name": "NVIDIA GeForce RTX 3080",
+    "device_count": 1,
+    "compute_capability": [
+      8,
+      6
+    ],
+    "architecture": "sm_86",
+    "driver_version": "591.86",
+    "runtime_version": "12.1",
+    "device_total_bytes": 10736762880,
+    "device_free_bytes": 9509535744,
+    "host_total_bytes": 17023365120,
+    "host_available_bytes": 9920327680,
+    "cpu_count": 8,
+    "device_memory_bandwidth": 659303587252.0559,
+    "host_to_device_pinned_bandwidth": 10603391367.245836,
+    "host_to_device_pageable_bandwidth": 6095430756.678574,
+    "storage": {
+      "path": "C:\\Users\\Hadi\\hf\\hub\\models--TinyLlama--TinyLlama-1.1B-Chat-v1.0\\snapshots\\fe8a4ea1ffedaf415f4da2f062534de366a451e6\\splitted_model",
+      "probed_real_shards": true,
+      "synthetic_probe": false,
+      "queue_depth_1_bytes_per_s": 568518759.5638883,
+      "by_concurrency": {
+        "1": 568518759.5638883,
+        "2": 2060146617.1205738,
+        "4": 1065771558.0858213,
+        "8": 1451740105.9373536,
+        "16": 1076818077.8669963
+      },
+      "best_bytes_per_s": 2060146617.1205738,
+      "saturating_concurrency": 2,
+      "page_cache_dropped": false,
+      "page_cache_influence": "likely: this platform cannot drop the page cache, so some reads may have been served from RAM",
+      "rotational": null,
+      "bytes_read": 260046848,
+      "seconds": 0.2365009999994072,
+      "error": null
+    },
+    "dtypes": {
+      "bf16": true,
+      "fp16": true,
+      "fp8": false,
+      "fp4": false
+    },
+    "pinned_memory": true,
+    "async_copy_streams": true,
+    "triton": false,
+    "fused_4bit": {
+      "torch_int4pack": true,
+      "bitsandbytes": false,
+      "awq": false,
+      "gptq": false,
+      "marlin": false,
+      "any_usable": true
+    },
+    "allocator": {
+      "peak_allocated_bytes": 72497152,
+      "peak_reserved_bytes": 77594624,
+      "fragmentation_ratio": 0.06569362331081081,
+      "workspace_bytes": 54525952,
+      "expandable_segments": false
+    },
+    "versions": {
+      "python": "3.10.11",
+      "torch": "2.5.1+cu121",
+      "platform": "Windows-10-10.0.19044-SP0",
+      "machine": "AMD64",
+      "executable": "python.exe"
+    },
+    "derived": {
+      "reserve_bytes": {
+        "value": 705336856,
+        "formula": "min(max(measured_workspace, total_device * measured_fragmentation_ratio), total_device * reserve_ceiling_fraction)",
+        "inputs": {
+          "total_device_bytes": 10736762880,
+          "measured_workspace_bytes": 54525952,
+          "measured_fragmentation_ratio": 0.06569362331081081,
+          "reserve_ceiling_fraction": 0.25,
+          "ceiling_bytes": 2684190720
+        },
+        "source": "derived"
+      },
+      "host_cache_bytes": {
+        "value": 4108995584,
+        "formula": "max(0, (host_available - host_total * os_headroom_fraction) * host_cache_fraction)",
+        "inputs": {
+          "host_total_bytes": 17023365120,
+          "host_available_bytes": 9920327680,
+          "os_headroom_fraction": 0.1,
+          "os_headroom_bytes": 1702336512,
+          "host_cache_fraction": 0.5
+        },
+        "source": "derived"
+      },
+      "io_workers": {
+        "value": 2,
+        "formula": "clamp(measured_saturating_concurrency, 1, cpu_count)",
+        "inputs": {
+          "measured_saturating_concurrency": 2,
+          "cpu_count": 8,
+          "measured_by_concurrency": {
+            "1": 568518759.5638883,
+            "2": 2060146617.1205738,
+            "4": 1065771558.0858213,
+            "8": 1451740105.9373536,
+            "16": 1076818077.8669963
+          }
+        },
+        "source": "derived"
+      },
+      "window_budget_bytes": {
+        "value": 5015713012,
+        "formula": "(total_device - reserve) * window_fraction",
+        "inputs": {
+          "total_device_bytes": 10736762880,
+          "reserve_bytes": 705336856,
+          "usable_device_bytes": 10031426024,
+          "window_fraction": 0.5
+        },
+        "source": "derived"
+      },
+      "usable_device_bytes": {
+        "value": 10031426024,
+        "formula": "total_device - reserve",
+        "inputs": {
+          "total_device_bytes": 10736762880,
+          "reserve_bytes": 705336856
+        },
+        "source": "derived"
+      },
+      "compute_dtype": {
+        "value": "bfloat16",
+        "formula": "bf16 where the backend supports it",
+        "inputs": {
+          "dtype_support": {
+            "bf16": true,
+            "fp16": true,
+            "fp8": false,
+            "fp4": false
+          }
+        },
+        "source": "derived"
+      },
+      "kv_dtype": {
+        "value": "int4",
+        "formula": "int4 when usable_device < host_total: the device is the smaller pool, so context length is what runs out first",
+        "inputs": {
+          "usable_device_bytes": 10031426024,
+          "host_total_bytes": 17023365120,
+          "compute_dtype": "bfloat16",
+          "note": "a machine-level default; the most recent tokens stay in an fp16 residual window regardless of this choice"
+        },
+        "source": "derived"
+      },
+      "quant_compute_path": {
+        "value": "fused_packed",
+        "formula": "fused_packed: a fused 4-bit kernel is present and the device can run it",
+        "inputs": {
+          "kernels_found": [
+            "torch_int4pack"
+          ],
+          "device_can_run_them": true,
+          "native_fp4": false
+        },
+        "source": "derived"
+      },
+      "speculative_recommended": {
+        "value": true,
+        "formula": "device_memory_bandwidth / slowest_weight_tier_bandwidth >= speculative_amortization_threshold",
+        "inputs": {
+          "device_memory_bandwidth": 659303587252.0559,
+          "slowest_weight_tier_bandwidth": 2060146617.1205738,
+          "amortization_ratio": 320.02750764096174,
+          "threshold": 10.0
+        },
+        "source": "derived"
+      }
+    },
+    "warnings": [
+      "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is not set; the caching allocator will fragment more under a streaming workload. Set it before the first CUDA allocation."
+    ],
+    "policy": {
+      "reserve_ceiling_fraction": 0.25,
+      "os_headroom_fraction": 0.1,
+      "host_cache_fraction": 0.5,
+      "window_fraction": 0.5,
+      "speculative_amortization_threshold": 10.0,
+      "io_concurrency_improvement": 0.1,
+      "slow_storage_bytes_per_s": 150000000.0
+    },
+    "profile_key": "5d35995f38857d32"
+  },
+  "software": {
+    "python": "3.10.11",
+    "torch": "2.5.1+cu121",
+    "transformers": "4.51.3"
+  },
+  "run": {
+    "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "prompt_tokens": 6,
+    "new_tokens": 16,
+    "max_vram_gb": null,
+    "prefetching": true,
+    "sync_phases": true,
+    "dtype": "torch.bfloat16",
+    "output_preview": "<s> The capital of France is Paris.\n\n2. B. C. The capital of Canada is Ott"
+  },
+  "throughput": {
+    "wall_seconds": 67.42809799999668,
+    "model_build_seconds": 4.7540570000055595,
+    "prefill_seconds": 3.8399131999976817,
+    "prefill_tokens_per_second": 1.562535319809735,
+    "decode_seconds": 63.588184799999,
+    "decode_tokens_per_second": 0.23589287926961294
+  },
+  "bytes_per_token": {
+    "device": 128,
+    "host": 2200096768.0,
+    "storage": 2200119152.0
+  },
+  "bytes_total": {
+    "device_resident": 128,
+    "host_transferred": 35201548288,
+    "storage_read": 35201906432,
+    "storage_read_exact": true,
+    "storage_physical_read": null,
+    "prefill": {
+      "host": 2200096768,
+      "storage": 2200119152
+    },
+    "decode": {
+      "host": 33001451520,
+      "storage": 33001787280
+    }
+  },
+  "cache_hit_rate": {
+    "device": 0.0,
+    "host": 0.0,
+    "stub": true,
+    "note": "no tiered cache exists yet; every byte is fetched from storage every pass"
+  },
+  "phases_seconds": {
+    "storage_wait": 5.838655700521485,
+    "host_to_device": 13.370868599609821,
+    "dequant": 0.0011135998647660017,
+    "compute": 3.345057800062932,
+    "evict": 44.4738713999468,
+    "unattributed": 0.3985308999908739,
+    "storage_read_overlapped": 1.831253000018478,
+    "note": "storage_wait is what the forward actually blocked for; storage_read_overlapped is the loader's own read time, which runs on the prefetch worker and hides behind compute"
+  },
+  "counts": {
+    "storage_reads": 400,
+    "device_placements": 3216
+  },
+  "memory": {
+    "peak_device_bytes": 141316608,
+    "peak_host_rss_bytes": 1540169728
+  }
+}
