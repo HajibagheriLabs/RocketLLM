@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-08T06:47:18-0400",
+  "hardware_profile": {
+    "schema": "stub-v0",
+    "note": "probed by the benchmark; superseded by rocketllm/hw/profile.py once it lands",
+    "backend": "cuda",
+    "device": "NVIDIA GeForce RTX 3080",
+    "device_total_bytes": 10736762880,
+    "compute_capability": "8.6",
+    "bf16_supported": true,
+    "pinned_memory_available": true,
+    "async_copy_streams_available": true,
+    "host_ram_total_bytes": 17023365120,
+    "cpu_count": 8,
+    "platform": "Windows-10-10.0.19044-SP0",
+    "machine": "AMD64",
+    "weights_storage": "C:",
+    "host_to_device_bandwidth_bytes_per_s": null,
+    "storage_read_bandwidth_bytes_per_s": null,
+    "profile_key": "86252e3b2057424c"
+  },
+  "software": {
+    "python": "3.10.11",
+    "torch": "2.5.1+cu121",
+    "transformers": "4.51.3"
+  },
+  "run": {
+    "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "prompt_tokens": 6,
+    "new_tokens": 16,
+    "max_vram_gb": null,
+    "prefetching": true,
+    "sync_phases": true,
+    "dtype": "torch.bfloat16",
+    "output_preview": "<s> The capital of France is Paris.\n\n2. B. C. The capital of Canada is Ott"
+  },
+  "throughput": {
+    "wall_seconds": 68.48825619999843,
+    "model_build_seconds": 4.754194199998892,
+    "prefill_seconds": 4.4484764000008,
+    "prefill_tokens_per_second": 1.3487764035342351,
+    "decode_seconds": 64.03977979999763,
+    "decode_tokens_per_second": 0.2342294125127606
+  },
+  "bytes_per_token": {
+    "device": 128,
+    "host": 2200096768.0,
+    "storage": 2200119152.0
+  },
+  "bytes_total": {
+    "device_resident": 128,
+    "host_transferred": 35201548288,
+    "storage_read": 35201906432,
+    "storage_read_exact": true,
+    "storage_physical_read": null,
+    "prefill": {
+      "host": 2200096768,
+      "storage": 2200119152
+    },
+    "decode": {
+      "host": 33001451520,
+      "storage": 33001787280
+    }
+  },
+  "cache_hit_rate": {
+    "device": 0.0,
+    "host": 0.0,
+    "stub": true,
+    "note": "no tiered cache exists yet; every byte is fetched from storage every pass"
+  },
+  "phases_seconds": {
+    "storage_wait": 6.498816599963902,
+    "host_to_device": 12.24634200004948,
+    "dequant": 0.0011188000316906255,
+    "compute": 3.680424400008633,
+    "evict": 45.6682209999999,
+    "unattributed": 0.3933333999448223,
+    "storage_read_overlapped": 1.4794513000124425,
+    "note": "storage_wait is what the forward actually blocked for; storage_read_overlapped is the loader's own read time, which runs on the prefetch worker and hides behind compute"
+  },
+  "counts": {
+    "storage_reads": 400,
+    "device_placements": 3216
+  },
+  "memory": {
+    "peak_device_bytes": 141316608,
+    "peak_host_rss_bytes": 1556094976
+  }
+}

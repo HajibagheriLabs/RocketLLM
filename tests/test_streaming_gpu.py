@@ -18,14 +18,29 @@ python test_streaming_gpu.py --model meta-llama/Llama-3.3-70B-Instruct --max-vra
     --prompt "The capital of France is" --max-new-tokens 8
 """
 import argparse
+import sys
 import time
+from pathlib import Path
 
 import torch
 
+# Run as a plain script from a checkout, with or without an editable install: the package sits at
+# the repo root, which is not on the path when this file is executed directly.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 
 def cap_vram(max_vram_gb):
-    """Limit how much of the GPU this process may allocate, to emulate a smaller card."""
+    """Limit how much of the GPU this process may allocate, to emulate a smaller card.
+
+    Capping is a CUDA allocator feature, so it is gated on the capability rather than assumed:
+    on every other backend the request is reported as unavailable and the run continues at the
+    device's real size.
+    """
     if max_vram_gb is None:
+        return
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        print(f"--max-vram-gb {max_vram_gb} ignored: capping needs the CUDA allocator, "
+              f"which is unavailable on this backend")
         return
     total = torch.cuda.get_device_properties(0).total_memory
     frac = (max_vram_gb * (1024 ** 3)) / total
@@ -64,7 +79,14 @@ def run_reference(args):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    ref = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16).cuda().eval()
+    # transformers renamed this argument: `torch_dtype` up to 4.5x, `dtype` from 4.56 on, and the
+    # old name is gone in 5.x. We support both ends of that range, so try the current spelling and
+    # fall back rather than pinning the gate to one transformers generation.
+    try:
+        ref = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16)
+    except TypeError:
+        ref = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16)
+    ref = ref.cuda().eval()
     ids = tok([args.prompt], return_tensors="pt", return_attention_mask=False)["input_ids"].cuda()
     out = ref.generate(ids, max_new_tokens=args.max_new_tokens, do_sample=False)
     text = tok.decode(out[0])

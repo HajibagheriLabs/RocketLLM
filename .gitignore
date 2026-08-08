@@ -22,5 +22,5 @@ splitted_model/
 *.safetensors
 *.safetensors.done
 
-# Benchmark output
-bench_results/
+# Benchmark records are committed on purpose: a result is only meaningful next to the machine it
+# was measured on, and the point is to diff across steps and collect them across contributors.

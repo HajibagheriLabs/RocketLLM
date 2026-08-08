@@ -1,0 +1,964 @@
+"""Streaming benchmark harness.
+
+Every optimization in this project is judged here. The headline number is not tokens per second --
+that says more about the machine than about the engine -- it is BYTES MOVED PER TOKEN, BROKEN DOWN
+BY MEMORY TIER:
+
+    device    bytes served from weights already resident on the device (no read, no transfer)
+    host      bytes pushed across the host->device link
+    storage   bytes read out of the checkpoint on disk
+
+Those three tell you two things at once: whether a change actually moved less data, and which regime
+this particular machine is in. A model that fits in VRAM is a completely different problem from one
+that is ten times the size of VRAM, and the same patch can help one and do nothing for the other.
+
+Everything here is measured, not modelled. Byte counts come from wrapping the real loader and the
+real device-placement call; timings come from wrapping the same paths. Nothing is inferred from a
+tensor's declared size when the actual read can be observed instead.
+
+Usage
+-----
+# Baseline a small model and write a result record:
+python tests/bench_streaming.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --json
+
+# Emulate a 4GB card:
+python tests/bench_streaming.py --model Qwen/Qwen2.5-7B-Instruct --max-vram-gb 4 --json
+
+# Diff against a previous record:
+python tests/bench_streaming.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --compare-to bench_results/<previous>.json
+"""
+import argparse
+import ctypes
+import hashlib
+import json
+import os
+import platform
+import sys
+import threading
+import time
+from pathlib import Path
+
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Run from a plain checkout, with or without an editable install: the package sits at the repo
+# root and cap_vram lives next door with the correctness harness, so put both within reach.
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_streaming_gpu import cap_vram  # noqa: E402
+
+RESULTS_DIR = REPO_ROOT / "bench_results"
+SCHEMA_VERSION = 1
+
+UNAVAILABLE = None  # a metric this backend cannot report; never silently reported as zero
+
+
+# ---------------------------------------------------------------------------------------------
+# capability queries
+#
+# Nothing below branches on a device *name*. Each fact is asked for directly, and every answer of
+# "no" has a defined behaviour rather than an exception.
+# ---------------------------------------------------------------------------------------------
+
+def pick_device(requested=None):
+    """Resolve the device to run on, preferring the fastest backend actually present."""
+    if requested:
+        return torch.device(requested)
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.device("cuda:0")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu:0")
+    if hasattr(torch, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def device_sync(device):
+    """Block until queued device work has finished, where the backend has a notion of that."""
+    kind = device.type
+    if kind == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    elif kind == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.synchronize()
+    elif kind == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()
+
+
+def supports_bf16(device):
+    kind = device.type
+    if kind == "cuda":
+        try:
+            return bool(torch.cuda.is_bf16_supported())
+        except Exception:
+            return UNAVAILABLE
+    if kind in ("xpu", "mps", "cpu"):
+        # Ask the backend by trying the smallest possible allocation rather than assuming.
+        try:
+            torch.zeros(1, dtype=torch.bfloat16, device=device)
+            return True
+        except Exception:
+            return False
+    return UNAVAILABLE
+
+
+def compute_capability(device):
+    if device.type == "cuda" and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(device)
+        return f"{major}.{minor}"
+    return UNAVAILABLE
+
+
+def device_total_bytes(device):
+    kind = device.type
+    if kind == "cuda" and torch.cuda.is_available():
+        return int(torch.cuda.get_device_properties(device).total_memory)
+    if kind == "xpu" and hasattr(torch, "xpu"):
+        try:
+            return int(torch.xpu.get_device_properties(device).total_memory)
+        except Exception:
+            return UNAVAILABLE
+    if kind == "mps" and hasattr(torch, "mps"):
+        try:
+            return int(torch.mps.recommended_max_memory())
+        except Exception:
+            return UNAVAILABLE
+    return UNAVAILABLE
+
+
+def device_name(device):
+    kind = device.type
+    if kind == "cuda" and torch.cuda.is_available():
+        return torch.cuda.get_device_name(device)
+    if kind == "xpu" and hasattr(torch, "xpu"):
+        try:
+            return torch.xpu.get_device_properties(device).name
+        except Exception:
+            return "xpu"
+    if kind == "mps":
+        return "Apple Silicon (MPS)"
+    return platform.processor() or platform.machine() or "cpu"
+
+
+def peak_device_bytes(device):
+    """Peak device allocation for this process, where the backend tracks one."""
+    kind = device.type
+    if kind == "cuda" and torch.cuda.is_available():
+        return int(torch.cuda.max_memory_allocated(device))
+    if kind == "xpu" and hasattr(torch, "xpu"):
+        try:
+            return int(torch.xpu.max_memory_allocated(device))
+        except Exception:
+            return UNAVAILABLE
+    # MPS exposes only a current figure, not a high-water mark, and CPU has no separate device
+    # pool at all. Reporting either as 0 would read as "used no memory", which is a lie.
+    return UNAVAILABLE
+
+
+def reset_peak_device_stats(device):
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+    elif device.type == "xpu" and hasattr(torch, "xpu"):
+        try:
+            torch.xpu.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+
+def host_ram_total_bytes():
+    if os.name == "nt":
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        status = _MemStatus()
+        status.dwLength = ctypes.sizeof(_MemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullTotalPhys)
+        return UNAVAILABLE
+    try:
+        return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        return UNAVAILABLE
+
+
+def peak_host_rss_bytes():
+    """Process peak resident set size, straight from the OS -- no sampling thread, no estimate."""
+    if os.name == "nt":
+        class _ProcMemCounters(ctypes.Structure):
+            _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+        counters = _ProcMemCounters()
+        counters.cb = ctypes.sizeof(_ProcMemCounters)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # A HANDLE is pointer-sized; without an explicit restype ctypes truncates it to int on
+        # 64-bit and the call fails.
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        for library in ("psapi", "kernel32"):
+            try:
+                dll = ctypes.WinDLL(library, use_last_error=True)
+                # Windows moved this into kernel32 as K32GetProcessMemoryInfo; try both names.
+                func = getattr(dll, "GetProcessMemoryInfo", None) or \
+                    getattr(dll, "K32GetProcessMemoryInfo", None)
+                if func is None:
+                    continue
+                func.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ProcMemCounters), ctypes.c_ulong]
+                func.restype = ctypes.c_int
+                if func(kernel32.GetCurrentProcess(), ctypes.byref(counters),
+                        ctypes.sizeof(counters)):
+                    return int(counters.PeakWorkingSetSize)
+            except (OSError, AttributeError):
+                continue
+        return UNAVAILABLE
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports kilobytes, the BSDs and macOS report bytes.
+        return int(peak if sys.platform == "darwin" else peak * 1024)
+    except (ImportError, OSError):
+        return UNAVAILABLE
+
+
+def physical_read_bytes():
+    """Bytes this process pulled through the block layer, where the OS exposes that.
+
+    This is the one counter that separates a real disk read from a page-cache hit, which is the
+    difference between the storage tier and the host tier. Linux exposes it; most other platforms
+    do not, and there it is reported as unavailable rather than conflated with logical reads.
+    """
+    try:
+        with open("/proc/self/io", "r") as handle:
+            for line in handle:
+                if line.startswith("read_bytes:"):
+                    return int(line.split(":")[1].strip())
+    except (OSError, ValueError):
+        pass
+    return UNAVAILABLE
+
+
+def storage_backing(path):
+    """Best-effort description of what the weights are sitting on."""
+    try:
+        if os.name == "nt":
+            drive = os.path.splitdrive(os.path.abspath(str(path)))[0]
+            return drive or UNAVAILABLE
+        return f"dev:{os.stat(path).st_dev}"
+    except OSError:
+        return UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------------------------
+# hardware profile (stub)
+#
+# rocketllm/hw/profile.py will own this and will measure bandwidths rather than only querying
+# sizes. Until then the bench probes what it can, and every record carries the result: a number
+# without the machine it came from cannot be compared to anything.
+# ---------------------------------------------------------------------------------------------
+
+def probe_hardware(device, checkpoint_hint=None):
+    profile = {
+        "schema": "stub-v0",
+        "note": "probed by the benchmark; superseded by rocketllm/hw/profile.py once it lands",
+        "backend": device.type,
+        "device": device_name(device),
+        "device_total_bytes": device_total_bytes(device),
+        "compute_capability": compute_capability(device),
+        "bf16_supported": supports_bf16(device),
+        "pinned_memory_available": bool(device.type == "cuda" and torch.cuda.is_available()),
+        "async_copy_streams_available": bool(device.type == "cuda" and torch.cuda.is_available()),
+        "host_ram_total_bytes": host_ram_total_bytes(),
+        "cpu_count": os.cpu_count(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "weights_storage": storage_backing(checkpoint_hint) if checkpoint_hint else UNAVAILABLE,
+        # Not probed yet. These are what actually set the per-tier cost in the performance model,
+        # and guessing them would be worse than admitting they are missing.
+        "host_to_device_bandwidth_bytes_per_s": UNAVAILABLE,
+        "storage_read_bandwidth_bytes_per_s": UNAVAILABLE,
+    }
+    # Identity of the machine, for the comparison guard. Deliberately excludes software versions:
+    # those matter, but they are a separate axis and warned about rather than refused.
+    identity = "|".join(str(profile[k]) for k in
+                        ("backend", "device", "device_total_bytes", "compute_capability",
+                         "host_ram_total_bytes", "machine"))
+    profile["profile_key"] = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return profile
+
+
+def software_env():
+    import transformers
+    return {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+    }
+
+
+# ---------------------------------------------------------------------------------------------
+# meters
+# ---------------------------------------------------------------------------------------------
+
+class Meters:
+    """Byte and time counters, written from the forward thread and the prefetch worker alike."""
+
+    FIELDS = ("storage_bytes", "storage_seconds", "storage_reads",
+              "transfer_bytes", "transfer_seconds", "transfers",
+              "dequant_seconds", "compute_seconds", "storage_wait_seconds", "evict_seconds")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._compute_started = {}
+        self.storage_bytes_exact = True
+        for field in self.FIELDS:
+            setattr(self, field, 0 if field.endswith(("bytes", "reads", "transfers")) else 0.0)
+
+    def add(self, **kwargs):
+        with self._lock:
+            for key, value in kwargs.items():
+                setattr(self, key, getattr(self, key) + value)
+
+    def snapshot(self):
+        with self._lock:
+            return {field: getattr(self, field) for field in self.FIELDS}
+
+    def reset(self):
+        with self._lock:
+            for field in self.FIELDS:
+                setattr(self, field, 0 if field.endswith(("bytes", "reads", "transfers")) else 0.0)
+
+
+def diff_snapshots(later, earlier):
+    return {key: later[key] - earlier[key] for key in later}
+
+
+# ---------------------------------------------------------------------------------------------
+# instrumentation
+#
+# Wrappers only. The streaming code is not restructured for the benchmark; every patch here calls
+# straight through to the original and is removed again afterwards.
+# ---------------------------------------------------------------------------------------------
+
+class Instrumentation:
+    def __init__(self, meters, device, sync_phases):
+        self.meters = meters
+        self.device = device
+        self.sync_phases = sync_phases
+        self._originals = []
+
+    def _patch(self, obj, name, replacement):
+        self._originals.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, replacement)
+
+    def install(self):
+        """Patch before the model is built.
+
+        The streaming hooks are registered during construction and capture the bound method as it
+        is *then*, so wrapping the hooks afterwards would have no effect on an existing model.
+        """
+        import rocketllm.base as base
+
+        meters = self.meters
+        sync = self._sync
+
+        original_load_layer = base.load_layer
+        original_load_subset = base.load_layer_subset
+        original_place = base.set_module_tensor_to_device
+
+        def load_layer(local_path, layer_name, profiling=False):
+            start = time.perf_counter()
+            result = original_load_layer(local_path, layer_name, profiling)
+            elapsed = time.perf_counter() - start
+
+            state_dict = result[0] if isinstance(result, tuple) else result
+            shard = Path(local_path) / (layer_name + ".safetensors")
+            try:
+                # A whole-shard load reads the whole file, so the file itself is the exact number.
+                read_bytes = os.path.getsize(shard)
+            except OSError:
+                # Another persister (or another on-disk layout) -- fall back to what came back and
+                # flag the record, because that misses any container overhead.
+                read_bytes = sum(v.numel() * v.element_size() for v in state_dict.values())
+                meters.storage_bytes_exact = False
+            meters.add(storage_bytes=read_bytes, storage_seconds=elapsed, storage_reads=1)
+            return result
+
+        def load_layer_subset(local_path, layer_name, keys):
+            start = time.perf_counter()
+            result = original_load_subset(local_path, layer_name, keys)
+            elapsed = time.perf_counter() - start
+            # A subset read seeks to exactly these tensors, so their own size is what came off disk.
+            read_bytes = sum(v.numel() * v.element_size() for v in result.values())
+            meters.add(storage_bytes=read_bytes, storage_seconds=elapsed, storage_reads=1)
+            return result
+
+        def place(module, tensor_name, device, value=None, dtype=None, **kwargs):
+            # device='meta' is an eviction: it frees, it does not transfer.
+            evicting = str(device) == "meta"
+            start = time.perf_counter()
+            result = original_place(module, tensor_name, device, value=value, dtype=dtype, **kwargs)
+            if evicting:
+                return result
+            sync()
+            elapsed = time.perf_counter() - start
+            moved = 0
+            if value is not None:
+                itemsize = _itemsize(dtype) if dtype is not None else value.element_size()
+                moved = value.numel() * itemsize
+            meters.add(transfer_bytes=moved, transfer_seconds=elapsed, transfers=1)
+            return result
+
+        self._patch(base, "load_layer", load_layer)
+        self._patch(base, "load_layer_subset", load_layer_subset)
+        self._patch(base, "set_module_tensor_to_device", place)
+
+        model_cls = base.RocketModel
+        original_decompress = model_cls._decompress_state_dict
+        original_pre = model_cls._pre_hook
+        original_post = model_cls._post_hook
+
+        def decompress(model_self, state_dict):
+            start = time.perf_counter()
+            try:
+                return original_decompress(model_self, state_dict)
+            finally:
+                meters.add(dequant_seconds=time.perf_counter() - start)
+
+        def pre_hook(model_self, module, args):
+            # Whatever the pre-hook spends beyond placing and dequantizing the weights is time
+            # spent *obtaining* them: either blocking on the prefetch worker or reading inline.
+            # That wait is the storage tier's real cost to the critical path, and with prefetching
+            # on it is nowhere near the worker-thread read time -- so it has to be measured here
+            # rather than inferred from what the loader reported.
+            hook_started = time.perf_counter()
+            before = meters.snapshot()
+            result = original_pre(model_self, module, args)
+            sync()
+            hook_elapsed = time.perf_counter() - hook_started
+            after = meters.snapshot()
+            accounted = ((after["transfer_seconds"] - before["transfer_seconds"])
+                         + (after["dequant_seconds"] - before["dequant_seconds"]))
+            meters.add(storage_wait_seconds=max(0.0, hook_elapsed - accounted))
+
+            # Everything from here until the post hook is the module's own forward.
+            meters._compute_started[id(module)] = time.perf_counter()
+            return result
+
+        def post_hook(model_self, module, args, output):
+            started = meters._compute_started.pop(id(module), None)
+            if started is not None:
+                sync()
+                meters.add(compute_seconds=time.perf_counter() - started)
+            # Releasing the layer is its own phase, and not a free one: the post hook sends the
+            # weights back to meta and then collects. Folding it into "unattributed" would hide
+            # the single largest cost in the current pipeline.
+            evict_started = time.perf_counter()
+            try:
+                return original_post(model_self, module, args, output)
+            finally:
+                meters.add(evict_seconds=time.perf_counter() - evict_started)
+
+        self._patch(model_cls, "_decompress_state_dict", decompress)
+        self._patch(model_cls, "_pre_hook", pre_hook)
+        self._patch(model_cls, "_post_hook", post_hook)
+
+    def _sync(self):
+        if self.sync_phases:
+            device_sync(self.device)
+
+    def remove(self):
+        for obj, name, original in reversed(self._originals):
+            setattr(obj, name, original)
+        self._originals = []
+
+
+def _itemsize(dtype):
+    try:
+        return dtype.itemsize
+    except AttributeError:  # torch < 2.1
+        return torch.empty((), dtype=dtype).element_size()
+
+
+def resident_bytes(model):
+    """Bytes that live on the device between layers, and so are served without moving at all.
+
+    Measured at steady state, before generation: whatever is resident then is re-read from device
+    memory on every single token, which is exactly what the device tier means.
+    """
+    total = 0
+    seen = set()
+    for _, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+        if tensor is None or tensor.device.type == "meta":
+            continue
+        if id(tensor) in seen:  # tied weights are one allocation, not two
+            continue
+        seen.add(id(tensor))
+        total += tensor.numel() * tensor.element_size()
+    return total
+
+
+# ---------------------------------------------------------------------------------------------
+# the run
+# ---------------------------------------------------------------------------------------------
+
+def make_phase_marker(meters):
+    """A logits processor that timestamps every generation step, separating prefill from decode.
+
+    transformers calls the logits processors once per generated token, so the first call lands at
+    the end of prefill and each later one at the end of a decode step. Riding on the callback beats
+    running generation twice or reaching into the generation loop. Subclassing the real base class
+    keeps it acceptable to generate()'s processor-list validation.
+    """
+    from transformers import LogitsProcessor
+
+    class PhaseMarker(LogitsProcessor):
+        def __init__(self):
+            self.marks = []
+
+        def __call__(self, input_ids, scores):
+            self.marks.append((time.perf_counter(), meters.snapshot()))
+            return scores
+
+    return PhaseMarker()
+
+
+def load_model(args, device):
+    """Build the streaming model, bypassing the platform override in AutoModel.
+
+    AutoModel returns the MLX backend on macOS, which does not go through the streaming hooks this
+    harness measures. Selecting the class directly keeps the bench pointed at the streaming engine
+    on every platform; the MLX path needs its own harness.
+    """
+    import importlib
+    from rocketllm.auto_model import AutoModel
+
+    module_name, class_name = AutoModel.get_module_class(args.model)
+    model_cls = getattr(importlib.import_module(module_name), class_name)
+    print(f"streaming class: {class_name}")
+    return model_cls(args.model, device=str(device), prefetching=not args.no_prefetch)
+
+
+def run(args, device):
+    from transformers import LogitsProcessorList
+
+    meters = Meters()
+    instrumentation = Instrumentation(meters, device, sync_phases=not args.no_sync_phases)
+    instrumentation.install()
+
+    try:
+        build_started = time.perf_counter()
+        model = load_model(args, device)
+        build_seconds = time.perf_counter() - build_started
+
+        tokens = model.tokenizer([args.prompt], return_tensors="pt",
+                                 return_attention_mask=False)["input_ids"].to(device)
+        prompt_tokens = int(tokens.shape[-1])
+
+        device_tier_bytes = resident_bytes(model.model)
+
+        # Only the generation run is measured: the one-time checkpoint split and the resident
+        # loads that precede it are setup, not per-token cost.
+        meters.reset()
+        reset_peak_device_stats(device)
+        marker = make_phase_marker(meters)
+        physical_before = physical_read_bytes()
+
+        device_sync(device)
+        started = time.perf_counter()
+        output = model.generate(tokens,
+                                max_new_tokens=args.max_new_tokens,
+                                do_sample=False,
+                                use_cache=True,
+                                logits_processor=LogitsProcessorList([marker]),
+                                return_dict_in_generate=True)
+        device_sync(device)
+        wall_seconds = time.perf_counter() - started
+
+        physical_after = physical_read_bytes()
+        totals = meters.snapshot()
+        peak_device = peak_device_bytes(device)
+        text = model.tokenizer.decode(output.sequences[0])
+        new_tokens = int(output.sequences.shape[-1]) - prompt_tokens
+    finally:
+        instrumentation.remove()
+
+    return build_record(args, device, meters, marker, totals, device_tier_bytes,
+                        prompt_tokens, new_tokens, wall_seconds, build_seconds,
+                        peak_device, physical_before, physical_after, text, model)
+
+
+def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt_tokens,
+                 new_tokens, wall_seconds, build_seconds, peak_device,
+                 physical_before, physical_after, text, model):
+    # The first mark closes prefill; everything after it is decode. Counters are snapshotted at
+    # each mark, so the prefill/decode byte split falls out without a second run.
+    marks = marker.marks
+    if marks:
+        prefill_snapshot = marks[0][1]
+        decode_snapshot = diff_snapshots(totals, prefill_snapshot)
+    else:
+        prefill_snapshot = totals
+        decode_snapshot = {key: 0 for key in totals}
+
+    if len(marks) >= 2:
+        decode_seconds = marks[-1][0] - marks[0][0]
+        decode_steps = len(marks) - 1
+        prefill_seconds = wall_seconds - decode_seconds
+    else:
+        # A single generated token gives no decode interval to measure.
+        decode_seconds = UNAVAILABLE
+        decode_steps = 0
+        prefill_seconds = wall_seconds
+
+    per_token = (lambda value: value / new_tokens) if new_tokens else (lambda value: UNAVAILABLE)
+
+    physical = UNAVAILABLE
+    if physical_before is not None and physical_after is not None:
+        physical = physical_after - physical_before
+
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "hardware_profile": probe_hardware(device, getattr(model, "checkpoint_path", None)),
+        "software": software_env(),
+        "run": {
+            "model": args.model,
+            "prompt_tokens": prompt_tokens,
+            "new_tokens": new_tokens,
+            "max_vram_gb": args.max_vram_gb,
+            "prefetching": not args.no_prefetch,
+            "sync_phases": not args.no_sync_phases,
+            "dtype": str(model.running_dtype),
+            "output_preview": text[:200],
+        },
+        "throughput": {
+            "wall_seconds": wall_seconds,
+            "model_build_seconds": build_seconds,
+            "prefill_seconds": prefill_seconds,
+            "prefill_tokens_per_second": (prompt_tokens / prefill_seconds
+                                          if prefill_seconds and prefill_seconds > 0 else UNAVAILABLE),
+            "decode_seconds": decode_seconds,
+            "decode_tokens_per_second": (decode_steps / decode_seconds
+                                         if decode_seconds and decode_seconds > 0 else UNAVAILABLE),
+        },
+        "bytes_per_token": {
+            # Resident weights are re-read from device memory for every token, so the per-token
+            # figure is the resident footprint itself.
+            "device": device_tier_bytes if new_tokens else UNAVAILABLE,
+            "host": per_token(totals["transfer_bytes"]),
+            "storage": per_token(totals["storage_bytes"]),
+        },
+        "bytes_total": {
+            "device_resident": device_tier_bytes,
+            "host_transferred": totals["transfer_bytes"],
+            "storage_read": totals["storage_bytes"],
+            "storage_read_exact": meters.storage_bytes_exact,
+            "storage_physical_read": physical,
+            "prefill": {"host": prefill_snapshot["transfer_bytes"],
+                        "storage": prefill_snapshot["storage_bytes"]},
+            "decode": {"host": decode_snapshot["transfer_bytes"],
+                       "storage": decode_snapshot["storage_bytes"]},
+        },
+        "cache_hit_rate": {
+            "device": 0.0,
+            "host": 0.0,
+            "stub": True,
+            "note": "no tiered cache exists yet; every byte is fetched from storage every pass",
+        },
+        # The critical path: these four are sequential and sum toward wall time. The worker-thread
+        # read time is reported alongside them but deliberately kept out of the sum, because with
+        # prefetching on it runs underneath compute and adding it would double-count.
+        "phases_seconds": {
+            "storage_wait": totals["storage_wait_seconds"],
+            "host_to_device": totals["transfer_seconds"],
+            "dequant": totals["dequant_seconds"],
+            "compute": totals["compute_seconds"],
+            "evict": totals["evict_seconds"],
+            "unattributed": wall_seconds - (totals["storage_wait_seconds"]
+                                            + totals["transfer_seconds"]
+                                            + totals["dequant_seconds"]
+                                            + totals["compute_seconds"]
+                                            + totals["evict_seconds"]),
+            "storage_read_overlapped": totals["storage_seconds"],
+            "note": ("storage_wait is what the forward actually blocked for; "
+                     "storage_read_overlapped is the loader's own read time, which runs on the "
+                     "prefetch worker and hides behind compute"
+                     if not args.no_prefetch else
+                     "prefetching disabled, so storage_wait and storage_read_overlapped describe "
+                     "the same inline reads"),
+        },
+        "counts": {
+            "storage_reads": totals["storage_reads"],
+            "device_placements": totals["transfers"],
+        },
+        "memory": {
+            "peak_device_bytes": peak_device,
+            "peak_host_rss_bytes": peak_host_rss_bytes(),
+        },
+    }
+    return record
+
+
+# ---------------------------------------------------------------------------------------------
+# reporting
+# ---------------------------------------------------------------------------------------------
+
+def human_bytes(value):
+    if value is None:
+        return "unavailable"
+    step = 1024.0
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(value) < step or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= step
+    return f"{value:.1f} TB"
+
+
+def fmt(value, suffix="", digits=2):
+    if value is None:
+        return "unavailable"
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.{digits}f}{suffix}"
+    return f"{value}{suffix}"
+
+
+def print_report(record):
+    profile = record["hardware_profile"]
+    run_info = record["run"]
+    tp = record["throughput"]
+    bpt = record["bytes_per_token"]
+    totals = record["bytes_total"]
+    phases = record["phases_seconds"]
+
+    print()
+    print("=" * 78)
+    print("  RocketLLM streaming benchmark")
+    print("=" * 78)
+    print(f"  model         {run_info['model']}")
+    print(f"  tokens        {run_info['prompt_tokens']} prompt -> {run_info['new_tokens']} generated")
+    print(f"  dtype         {run_info['dtype']}")
+    print(f"  device        {profile['device']}  [{profile['backend']}]  "
+          f"cc {fmt(profile['compute_capability'])}")
+    print(f"  device memory {human_bytes(profile['device_total_bytes'])}   "
+          f"host RAM {human_bytes(profile['host_ram_total_bytes'])}")
+    cap = "none requested" if run_info["max_vram_gb"] is None else f"{run_info['max_vram_gb']}GB"
+    print(f"  bf16          {fmt(profile['bf16_supported'])}    "
+          f"pinned {profile['pinned_memory_available']}    "
+          f"vram cap {cap}")
+    print(f"  profile key   {profile['profile_key']}")
+
+    print()
+    print("  BYTES PER TOKEN BY TIER  (the primary metric)")
+    print(f"    device  (resident, no move)   {human_bytes(bpt['device'])}")
+    print(f"    host    (over the link)       {human_bytes(bpt['host'])}")
+    print(f"    storage (read from disk)      {human_bytes(bpt['storage'])}")
+    if not totals["storage_read_exact"]:
+        print("    note: storage bytes summed from tensors, not file sizes, on this layout")
+    if totals["storage_physical_read"] is not None:
+        print(f"    physical disk reads (total)   {human_bytes(totals['storage_physical_read'])}"
+              "  [rest served by page cache]")
+    else:
+        print("    physical disk reads           unavailable on this platform")
+
+    print()
+    print("  THROUGHPUT")
+    print(f"    prefill   {fmt(tp['prefill_seconds'], 's')}   "
+          f"{fmt(tp['prefill_tokens_per_second'], ' tok/s')}")
+    print(f"    decode    {fmt(tp['decode_seconds'], 's')}   "
+          f"{fmt(tp['decode_tokens_per_second'], ' tok/s')}")
+    print(f"    wall      {fmt(tp['wall_seconds'], 's')}   "
+          f"(model build {fmt(tp['model_build_seconds'], 's')}, excluded)")
+
+    print()
+    print("  WALL-CLOCK PHASES  (critical path, sums toward wall time)")
+    for label, key in (("storage wait", "storage_wait"), ("host -> device", "host_to_device"),
+                       ("dequant", "dequant"), ("compute", "compute"), ("evict", "evict"),
+                       ("unattributed", "unattributed")):
+        share = ""
+        if phases[key] is not None and tp["wall_seconds"]:
+            share = f"   {phases[key] / tp['wall_seconds']:6.1%}"
+        print(f"    {label:<16}{fmt(phases[key], 's'):>10}{share}")
+    print(f"    {'':<16}{'':>10}")
+    print(f"    storage read on the prefetch worker (overlapped, not in the sum above): "
+          f"{fmt(phases['storage_read_overlapped'], 's')}")
+    print(f"    {phases['note']}")
+
+    print()
+    print("  CACHE HIT RATE")
+    print(f"    device {record['cache_hit_rate']['device']:.0%}   "
+          f"host {record['cache_hit_rate']['host']:.0%}   "
+          f"({record['cache_hit_rate']['note']})")
+
+    print()
+    print("  PEAK MEMORY")
+    print(f"    device    {human_bytes(record['memory']['peak_device_bytes'])}")
+    print(f"    host rss  {human_bytes(record['memory']['peak_host_rss_bytes'])}")
+
+    print()
+    print("  TOTALS")
+    print(f"    storage read {human_bytes(totals['storage_read'])} in "
+          f"{record['counts']['storage_reads']} reads    "
+          f"host->device {human_bytes(totals['host_transferred'])} in "
+          f"{record['counts']['device_placements']} placements")
+    print(f"    prefill: {human_bytes(totals['prefill']['storage'])} storage / "
+          f"{human_bytes(totals['prefill']['host'])} host      "
+          f"decode: {human_bytes(totals['decode']['storage'])} storage / "
+          f"{human_bytes(totals['decode']['host'])} host")
+    print("=" * 78)
+
+
+# metric path, label, unit, whether a rise is an improvement
+COMPARED_METRICS = [
+    ("bytes_per_token.storage", "storage bytes/token", "bytes", False),
+    ("bytes_per_token.host", "host bytes/token", "bytes", False),
+    ("bytes_per_token.device", "device bytes/token", "bytes", True),
+    ("throughput.decode_tokens_per_second", "decode tok/s", "rate", True),
+    ("throughput.prefill_tokens_per_second", "prefill tok/s", "rate", True),
+    ("throughput.wall_seconds", "wall seconds", "seconds", False),
+    ("phases_seconds.storage_wait", "phase: storage wait", "seconds", False),
+    ("phases_seconds.host_to_device", "phase: host->device", "seconds", False),
+    ("phases_seconds.dequant", "phase: dequant", "seconds", False),
+    ("phases_seconds.compute", "phase: compute", "seconds", False),
+    ("phases_seconds.evict", "phase: evict", "seconds", False),
+    ("memory.peak_device_bytes", "peak device memory", "bytes", False),
+    ("memory.peak_host_rss_bytes", "peak host rss", "bytes", False),
+    ("cache_hit_rate.device", "cache hit rate (device)", "ratio", True),
+]
+
+
+def dig(record, path):
+    node = record
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return UNAVAILABLE
+        node = node[part]
+    return node
+
+
+def print_comparison(current, previous, forced):
+    old_profile = previous.get("hardware_profile", {})
+    new_profile = current["hardware_profile"]
+    if old_profile.get("profile_key") != new_profile.get("profile_key"):
+        differing = [key for key in ("backend", "device", "device_total_bytes",
+                                     "compute_capability", "host_ram_total_bytes", "machine")
+                     if old_profile.get(key) != new_profile.get(key)]
+        message = (f"hardware profiles differ ({', '.join(differing) or 'unknown fields'}): "
+                   f"{old_profile.get('device')} vs {new_profile.get('device')}")
+        if not forced:
+            print(f"\nREFUSING TO COMPARE: {message}.\n"
+                  f"Bytes per token is comparable across machines; timings are not. "
+                  f"Re-run with --force to compare anyway.")
+            return False
+        print(f"\nWARNING: {message}. Comparing anyway because --force was given. "
+              f"Treat every timing below as meaningless; only the byte counts carry over.")
+
+    old_software = previous.get("software", {})
+    if old_software != current["software"]:
+        print(f"\nnote: software differs -- was {old_software}, now {current['software']}")
+
+    old_run, new_run = previous.get("run", {}), current["run"]
+    for key in ("model", "prompt_tokens", "new_tokens", "prefetching", "sync_phases"):
+        if old_run.get(key) != new_run.get(key):
+            print(f"note: run config differs on {key}: {old_run.get(key)} -> {new_run.get(key)}")
+
+    print()
+    print("=" * 78)
+    print("  DELTA vs previous")
+    print("=" * 78)
+    print(f"  {'metric':<28}{'previous':>14}{'current':>14}{'change':>20}")
+    print("  " + "-" * 74)
+    for path, label, unit, higher_is_better in COMPARED_METRICS:
+        old_value, new_value = dig(previous, path), dig(current, path)
+        render = human_bytes if unit == "bytes" else (lambda v: fmt(v, "", 2))
+        if old_value is None or new_value is None:
+            print(f"  {label:<28}{render(old_value):>14}{render(new_value):>14}{'--':>20}")
+            continue
+        if old_value == 0:
+            change = "n/a (was 0)"
+        elif render(old_value) == render(new_value):
+            # Two values that print the same differ only below display resolution; quoting a
+            # percentage there would dress up noise as a result.
+            change = "same"
+        else:
+            pct = (new_value - old_value) / abs(old_value) * 100.0
+            better = (pct > 0) == higher_is_better
+            direction = "better" if abs(pct) > 0.5 and better else (
+                "worse" if abs(pct) > 0.5 else "same")
+            change = f"{pct:+.1f}%  {direction}"
+        print(f"  {label:<28}{render(old_value):>14}{render(new_value):>14}{change:>20}")
+    print("=" * 78)
+    return True
+
+
+def write_record(record, explicit_path=None):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    if explicit_path:
+        path = Path(explicit_path)
+    else:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        slug = record["run"]["model"].replace("/", "_").replace(":", "_")
+        key = record["hardware_profile"]["profile_key"]
+        path = RESULTS_DIR / f"{stamp}_{slug}_{key}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--prompt", default="The capital of France is")
+    parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument("--max-vram-gb", type=float, default=None,
+                        help="emulate a smaller device (CUDA allocator only)")
+    parser.add_argument("--device", default=None,
+                        help="override the auto-detected backend, e.g. cpu or cuda:1")
+    parser.add_argument("--json", action="store_true",
+                        help=f"write the result record under {RESULTS_DIR.name}/")
+    parser.add_argument("--out", default=None, help="explicit path for the result record")
+    parser.add_argument("--compare-to", default=None, help="a previous result record to diff against")
+    parser.add_argument("--force", action="store_true",
+                        help="compare across different hardware profiles anyway")
+    parser.add_argument("--no-prefetch", action="store_true",
+                        help="disable the prefetch worker so phase times stop overlapping")
+    parser.add_argument("--no-sync-phases", action="store_true",
+                        help="skip device synchronization; truer wall time, vaguer phase split")
+    args = parser.parse_args()
+
+    device = pick_device(args.device)
+    print(f"benchmark device: {device} ({device_name(device)})")
+    if device.type == "cpu":
+        print("note: CPU is a correctness target, not a performance one. Device-tier and "
+              "peak-device metrics will report as unavailable.")
+
+    cap_vram(args.max_vram_gb)
+
+    record = run(args, device)
+    print_report(record)
+
+    if args.json or args.out:
+        path = write_record(record, args.out)
+        print(f"\nwrote {path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path}")
+
+    if args.compare_to:
+        previous = json.loads(Path(args.compare_to).read_text(encoding="utf-8"))
+        if not print_comparison(record, previous, args.force):
+            raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()
