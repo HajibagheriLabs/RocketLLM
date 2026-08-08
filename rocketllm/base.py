@@ -12,6 +12,7 @@ from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer
 
+from .hw.caps import get_caps
 from .profiler import LayeredProfiler
 
 from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
@@ -156,11 +157,18 @@ class RocketModel:
         # Default to the model's native dtype (bf16 for most modern models). Forcing fp16 overflows
         # on deep models (e.g. Qwen3-235B's 94 layers) and produces garbage; bf16's wider range
         # avoids it. Users can still override via dtype=.
+        #
+        # The choice then goes through the device abstraction, which is what knows whether this
+        # hardware can actually run it. A checkpoint asking for bf16 on a card without bf16 used
+        # to be honoured as written; now it degrades to fp16 and says so once, because the failure
+        # mode otherwise is silently wrong tokens rather than an error.
+        self.caps = get_caps(self.running_device)
         if dtype is None:
             cfg_dtype = getattr(self.config, "torch_dtype", None)
             if isinstance(cfg_dtype, str):
                 cfg_dtype = getattr(torch, cfg_dtype, None)
-            dtype = cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.float16
+            requested = cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.float16
+            dtype = self.caps.select_compute_dtype(requested)
         self.running_dtype = dtype
         self.dtype = self.running_dtype
 
