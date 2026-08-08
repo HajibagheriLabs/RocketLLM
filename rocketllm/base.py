@@ -16,6 +16,8 @@ from transformers.quantizers import AutoHfQuantizer
 
 from .hw import caps
 from .hw.caps import get_caps
+from .hw.profile import HardwareProfile
+from .streaming import HostStagingPool
 from .profiler import LayeredProfiler
 
 from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
@@ -71,10 +73,6 @@ class RocketModel:
     attention/rotary/cache details: new model architectures work as soon as transformers supports
     them.
     """
-
-    # Upper bound on how much pinned (page-locked) host memory a single prefetched layer may use.
-    # Layers larger than this are loaded into ordinary pageable memory instead.
-    max_pinned_layer_bytes = 2 * 1024 ** 3
 
     # Subclasses override this to point at non-standard module names.
     def set_layer_names_dict(self):
@@ -186,6 +184,11 @@ class RocketModel:
         self._executor = ThreadPoolExecutor(max_workers=1) if self.prefetching else None
         self._prefetch_future = None
         self._prefetched_idx = None
+
+        # Staging buffers are sized from the machine, not from a constant. Probing is cached by
+        # hardware fingerprint, so this is a one-off cost; if it fails for any reason the pool
+        # runs with a zero budget, which means no pooling and no pinning -- slower, still correct.
+        self.staging_pool = HostStagingPool(self.caps, self._staging_budget_bytes())
 
         self.init_model()
 
@@ -608,8 +611,13 @@ class RocketModel:
                                         value=value, dtype=self.running_dtype)
 
     def _staging_buffer(self, count, dtype):
-        """A flat host buffer to pack a layer into, page-locked where the backend allows it."""
-        return self.caps.pinned_empty((count,), dtype)
+        """A flat host buffer to pack a layer into, reused across layers.
+
+        The pool hands the same page-locked buffer back for layers of the same size class, which
+        is what makes pinning affordable: allocated per layer it costs more than the transfer it
+        accelerates, allocated once it costs nothing per token.
+        """
+        return self.staging_pool.buffer(count, dtype)
 
     # Suffixes of the companion tensors that pre-quantized checkpoints ship alongside a weight
     # (fp8 block scales, compressed-tensors/MXFP4 packed payloads and their scales, GPTQ indices).
@@ -836,12 +844,29 @@ class RocketModel:
 
     # ---- lifecycle --------------------------------------------------------------------------
 
+    def _staging_budget_bytes(self):
+        """How much host memory the staging pool may hold, from the hardware profile."""
+        try:
+            self.profile = HardwareProfile.load_or_probe(weights_path=self.checkpoint_path,
+                                                         device=self.running_device)
+            return self.profile.derived["staging_pool_bytes"].value
+        except Exception as exc:  # noqa: BLE001 - loading must not fail over a tuning knob
+            self.profile = None
+            caps.announce_once(
+                "profile-unavailable",
+                f"could not build a hardware profile ({exc}); the staging pool runs unpooled, "
+                f"which is slower but produces the same result.", logging.INFO)
+            return 0
+
     def reset(self):
         """Release cached device blocks and host garbage. Between generations, never between them.
 
         A streaming run touches every layer on every token, so anything done per layer is done
         hundreds of times per token. Releasing memory is only worth paying for when something else
         might want it, which is when a generation ends.
+
+        Staging buffers deliberately survive: they are what makes the next generation cheap, and
+        holding them is the whole point of the pool. close() is what gives them back.
         """
         self._prefetch_future = None
         self._prefetched_idx = None
@@ -853,6 +878,7 @@ class RocketModel:
         if executor is not None:
             executor.shutdown(wait=True)
         self.prefetching = False
+        self.staging_pool.clear()
         self.reset()
 
     def __enter__(self):

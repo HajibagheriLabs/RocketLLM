@@ -49,6 +49,10 @@ class Policy:
     os_headroom_fraction: float = 0.10
     #: Share of what remains after that headroom which the host weight cache may claim.
     host_cache_fraction: float = 0.50
+    #: Share of the same remainder that reusable host staging buffers may hold. Kept well below
+    #: the cache's share: staging only needs the layers in flight, and page-locked memory cannot
+    #: be paged out, so over-claiming it hurts the whole machine rather than just this process.
+    staging_pool_fraction: float = 0.10
     #: Share of usable device memory a prefetch window may hold. The rest is for the KV cache,
     #: resident weights and activations.
     window_fraction: float = 0.50
@@ -71,6 +75,7 @@ _ENV_PREFIX = "ROCKETLLM_"
 _OVERRIDABLE = {
     "reserve_bytes": int,
     "host_cache_bytes": int,
+    "staging_pool_bytes": int,
     "io_workers": int,
     "window_fraction": float,
     "compute_dtype": str,
@@ -578,6 +583,7 @@ class HardwareProfile:
 
         self._derive_reserve(policy, chosen)
         self._derive_host_cache(policy, chosen)
+        self._derive_staging_pool(policy, chosen)
         self._derive_io_workers(policy, chosen)
         self._derive_window(policy, chosen)
         self._derive_dtypes(policy, chosen)
@@ -640,6 +646,31 @@ class HardwareProfile:
                       "os_headroom_fraction": policy.os_headroom_fraction,
                       "os_headroom_bytes": headroom,
                       "host_cache_fraction": policy.host_cache_fraction,
+                  }, overrides)
+
+    def _derive_staging_pool(self, policy, overrides):
+        """How much host memory reusable staging buffers may hold.
+
+        Staging buffers are where a layer is packed before its single transfer. Page-locking one
+        is a synchronizing driver call expensive enough to cost more than the transfer it speeds
+        up, so they are pooled rather than allocated per layer -- and a pool needs a budget.
+
+        Taken from the same measured base as the host cache, and as its own share rather than a
+        slice of it, so the two cannot silently compete. Zero is a valid answer on a loaded
+        machine: it means no pooling and no pinning, which must still work.
+        """
+        total = self.host_total_bytes or 0
+        available = self.host_available_bytes or 0
+        headroom = int(total * policy.os_headroom_fraction)
+        value = max(0, int((available - headroom) * policy.staging_pool_fraction))
+        self._set("staging_pool_bytes", value,
+                  "max(0, (host_available - host_total * os_headroom_fraction) "
+                  "* staging_pool_fraction)", {
+                      "host_total_bytes": total,
+                      "host_available_bytes": available,
+                      "os_headroom_fraction": policy.os_headroom_fraction,
+                      "os_headroom_bytes": headroom,
+                      "staging_pool_fraction": policy.staging_pool_fraction,
                   }, overrides)
 
     def _derive_io_workers(self, policy, overrides):
