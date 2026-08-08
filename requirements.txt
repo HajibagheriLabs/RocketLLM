@@ -1,0 +1,12 @@
+# Runtime dependencies, kept in step with [project.dependencies] in pyproject.toml.
+# `pip install -e .` is the supported install; this file exists for environments that want a
+# plain requirements pin. Accelerator and kernel packages are deliberately NOT here — install
+# them through the extras (`.[quant]`, `.[mlx]`) so a base install stays hardware-neutral.
+tqdm
+torch>=2.4
+transformers>=4.49,<5.13
+accelerate>=1.0
+safetensors
+huggingface-hub
+scipy
+sentencepiece

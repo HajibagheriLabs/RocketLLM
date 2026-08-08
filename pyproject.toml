@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rocketllm"
+version = "0.1.0"
+description = "Run language models far larger than your VRAM by streaming their weights layer by layer from storage."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Hadi Hajibagheri" }]
+maintainers = [{ name = "Hadi Hajibagheri" }]
+keywords = ["llm", "inference", "streaming", "quantization", "moe", "low-vram"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Base install must stay hardware-neutral: nothing here assumes a vendor, a kernel package or an
+# accelerator. Everything device-specific lives in an extra below and degrades gracefully when it
+# is absent.
+dependencies = [
+    "tqdm",
+    "torch>=2.4",
+    "transformers>=4.49,<5.13",
+    "accelerate>=1.0",
+    "safetensors",
+    "huggingface-hub",
+    "scipy",
+    "sentencepiece",
+]
+
+[project.optional-dependencies]
+# Checkpoints stored in these formats need their reader; nothing else does.
+quant = [
+    "bitsandbytes",
+    "compressed-tensors",
+]
+# Apple Silicon backend.
+mlx = [
+    "mlx",
+    "psutil",
+]
+dev = [
+    "pytest",
+]
+
+[project.urls]
+Homepage = "https://github.com/hadihajibagheri/rocketllm"
+Source = "https://github.com/hadihajibagheri/rocketllm"
+Issues = "https://github.com/hadihajibagheri/rocketllm/issues"
+
+[tool.setuptools.packages.find]
+include = ["rocketllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,30 @@
+RocketLLM
+Copyright 2026 Hadi Hajibagheri
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this software except in compliance with the License. You may obtain a copy of
+the License in the LICENSE file distributed with this work, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Any distribution of RocketLLM, in source or object form, and any derivative work
+based on it, must retain this NOTICE file and reproduce the attribution it
+contains, as required by Section 4(d) of the Apache License, Version 2.0.
+
+
+--------------------------------------------------------------------------------
+Third-party attribution
+--------------------------------------------------------------------------------
+
+RocketLLM is derived from AirLLM (https://github.com/lyogavin/airllm),
+Copyright Gavin Li and the AirLLM contributors, licensed under the Apache
+License, Version 2.0. The layer-streaming inference approach originates there.
+
+RocketLLM is an independent fork. It is not affiliated with, sponsored by, or
+endorsed by the AirLLM project or its authors.
+
+This distribution also contains the Baichuan tokenizer implementation in
+rocketllm/tokenization_baichuan.py, Copyright 2023 Baichuan Inc., based on work
+Copyright 2022 EleutherAI and the HuggingFace Inc. team, licensed under the
+Apache License, Version 2.0. Its original copyright headers are retained in that
+file as Section 4(c) requires.

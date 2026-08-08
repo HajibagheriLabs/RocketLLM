@@ -1,0 +1,26 @@
+# Editors / OS
+.idea
+.vscode
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local working notes, not part of the published project
+PLAYBOOK.md
+
+# Split layer shards and downloaded checkpoints
+splitted_model/
+*.safetensors
+*.safetensors.done
+
+# Benchmark output
+bench_results/

@@ -1,0 +1,10 @@
+# Normalize to LF in the repository and in the working tree. Contributors run every OS, and a
+# hook or shell script checked out with CRLF fails on Linux and macOS with a bad interpreter.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.safetensors binary
+
+# Notebooks are committed without their execution output, so their JSON diffs stay reviewable.
+*.ipynb text eol=lf
