@@ -1,4 +1,6 @@
 
+import logging
+from collections import OrderedDict
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 from pathlib import Path
@@ -12,6 +14,7 @@ from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer
 
+from .hw import caps
 from .hw.caps import get_caps
 from .profiler import LayeredProfiler
 
@@ -354,21 +357,10 @@ class RocketModel:
         else:
             state_dict = load_layer_output
 
-        if self.prefetching and torch.cuda.is_available():
-            # pin_memory() returns a pinned copy rather than pinning in place, so the result has to
-            # be kept for the faster host->device copy to actually happen. Pinned memory can't be
-            # paged out, so we only spend it on layers small enough to be safe: a frontier MoE
-            # checkpoint has ~17GB layers, and with prefetching two are in flight at once, which
-            # would lock up ~34GB of RAM for a copy that is dwarfed by the disk read anyway.
-            total_bytes = sum(v.numel() * v.element_size() for v in state_dict.values())
-            if total_bytes <= self.max_pinned_layer_bytes:
-                try:
-                    for k in state_dict.keys():
-                        state_dict[k] = state_dict[k].pin_memory()
-                except RuntimeError:
-                    # Out of pinned memory: fall back to pageable, which is slower but always works.
-                    pass
-
+        # These tensors are no longer what crosses the link: move_layer_to_device packs them into
+        # one staging buffer and transfers that. Pinning each of them here would page-lock the
+        # whole layer twice over -- once as sixty separate driver calls, once as the buffer -- to
+        # speed up a copy that now never happens. Only the staging buffer is worth pinning.
         return state_dict
 
     def _restore_plain_weight_modules(self, state_dict):
@@ -512,27 +504,112 @@ class RocketModel:
         )
 
     def move_layer_to_device(self, state_dict):
+        """Place a layer's weights on the device, in as few transfers as possible.
+
+        A decoder layer is on the order of sixty separate tensors. Sent one at a time, none of them
+        is large enough to reach link bandwidth, and the per-transfer overhead is paid sixty times.
+        So tensors that can share a buffer are packed into one contiguous staging buffer, sent in a
+        single transfer, and then bound as views into the device buffer -- no second copy, and one
+        allocation for the whole layer.
+
+        Grouping is by target dtype, which keeps the arithmetic obvious and still collapses a
+        typical all-bf16 layer to a single transfer. Anything that cannot be packed -- a param the
+        quantizer reconstructs itself, or one that errors on the way in -- falls back to being
+        placed on its own, because a slower correct path beats a faster broken one.
+        """
         self._restore_plain_weight_modules(state_dict)
         state_dict = self._decompress_state_dict(state_dict)
+
+        groups, individual = self._plan_transfer(state_dict)
+
         moved = []
-        for param_name in self._param_names_from_state_dict(state_dict):
-            if self.hf_quantizer is not None and self._needs_quantization(param_name):
-                # On-the-fly-quantizing schemes (e.g. bitsandbytes) reconstruct the param from the
-                # weight plus companion quant-state tensors carried in state_dict.
-                self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name,
-                                                         self.running_device, state_dict)
-            else:
-                # Normal load. Only ordinary high-precision tensors get cast to the runtime dtype;
-                # pre-quantized payloads must be placed verbatim (see _should_load_verbatim).
-                value = state_dict[param_name]
-                self._adopt_checkpoint_shape(param_name, value)
-                if self._should_load_verbatim(param_name, value):
-                    set_module_tensor_to_device(self.model, param_name, self.running_device, value=value)
-                else:
-                    set_module_tensor_to_device(self.model, param_name, self.running_device,
-                                                value=value, dtype=self.running_dtype)
+        for target_dtype, entries in groups.items():
+            if len(entries) < 2:
+                # One tensor is not a coalesce; packing it would just add a host-side copy.
+                individual.extend(name for name, _ in entries)
+                continue
+            try:
+                moved.extend(self._move_coalesced(entries, target_dtype))
+            except Exception as exc:  # noqa: BLE001 - correctness over throughput
+                caps.announce_once(
+                    "coalesce-fallback",
+                    f"could not coalesce a layer's transfers ({exc}); falling back to placing "
+                    f"tensors individually, which is slower but produces the same result.",
+                    logging.INFO)
+                individual.extend(name for name, _ in entries)
+
+        for param_name in individual:
+            self._move_one(param_name, state_dict)
             moved.append(param_name)
         return moved
+
+    def _plan_transfer(self, state_dict):
+        """Split a layer's params into coalescable groups and ones that must go on their own."""
+        groups = OrderedDict()
+        individual = []
+        for param_name in self._param_names_from_state_dict(state_dict):
+            if self.hf_quantizer is not None and self._needs_quantization(param_name):
+                # The quantizer reconstructs these from the weight plus companion quant-state
+                # tensors and does its own placement; there is no plain buffer to pack.
+                individual.append(param_name)
+                continue
+            value = state_dict[param_name]
+            self._adopt_checkpoint_shape(param_name, value)
+            target = value.dtype if self._should_load_verbatim(param_name, value) \
+                else self.running_dtype
+            groups.setdefault(target, []).append((param_name, value))
+        return groups, individual
+
+    def _move_coalesced(self, entries, target_dtype):
+        """Pack, send once, then bind each parameter as a view into the device buffer."""
+        total = sum(value.numel() for _, value in entries)
+        host = self._staging_buffer(total, target_dtype)
+
+        offset = 0
+        for _, value in entries:
+            count = value.numel()
+            # copy_ casts on the way in, so the transfer carries the runtime dtype, not the
+            # checkpoint's -- fewer bytes over the link when the checkpoint is wider.
+            host.narrow(0, offset, count).copy_(value.reshape(-1))
+            offset += count
+
+        with self.caps.copy_stream() as stream:
+            device_buffer = host.to(self.running_device, non_blocking=stream.is_async)
+            # The compute that follows runs on the default stream, so the copy has to be known
+            # complete before anything reads it. Overlapping the two is what the cache is for.
+            stream.synchronize()
+
+        moved = []
+        offset = 0
+        for param_name, value in entries:
+            count = value.numel()
+            view = device_buffer.narrow(0, offset, count).view(value.shape)
+            set_module_tensor_to_device(self.model, param_name, self.running_device, value=view)
+            offset += count
+            moved.append(param_name)
+        return moved
+
+    def _move_one(self, param_name, state_dict):
+        """Place a single parameter. The original path, kept intact as the fallback."""
+        if self.hf_quantizer is not None and self._needs_quantization(param_name):
+            # On-the-fly-quantizing schemes (e.g. bitsandbytes) reconstruct the param from the
+            # weight plus companion quant-state tensors carried in state_dict.
+            self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name,
+                                                     self.running_device, state_dict)
+            return
+        # Normal load. Only ordinary high-precision tensors get cast to the runtime dtype;
+        # pre-quantized payloads must be placed verbatim (see _should_load_verbatim).
+        value = state_dict[param_name]
+        self._adopt_checkpoint_shape(param_name, value)
+        if self._should_load_verbatim(param_name, value):
+            set_module_tensor_to_device(self.model, param_name, self.running_device, value=value)
+        else:
+            set_module_tensor_to_device(self.model, param_name, self.running_device,
+                                        value=value, dtype=self.running_dtype)
+
+    def _staging_buffer(self, count, dtype):
+        """A flat host buffer to pack a layer into, page-locked where the backend allows it."""
+        return self.caps.pinned_empty((count,), dtype)
 
     # Suffixes of the companion tensors that pre-quantized checkpoints ship alongside a weight
     # (fp8 block scales, compressed-tensors/MXFP4 packed payloads and their scales, GPTQ indices).

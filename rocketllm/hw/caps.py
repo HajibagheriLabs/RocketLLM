@@ -56,6 +56,11 @@ def _announce(key, message, level=logging.INFO):
     return True
 
 
+#: Public name for the once-per-process announcer, for engine code that needs to report a
+#: degradation of its own without inventing a second mechanism.
+announce_once = _announce
+
+
 def reset_announcements():
     """Forget what has already been announced. For tests that assert on the once-only behaviour."""
     with _warn_lock:

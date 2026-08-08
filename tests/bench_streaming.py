@@ -333,9 +333,14 @@ class Instrumentation:
         def place(module, tensor_name, device, value=None, dtype=None, **kwargs):
             # device='meta' is an eviction: it frees, it does not transfer.
             evicting = str(device) == "meta"
+            # A value already sitting on the target device is being *bound*, not moved -- that is
+            # what the coalesced path does once its single transfer has landed. Counting its bytes
+            # here would charge the link for data that never crossed it.
+            binding = (not evicting and value is not None
+                       and value.device.type == torch.device(str(device)).type)
             start = time.perf_counter()
             result = original_place(module, tensor_name, device, value=value, dtype=dtype, **kwargs)
-            if evicting:
+            if evicting or binding:
                 return result
             sync()
             elapsed = time.perf_counter() - start
@@ -396,7 +401,27 @@ class Instrumentation:
             finally:
                 meters.add(evict_seconds=time.perf_counter() - evict_started)
 
+        original_coalesced = getattr(model_cls, "_move_coalesced", None)
+
+        def move_coalesced(model_self, entries, target_dtype):
+            """The coalesced path stages a whole layer and sends it in one transfer.
+
+            All of that -- packing the staging buffer, the buffer itself, the copy -- is the cost
+            of getting the layer onto the device, so it is charged to the host->device phase. The
+            binds that follow are free and are skipped by the placement wrapper above.
+            """
+            nbytes = sum(value.numel() for _, value in entries) * _itemsize(target_dtype)
+            start = time.perf_counter()
+            try:
+                return original_coalesced(model_self, entries, target_dtype)
+            finally:
+                sync()
+                meters.add(transfer_bytes=nbytes,
+                           transfer_seconds=time.perf_counter() - start, transfers=1)
+
         self._patch(model_cls, "_decompress_state_dict", decompress)
+        if original_coalesced is not None:
+            self._patch(model_cls, "_move_coalesced", move_coalesced)
         self._patch(model_cls, "_pre_hook", pre_hook)
         self._patch(model_cls, "_post_hook", post_hook)
 
