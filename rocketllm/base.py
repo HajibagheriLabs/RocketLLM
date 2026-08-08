@@ -744,18 +744,55 @@ class RocketModel:
     def _post_hook(self, module, args, output):
         # module.to('meta') would also evict the experts, which manage their own lifetime, so with
         # expert streaming we only release exactly what this hook placed.
+        #
+        # Sending the weights to meta is all the releasing this needs to do. It used to also empty
+        # the allocator cache here, which handed the blocks back to the driver and made the next
+        # layer pay for a fresh, synchronizing allocation -- every layer, every token. Leaving the
+        # blocks in the pool lets the next layer reuse them, which is the whole point of a caching
+        # allocator. The expensive release now happens once per generation, in reset().
         if self.hf_quantizer is not None or getattr(self, '_expert_streaming', False):
             for param_name in getattr(module, '_rocketllm_moved', []):
                 set_module_tensor_to_device(self.model, param_name, 'meta')
         else:
             module.to('meta')
-        clean_memory()
         return output
+
+    # ---- lifecycle --------------------------------------------------------------------------
+
+    def reset(self):
+        """Release cached device blocks and host garbage. Between generations, never between them.
+
+        A streaming run touches every layer on every token, so anything done per layer is done
+        hundreds of times per token. Releasing memory is only worth paying for when something else
+        might want it, which is when a generation ends.
+        """
+        self._prefetch_future = None
+        self._prefetched_idx = None
+        clean_memory(self.running_device)
+
+    def close(self):
+        """Shut the model down for good: stop the prefetch worker and release everything."""
+        executor, self._executor = getattr(self, '_executor', None), None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        self.prefetching = False
+        self.reset()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
     # ---- delegation to the underlying transformers model ------------------------------------
 
     def generate(self, *args, **kwargs):
-        return self.model.generate(*args, **kwargs)
+        try:
+            return self.model.generate(*args, **kwargs)
+        finally:
+            # One release per generation, in place of one per layer per token.
+            self.reset()
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)

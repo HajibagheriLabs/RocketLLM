@@ -73,14 +73,21 @@ class NotEnoughSpaceException(Exception):
     pass
 
 # Function to clean RAM & vRAM
-def clean_memory():
+def clean_memory(device=None):
+    """Give freed memory back to the OS and the driver.
+
+    This is expensive: releasing device blocks makes the next allocation a fresh, synchronizing
+    driver call. It belongs between generations, not between layers -- see RocketModel.reset().
+    """
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception as ex:
         # maybe platform
         pass
-    torch.cuda.empty_cache()
+    # Routed through the device abstraction so this works on every backend, not just CUDA.
+    from .hw.caps import get_caps
+    get_caps(device, announce=False).empty_cache()
 
 
 def uncompress_layer_state_dict(layer_state_dict):
