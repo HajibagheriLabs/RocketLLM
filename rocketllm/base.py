@@ -19,7 +19,7 @@ from .hw.caps import get_caps
 from .hw.profile import HardwareProfile
 from .quant import detect_backend
 from .quant.safetensors_quant import announce_backend
-from .streaming import HostStagingPool
+from .streaming import HostStagingPool, WeightTransfer
 from .profiler import LayeredProfiler
 
 from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
@@ -176,6 +176,10 @@ class RocketModel:
         # hardware fingerprint, so this is a one-off cost; if it fails for any reason the pool
         # runs with a zero budget, which means no pooling and no pinning -- slower, still correct.
         self.staging_pool = HostStagingPool(self.caps, self._staging_budget_bytes())
+        # The copy stream, and the thing that owns a staged buffer's lifetime until its event
+        # fires. Built here because the pool has to know how to ask it for finished transfers
+        # before it decides it has no free buffer.
+        self.transfer = WeightTransfer(self.caps, pool=self.staging_pool)
 
         self.init_model()
 
@@ -458,9 +462,18 @@ class RocketModel:
         return groups, individual
 
     def _move_coalesced(self, entries, target_dtype):
-        """Pack, send once, then bind each parameter as a view into the device buffer."""
+        """Pack, send once, then bind each parameter as a view into the device buffer.
+
+        The transfer is issued on a dedicated copy stream and the compute stream is ordered behind
+        it by an event, rather than the CPU waiting for the copy to land. Nothing here blocks: the
+        binds below and the forward that follows are queued behind the event, so the copy overlaps
+        whatever the device is still working on. The host buffer is leased, not borrowed, and the
+        transfer layer holds that lease until its event has actually fired -- releasing it here
+        would let the next layer overwrite bytes still in flight.
+        """
         total = sum(value.numel() for _, value in entries)
-        host = self._staging_buffer(total, target_dtype)
+        lease = self.staging_pool.lease(total, target_dtype)
+        host = lease.view
 
         offset = 0
         for _, value in entries:
@@ -470,11 +483,7 @@ class RocketModel:
             host.narrow(0, offset, count).copy_(value.reshape(-1))
             offset += count
 
-        with self.caps.copy_stream() as stream:
-            device_buffer = host.to(self.running_device, non_blocking=stream.is_async)
-            # The compute that follows runs on the default stream, so the copy has to be known
-            # complete before anything reads it. Overlapping the two is what the cache is for.
-            stream.synchronize()
+        device_buffer = self.transfer.send_buffer(host, lease).resolve()
 
         moved = []
         offset = 0
@@ -703,6 +712,9 @@ class RocketModel:
         """
         self._prefetch_future = None
         self._prefetched_idx = None
+        # Nothing may be in flight when the allocator is asked to hand memory back, and a staged
+        # buffer cannot be freed while a copy is still reading it.
+        self.transfer.drain()
         clean_memory(self.running_device)
 
     def close(self):
@@ -711,6 +723,7 @@ class RocketModel:
         if executor is not None:
             executor.shutdown(wait=True)
         self.prefetching = False
+        self.transfer.close()
         self.staging_pool.clear()
         self.reset()
 

@@ -174,7 +174,7 @@ class TieredWeightCache:
                 self.stats["hits_device"] += 1
                 self._touch(entry)
                 entry.refcount += 1
-                return entry.payload
+                return self._resolve(entry)
 
             if entry is not None and entry.tier == "host":
                 # Served from RAM over the link rather than re-read from disk. On a storage-bound
@@ -187,7 +187,7 @@ class TieredWeightCache:
                 self.stats["promotions"] += 1
                 self._touch(entry)
                 entry.refcount += 1
-                return entry.payload
+                return self._resolve(entry)
 
             self.stats["misses"] += 1
             payload = self._fetch(key)
@@ -199,7 +199,25 @@ class TieredWeightCache:
             self._admit(entry)
             self._touch(entry)
             entry.refcount += 1
+            return self._resolve(entry)
+
+    def _resolve(self, entry):
+        """Settle a payload that is still arriving before handing it to the caller.
+
+        The streaming path returns a TransferHandle rather than a tensor: the copy has been issued
+        on the copy stream and has not necessarily landed. Resolving it queues a wait on the compute
+        stream -- a device-side dependency, so this does not block the CPU -- and gives back the
+        staged host buffer once the copy is known to have finished. That is what makes the transfer
+        overlap the previous layer's compute instead of costing wall-clock time here.
+
+        Payloads that are already plain values, which is everything in the tests and every non-
+        streaming caller, have no resolve() and pass straight through.
+        """
+        resolver = getattr(entry.payload, "resolve", None)
+        if resolver is None:
             return entry.payload
+        entry.payload = resolver()
+        return entry.payload
 
     def release(self, key):
         """Give up a claim on an entry. It becomes evictable once nobody holds it."""
