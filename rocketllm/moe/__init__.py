@@ -10,10 +10,12 @@ here may be designed around one.
 """
 from .detect import (LAYOUT_FUSED, LAYOUT_MODULE_LIST, ExpertContainer, ExpertLayout,
                      detect_expert_layout, resolve_top_k, summarize)
+from .expert_cache import ExpertRecord, ExpertResidency, ExpertStats, is_shared, shared_kind
 from .router import RouterSelection
 
 __all__ = [
     "detect_expert_layout", "summarize", "resolve_top_k",
     "ExpertLayout", "ExpertContainer", "LAYOUT_MODULE_LIST", "LAYOUT_FUSED",
     "RouterSelection",
+    "ExpertResidency", "ExpertStats", "ExpertRecord", "shared_kind", "is_shared",
 ]

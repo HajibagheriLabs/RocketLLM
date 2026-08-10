@@ -22,8 +22,9 @@ from .quant import detect_backend
 from .quant.safetensors_quant import announce_backend
 from .memory import (CLASS_ALWAYS, KIND_DENSE, PinCandidate, TieredWeightCache, expert_kind,
                      is_expert, pin_budget_from, plan_pins)
-from .moe import (LAYOUT_MODULE_LIST, ExpertContainer, ExpertLayout, RouterSelection,
-                  detect_expert_layout, resolve_top_k, summarize as summarize_experts)
+from .moe import (LAYOUT_MODULE_LIST, ExpertContainer, ExpertLayout, ExpertResidency,
+                  RouterSelection, detect_expert_layout, resolve_top_k, shared_kind,
+                  summarize as summarize_experts)
 from .streaming import HostStagingPool, LayerLoader, WeightTransfer
 from .profiler import LayeredProfiler
 
@@ -102,7 +103,7 @@ class RocketModel:
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
                  vram_reserve=None, host_cache_gb=None, io_workers=None, window_max=None,
-                 pin_policy="auto"):
+                 pin_policy="auto", expert_residency="auto"):
         """
         Parameters
         ----------
@@ -155,6 +156,11 @@ class RocketModel:
             "auto" (default) ranks candidates by access-frequency-per-packed-byte and fills the pin
             budget; "off" pins nothing and streams everything, which is the pure-streaming
             configuration and is what a device with no spare memory gets anyway.
+        expert_residency: str, optional
+            "auto" (default) counts how often each expert is routed to and keeps the popular ones
+            resident; "off" leaves a mixture's experts to the ordinary cache without ever pinning
+            one. Exists so the policy can be measured against its own absence on the same build,
+            and because a model that routes uniformly has nothing for it to exploit.
         """
 
         self.profiling_mode = profiling_mode
@@ -228,6 +234,10 @@ class RocketModel:
         if pin_policy not in ("auto", "off"):
             raise ValueError(f"pin_policy must be 'auto' or 'off', not {pin_policy!r}")
         self.pin_policy = pin_policy
+        if expert_residency not in ("auto", "off"):
+            raise ValueError(
+                f"expert_residency must be 'auto' or 'off', not {expert_residency!r}")
+        self.expert_residency = expert_residency
         self._layer_bytes = {}
 
         # Staging buffers are sized from the machine, not from a constant. Probing is cached by
@@ -642,9 +652,15 @@ class RocketModel:
         self._expert_streaming = False
         self._non_expert_keys = {}
         self._expert_layouts = {}
-        #: Cache key -> the checkpoint tensors that expert is made of, and what they cost packed.
-        self._expert_tensor_keys = {}
-        self._expert_byte_counts = {}
+        #: Cache key -> the checkpoint tensors that unit is made of, and what they cost packed. A
+        #: unit here is anything the mixture streams on its own: one routed expert, or one always-on
+        #: module beside them. Both are ordinary cache entries; only their policy differs.
+        self._unit_tensor_keys = {}
+        self._unit_byte_counts = {}
+        self.experts = ExpertResidency(
+            aging_interval=self._knob("expert_aging_interval", 4096),
+            replan_interval=self._knob("expert_replan_interval", 512),
+            enabled=self.expert_residency == "auto")
 
         # Both layouts read individual tensors -- or individual rows of one -- out of a shard, which
         # is a safetensors capability. Other persisters store something this cannot seek into.
@@ -654,6 +670,7 @@ class RocketModel:
         layer_prefix = self.layer_names_dict['layer_prefix']
         hooked_experts = 0
         fused_containers = 0
+        shared_modules = 0
         skipped = []
 
         for idx in self._streamed_indices:
@@ -679,24 +696,27 @@ class RocketModel:
                     if self._hook_fused_container(idx, layer_name, container):
                         accepted.append(container)
                         fused_containers += 1
+                        shared_modules += self._hook_shared_modules(idx, container, packed_bytes)
                     continue
                 count = self._hook_expert_modules(idx, container, packed_bytes)
                 if count:
                     accepted.append(container)
                     hooked_experts += count
+                    self._hook_router(idx, layer_name, container)
+                    shared_modules += self._hook_shared_modules(idx, container, packed_bytes)
 
             if not accepted:
                 continue
             # Recomputed rather than taken from the layout, because a container detection was happy
             # with may still have been rejected just above; its tensors have to go back to the
             # layer's own stream or nothing would ever load them.
-            owned = {key for container in accepted for key in container.keys}
+            owned = {key for container in accepted for key in container.owned_keys}
             self._non_expert_keys[idx] = [key for key in shapes if key not in owned]
             self._expert_layouts[idx] = ExpertLayout(containers=tuple(accepted),
                                                      other_keys=tuple(self._non_expert_keys[idx]))
 
         self._expert_streaming = bool(hooked_experts or fused_containers)
-        self._report_expert_streaming(hooked_experts, fused_containers, skipped)
+        self._report_expert_streaming(hooked_experts, fused_containers, shared_modules, skipped)
 
     def _layer_tensor_specs(self, layer_name):
         """Every tensor in a layer's shard, from the header alone -- shapes and packed sizes.
@@ -762,34 +782,81 @@ class RocketModel:
             except AttributeError:
                 continue
             key = (idx, expert_kind(expert_idx))
-            self._expert_tensor_keys[key] = keys
-            self._expert_byte_counts[key] = sum(packed_bytes.get(name, 0) for name in keys)
-            module._rocketllm_expert = key
-            module.register_forward_pre_hook(self._expert_pre_hook)
-            module.register_forward_hook(self._expert_post_hook)
+            size = self._register_unit(key, keys, packed_bytes, module)
+            self.experts.track_expert(key, idx, expert_idx, size)
             hooked += 1
         return hooked
 
+    def _register_unit(self, key, keys, packed_bytes, module):
+        """Make one module a cache entry of its own. Returns what it costs packed."""
+        size = sum(packed_bytes.get(name, 0) for name in keys)
+        self._unit_tensor_keys[key] = keys
+        self._unit_byte_counts[key] = size
+        module._rocketllm_unit = key
+        module.register_forward_pre_hook(self._unit_pre_hook)
+        module.register_forward_hook(self._unit_post_hook)
+        return size
+
+    def _hook_shared_modules(self, idx, container, packed_bytes):
+        """Give each always-on module beside the experts its own entry. Returns how many.
+
+        These are the shared experts. Streaming them with the layer would be correct but wasteful in
+        the other direction: they are read on every token, so they are the first thing that should
+        be resident, and bundling them into the layer's entry means the pin planner cannot keep the
+        small always-on parts without also keeping a large shared feed-forward it may have no room
+        for. Split out, they rank in their own class -- above every routed expert, below attention.
+        """
+        hooked = 0
+        for path, keys in container.shared_keys.items():
+            try:
+                module = self.layers[idx].get_submodule(path)
+            except AttributeError:
+                continue
+            key = (idx, shared_kind(path))
+            self.experts.track_shared(key, self._register_unit(key, keys, packed_bytes, module))
+            hooked += 1
+        return hooked
+
+    def _hook_router(self, idx, layer_name, container):
+        """Watch a layer's router, so its top-k is known the moment it is chosen.
+
+        This is the only lookahead a mixture allows. Layer L's router runs inside layer L, so the
+        instant it fires is the earliest anything can know which experts the layer needs -- and,
+        equally, the latest, because layer L+1's routing does not exist yet and never will until L
+        has finished. Returns the selection slot, or None when the router cannot be read, in which
+        case the layer simply loads its experts as they run.
+        """
+        if not container.router_path or container.top_k is None:
+            return None
+        try:
+            router = self.layers[idx].get_submodule(container.router_path)
+        except AttributeError:
+            return None
+        selection = RouterSelection(container.num_experts, container.top_k,
+                                    path=f"{layer_name}.{container.path}")
+        router._rocketllm_router = (idx, selection)
+        router.register_forward_hook(self._router_hook)
+        return selection
+
     def _hook_fused_container(self, idx, layer_name, container):
         """Watch the router, then stream the rows it chose into the fused tensor."""
-        layer = self.layers[idx]
         try:
-            experts = layer.get_submodule(container.path)
-            router = layer.get_submodule(container.router_path)
+            experts = self.layers[idx].get_submodule(container.path)
         except AttributeError:
             return False
 
-        selection = RouterSelection(container.num_experts, container.top_k,
-                                    path=f"{layer_name}.{container.path}")
-        router._rocketllm_selection = selection
-        router.register_forward_hook(self._router_hook)
+        selection = self._hook_router(idx, layer_name, container)
+        if selection is None:
+            # This layout cannot stream without the selection; detection only offers a fused
+            # container when the router was identified, so reaching here means the module moved.
+            return False
 
         experts._rocketllm_fused = (idx, container, selection)
         experts.register_forward_pre_hook(self._fused_pre_hook)
         experts.register_forward_hook(self._fused_post_hook)
         return True
 
-    def _report_expert_streaming(self, hooked_experts, fused_containers, skipped):
+    def _report_expert_streaming(self, hooked_experts, fused_containers, shared_modules, skipped):
         """Say what was found, at load, once. A user who lost the fast path has to be able to see."""
         for line in summarize_experts(self._expert_layouts):
             print(f"MoE: {line}")
@@ -800,26 +867,50 @@ class RocketModel:
         if fused_containers:
             print(f"fused-expert streaming: {fused_containers} containers read only the rows their "
                   f"router selects, so a token costs its own experts' bytes, not the layer's.")
+        if shared_modules:
+            shared_bytes = self.experts.report()["shared_bytes"]
+            print(f"shared experts: {shared_modules} always-on modules "
+                  f"({shared_bytes / 1024 ** 2:.1f}MB) are pinned ahead of any routed expert, "
+                  f"because every token reads them.")
+        if self._expert_streaming:
+            print(f"expert residency: popularity counted from the router's own selection, halved "
+                  f"every {self.experts.stats.aging_interval} firings, pins re-ranked every "
+                  f"{self.experts.replan_interval}.")
         for reason in dict.fromkeys(reason for _, reason in skipped):
             print(f"expert container streamed with its layer instead: {reason}")
 
-    def _expert_pre_hook(self, module, args):
-        """Hand an expert to the cache, exactly as a dense module's hook does.
+    def expert_report(self):
+        """What the mixture did, for the benchmark. ``None`` when the model has no experts."""
+        residency = getattr(self, "experts", None)
+        if residency is None:
+            return None
+        report = residency.report()
+        return report if report.get("experts") else None
+
+    def _unit_pre_hook(self, module, args):
+        """Hand one expert, or one always-on module, to the cache as a dense module's hook does.
 
         Going through the cache rather than reading the shard here is what stops a mixture paying
-        for the same expert on every token. An expert that is still resident from the last token
-        costs nothing; one that is not is read, and then competes for residency on its measured
-        popularity -- the LFU half of the cache's policy, which exists for precisely this and had no
-        caller until now.
-        """
-        self.cache.acquire(module._rocketllm_expert)
+        for the same expert on every token. One still resident from the last token costs nothing;
+        one that is not is read, and then competes for residency on its measured popularity -- the
+        LFU half of the cache's policy, which exists for precisely this.
 
-    def _expert_post_hook(self, module, args, output):
-        self.cache.release(module._rocketllm_expert)
+        By the time this runs the read has usually already been started: the router fired earlier in
+        this same layer and the whole top-k went to the prefetch workers together, so what happens
+        here is collecting a read in flight rather than beginning one.
+        """
+        self.cache.acquire(module._rocketllm_unit)
+
+    def _unit_post_hook(self, module, args, output):
+        self.cache.release(module._rocketllm_unit)
         return output
 
     def _router_hook(self, module, args, output):
-        module._rocketllm_selection.observe(output)
+        """A layer just routed. Start those reads and count the choice."""
+        idx, selection = module._rocketllm_router
+        selected = selection.observe(output)
+        if selected:
+            self.experts.on_router(idx, selected)
         return output
 
     def _fused_pre_hook(self, module, args):
@@ -906,7 +997,15 @@ class RocketModel:
             # usable_device_bytes was derived from the measured reserve, so an overridden reserve
             # has to be folded back in or the override would silently do nothing.
             total = self.profile.device_total_bytes or 0
-            device_bytes = max(0, total - int(self._overrides["reserve_bytes"]))
+            overridden = max(0, total - int(self._overrides["reserve_bytes"]))
+            # The window budget is a *share* of usable memory, so it has to move with it. Left at
+            # the value derived for the whole card it can exceed the overridden device budget
+            # outright, and since pinning gets what the window does not, the pin budget then
+            # collapses to zero and nothing is ever kept -- an override for a smaller card would
+            # silently disable residency rather than emulating one.
+            if device_bytes > 0:
+                window_budget = int(window_budget * overridden / device_bytes)
+            device_bytes = overridden
         pinned = self._plan_pins(device_bytes, window_budget, largest)
 
         self.cache = TieredWeightCache(
@@ -917,6 +1016,12 @@ class RocketModel:
             device_bytes=device_bytes, host_bytes=host_bytes, window=window, pinned=pinned,
             profile=self.profile, prefetch_workers=self._knob("io_workers", 1))
 
+        # The mixture needs the cache to prefetch into and to hand new pin plans to, and the cache
+        # needs the pin plan the mixture cannot produce until something has routed. They are wired
+        # to each other here, once both exist.
+        self.experts.cache = self.cache
+        self.experts.on_replan(self._replan_expert_pins)
+
         print(f"cache: window {window} layers, device budget "
               f"{device_bytes / 1024 ** 3:.1f}GB, host tier {host_bytes / 1024 ** 3:.1f}GB, "
               f"{len(pinned)} pinned, pin_policy={self.pin_policy}")
@@ -924,19 +1029,41 @@ class RocketModel:
     def _plan_pins(self, device_bytes, window_budget, largest):
         """Which modules to keep resident for the whole run.
 
-        Every streamed module here is touched once per token, so they all sit in the same priority
-        class and the ranking reduces to size: pinning the smallest first keeps the most of them,
-        which is what buys the hit rate. An MoE's experts are ranked separately by the placement
-        module and are not part of this list.
+        Dense modules are touched once per token, so they all sit in the same priority class and the
+        ranking reduces to size: pinning the smallest first keeps the most of them, which is what
+        buys the hit rate. A mixture adds two more classes below that -- its always-on modules, then
+        its routed experts ranked by the popularity actually observed -- and the class boundaries
+        are absolute, so no expert displaces the attention block every token reads.
+
+        At load nothing has routed yet, so the expert half of that list is empty and the plan is
+        dense-only. It is rebuilt from real counts once the mixture has been running; see
+        :meth:`_replan_expert_pins`.
         """
+        self._pin_budget = pin_budget_from(device_bytes, window_budget)
         if self.pin_policy == "off":
             return ()
-        budget = pin_budget_from(device_bytes, window_budget)
+        return plan_pins(self._pin_candidates(), self._pin_budget).pinned
+
+    def _pin_candidates(self):
         candidates = [PinCandidate(key=(idx, KIND_DENSE),
                                    packed_bytes=self._layer_packed_bytes(idx),
                                    priority=CLASS_ALWAYS, accesses_per_token=1.0)
                       for idx in self._streamed_indices]
-        return plan_pins(candidates, budget).pinned
+        candidates.extend(self.experts.pin_candidates())
+        return candidates
+
+    def _replan_expert_pins(self):
+        """Re-rank residency now that routing has been watched for a while.
+
+        Called on a cadence the profile derives rather than on every firing: acting on a ranking
+        that has barely moved costs an eviction and a re-read, which is more than the residency it
+        buys back. The budget itself does not change here -- only who deserves it.
+        """
+        if self.pin_policy == "off" or getattr(self, "cache", None) is None:
+            return None
+        plan = plan_pins(self._pin_candidates(), self._pin_budget)
+        self.cache.apply_plan(plan)
+        return plan
 
     def _load_streamed_layer(self, idx):
         """Load one streamed module's weights. Experts are excluded when they stream themselves."""
@@ -949,9 +1076,10 @@ class RocketModel:
 
     def _cache_fetch(self, key):
         """Storage tier: read a unit's tensors. Runs on a prefetch worker, so it only reads."""
-        if is_expert(key[1]):
+        keys = self._unit_tensor_keys.get(key)
+        if keys is not None:
             return _ResidentModule(key, host=load_layer_subset(
-                self.checkpoint_path, self.layer_names[key[0]], self._expert_tensor_keys[key]))
+                self.checkpoint_path, self.layer_names[key[0]], keys))
         return _ResidentModule(key, host=self._load_streamed_layer(key[0]))
 
     def _cache_to_device(self, resident):
@@ -1016,9 +1144,10 @@ class RocketModel:
         return upcoming
 
     def _packed_bytes(self, key):
-        """Packed bytes of one cached unit, dense module or single expert."""
-        if is_expert(key[1]):
-            return self._expert_byte_counts.get(key, 0)
+        """Packed bytes of one cached unit: a dense module, an expert, or an always-on module."""
+        size = self._unit_byte_counts.get(key)
+        if size is not None:
+            return size
         return self._layer_packed_bytes(key[0])
 
     def _layer_packed_bytes(self, idx):

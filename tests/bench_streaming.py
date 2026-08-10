@@ -507,7 +507,8 @@ def load_model(args, device):
     model_cls = getattr(importlib.import_module(module_name), class_name)
     print(f"streaming class: {class_name}")
     return model_cls(args.model, device=str(device), prefetching=not args.no_prefetch,
-                     vram_reserve=args.vram_reserve)
+                     vram_reserve=args.vram_reserve, host_cache_gb=args.host_cache_gb,
+                     expert_residency="off" if args.no_expert_residency else "auto")
 
 
 def run(args, device):
@@ -595,6 +596,42 @@ def cache_hit_rate(model):
     }
 
 
+def _skew_verdict(experts):
+    """Say plainly whether this run's routing justifies keeping hot experts resident.
+
+    The residency policy is a bet that some experts are read far more than others. If a model does
+    not route that way the bet does not pay, and the honest thing is to print that rather than let
+    a reader assume the numbers above are a win.
+    """
+    if not experts["selections"]:
+        return "nothing routed: no expert popularity to exploit"
+    gini = experts["gini"]
+    if gini < 0.10:
+        return ("routing is near-uniform, so expert residency has little to exploit here; "
+                "randomly initialised weights route this way")
+    if gini < 0.30:
+        return "routing is mildly skewed: pinning helps, but the tail is still read often"
+    return "routing is strongly skewed, which is what makes hot-expert residency pay"
+
+
+def expert_cache(model):
+    """What a mixture's experts did, or ``None`` for a dense model.
+
+    The expert hit rate is reported apart from the overall one on purpose. Experts and dense layers
+    have different access patterns and different replacement policies, so a single combined figure
+    averages away the only number that says whether expert residency is working.
+
+    The routing distribution is here because the whole approach rests on it. Keeping hot experts
+    resident only pays if a mixture really does prefer some experts over others, and that is a
+    property of the trained weights rather than of this engine -- so it is measured and printed
+    rather than assumed. `gini` is 0 when every expert is chosen equally often and approaches 1 as
+    the choices concentrate; `top_10pct_share` is printed beside what that decile would hold under
+    uniform routing, so a flat distribution is visible at a glance rather than inferred.
+    """
+    reporter = getattr(model, "expert_report", None)
+    return reporter() if callable(reporter) else None
+
+
 def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt_tokens,
                  new_tokens, wall_seconds, build_seconds, peak_device,
                  physical_before, physical_after, text, model, hardware):
@@ -668,6 +705,7 @@ def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt
                        "storage": decode_snapshot["storage_bytes"]},
         },
         "cache_hit_rate": cache_hit_rate(model),
+        "expert_cache": expert_cache(model),
         # The critical path: these four are sequential and sum toward wall time. The worker-thread
         # read time is reported alongside them but deliberately kept out of the sum, because with
         # prefetching on it runs underneath compute and adding it would double-count.
@@ -813,6 +851,27 @@ def print_report(record):
           f"host {record['cache_hit_rate']['host']:.0%}   "
           f"({record['cache_hit_rate']['note']})")
 
+    experts = record.get("expert_cache")
+    if experts:
+        print()
+        print("  EXPERT CACHE")
+        print(f"    hit rate  {experts['hit_rate']:.0%}   "
+              f"(device {experts['hits_device']}, host {experts['hits_host']}, "
+              f"miss {experts['misses']} of {experts['acquires']} expert acquires)")
+        print(f"    residency {experts['pinned_experts']} experts pinned, "
+              f"{experts['pinned_shared']}/{experts['shared_modules']} shared modules pinned "
+              f"({human_bytes(experts['shared_bytes'])}), {experts['replans']} re-rankings")
+        print(f"    routing   {experts['distinct_per_visit']:.2f} distinct experts per layer visit, "
+              f"{experts['touched']}/{experts['experts']} ever routed to, "
+              f"{experts['firings']} router firings")
+        print(f"    parallel  {experts['prefetched']} expert reads issued as a batch on "
+              f"{experts['prefetch_calls']} router firings")
+        print(f"    skew      gini {experts['gini']:.2f}   "
+              f"hottest expert {experts['top_1_share']:.1%} of selections   "
+              f"hottest decile {experts['top_10pct_share']:.1%} "
+              f"(uniform would be {experts['uniform_share']:.1%})")
+        print(f"    {_skew_verdict(experts)}")
+
     print()
     print("  PEAK MEMORY")
     print(f"    device    {human_bytes(record['memory']['peak_device_bytes'])}")
@@ -847,6 +906,10 @@ COMPARED_METRICS = [
     ("memory.peak_device_bytes", "peak device memory", "bytes", False),
     ("memory.peak_host_rss_bytes", "peak host rss", "bytes", False),
     ("cache_hit_rate.device", "cache hit rate (device)", "ratio", True),
+    # Absent on a dense model, which the differ reports as unavailable rather than as zero.
+    ("expert_cache.hit_rate", "expert hit rate", "ratio", True),
+    ("expert_cache.distinct_per_visit", "experts per layer visit", "rate", False),
+    ("expert_cache.gini", "routing skew (gini)", "ratio", True),
 ]
 
 
@@ -945,6 +1008,12 @@ def main():
                         help="bytes of device memory to hold back, shrinking the weight cache. "
                              "--max-vram-gb caps the allocator but not the measured budget, so this "
                              "is the lever for benchmarking a model that does not fit")
+    parser.add_argument("--no-expert-residency", action="store_true",
+                        help="stop keeping hot experts resident, to measure the policy against its "
+                             "own absence on one build")
+    parser.add_argument("--host-cache-gb", type=float, default=None,
+                        help="gigabytes the host tier may hold. Set to 0 to measure the "
+                             "storage-bound regime, where evictions fall all the way to disk")
     parser.add_argument("--force", action="store_true",
                         help="compare across different hardware profiles anyway")
     parser.add_argument("--no-prefetch", action="store_true",

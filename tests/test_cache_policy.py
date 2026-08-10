@@ -9,6 +9,7 @@ for an access pattern that matches how decode actually walks a model.
 Every tier is mocked. There is no accelerator, no checkpoint and no I/O: "storage" is a dict and a
 fetch counter, which is what makes it possible to assert on the exact number of storage reads.
 """
+import types
 import unittest
 
 from rocketllm.memory.cache import TieredWeightCache, expert_kind, is_expert
@@ -221,6 +222,25 @@ class TestZeroBudget(unittest.TestCase):
             cache.release(key)
             self.assertEqual(discarded[-1], f"payload:{key}")
         self.assertEqual(cache.report()["entries"], 0, "a released transient entry is still tracked")
+
+    def test_an_explicit_host_size_beats_the_profile(self):
+        """REGRESSION TEST. A caller asking for no host tier must get no host tier.
+
+        The engine stops keeping CPU-side copies when it is told the host tier is zero. If the cache
+        quietly used the profile's measurement instead, it would demote entries into a tier whose
+        payloads had already been dropped, and promoting one back would hand the loader a None.
+        Zero is a real size here, not a missing argument.
+        """
+        profile = types.SimpleNamespace(derived={"host_cache_bytes": types.SimpleNamespace(
+            value=8 * 1024 * MB)})
+        cache = TieredWeightCache(fetch=lambda key: "payload", sizer=lambda key: MB,
+                                  device_bytes=MB, host_bytes=0, profile=profile)
+        self.assertEqual(cache.host.capacity, 0)
+
+        # Unspecified still means "take the machine's measurement", which is the common path.
+        default = TieredWeightCache(fetch=lambda key: "payload", sizer=lambda key: MB,
+                                    device_bytes=MB, profile=profile)
+        self.assertEqual(default.host.capacity, 8 * 1024 * MB)
 
     def test_a_streamed_entry_survives_a_nested_claim(self):
         """Two readers, one payload: it goes back only when the last of them is finished."""

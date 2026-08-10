@@ -41,6 +41,7 @@ from rocketllm import base as base_module
 from rocketllm.base import RocketModel
 from rocketllm.memory import is_expert
 from rocketllm.moe.detect import LAYOUT_FUSED, LAYOUT_MODULE_LIST
+from rocketllm.moe.expert_cache import is_shared
 
 PROMPT = torch.tensor([[1, 5, 9, 14, 3]])
 ONE_TOKEN = torch.tensor([[7]])
@@ -300,11 +301,10 @@ class TestModuleListStreaming(StreamingCase):
         try:
             with torch.no_grad():
                 model(ONE_TOKEN.to(DEVICE))
-            keys = list(model._expert_tensor_keys)
+            keys = [key for key in model._unit_tensor_keys if is_expert(key[1])]
             self.assertTrue(keys)
-            self.assertTrue(all(is_expert(key[1]) for key in keys),
-                            f"expert entries are not keyed as experts: {keys[:3]}")
-            self.assertTrue(all(count > 0 for count in model._expert_byte_counts.values()),
+            self.assertEqual(len(keys), 8, "two layers of four experts should each be an entry")
+            self.assertTrue(all(model._unit_byte_counts[key] > 0 for key in keys),
                             "an expert sized at zero bytes is free to keep and never evicted")
         finally:
             model.close()
@@ -344,12 +344,12 @@ class TestModuleListStreaming(StreamingCase):
             model.close()
 
 
-class TestSharedExpertsStayWithTheLayer(StreamingCase):
-    """Qwen2-MoE: a mixture with a shared expert beside the routed ones.
+class TestSharedExperts(StreamingCase):
+    """Qwen2-MoE: a mixture with an always-on feed-forward path beside the routed experts.
 
-    A shared expert runs for every token, so streaming it per expert would add reads and save
-    nothing. It has to be recognised as part of the layer rather than part of the mixture, and that
-    is what these check.
+    A shared expert is read on every token, so it is the first thing that should be resident and
+    the last thing that should be ranked against experts by popularity it would trivially win. It
+    gets an entry of its own, in its own priority class.
     """
 
     build = staticmethod(qwen2_moe)
@@ -361,14 +361,43 @@ class TestSharedExpertsStayWithTheLayer(StreamingCase):
         finally:
             model.close()
 
-    def test_the_shared_expert_and_router_stream_with_the_layer(self):
+    def test_shared_experts_are_detected_without_being_named(self):
+        model = self.stream()
+        try:
+            shared = model.experts.shared
+            self.assertTrue(shared, "the shared expert beside the routed ones was not found")
+            self.assertTrue(all(is_shared(key[1]) for key in shared))
+            paths = {key[1] for key in shared}
+            self.assertTrue(any("shared_expert" in path for path in paths), paths)
+            self.assertTrue(all(size > 0 for size in shared.values()))
+        finally:
+            model.close()
+
+    def test_the_shared_expert_leaves_the_layer_stream(self):
+        """It is its own entry now, so the layer must no longer carry it -- nor the experts."""
         model = self.stream()
         try:
             self.assertTrue(model._non_expert_keys)
             for keys in model._non_expert_keys.values():
-                self.assertTrue([k for k in keys if "shared_expert" in k])
-                self.assertTrue([k for k in keys if k.endswith("mlp.gate.weight")])
+                self.assertFalse([k for k in keys if "shared_expert" in k])
                 self.assertFalse([k for k in keys if ".experts." in k])
+                # The router stays: it has to be resident before it can choose.
+                self.assertTrue([k for k in keys if k.endswith("mlp.gate.weight")])
+        finally:
+            model.close()
+
+    def test_shared_experts_outrank_every_routed_expert(self):
+        """A class boundary, not a score: no amount of popularity promotes an expert past one."""
+        model = self.stream()
+        try:
+            with torch.no_grad():
+                model(PROMPT.to(DEVICE))
+            candidates = model._pin_candidates()
+            shared = [c for c in candidates if is_shared(c.key[1])]
+            routed = [c for c in candidates if is_expert(c.key[1])]
+            self.assertTrue(shared and routed)
+            self.assertLess(max(c.priority for c in shared),
+                            min(c.priority for c in routed))
         finally:
             model.close()
 
@@ -376,14 +405,14 @@ class TestSharedExpertsStayWithTheLayer(StreamingCase):
         """Re-reading an expert within one forward would be a straight loss over whole-layer."""
         model = self.stream()
         loaded = []
-        original = model._expert_pre_hook
+        original = model._unit_pre_hook
 
         def counting(module, args):
             original(module, args)
             loaded.append(id(module))
 
         for mod in model.model.modules():
-            if hasattr(mod, "_rocketllm_expert"):
+            if is_expert(getattr(mod, "_rocketllm_unit", (None, ""))[1]):
                 mod._forward_pre_hooks.clear()
                 mod.register_forward_pre_hook(counting)
         try:
@@ -504,7 +533,7 @@ class TestFusedStreaming(StreamingCase):
             return original(path, layer_name, rows)
 
         for mod in model.model.modules():
-            if getattr(mod, "_rocketllm_selection", None) is not None:
+            if getattr(mod, "_rocketllm_router", None) is not None:
                 mod._forward_hooks.clear()
 
         base_module.load_layer_rows = recording
@@ -541,7 +570,7 @@ class TestDenseIsUnaffected(StreamingCase):
         try:
             with torch.no_grad():
                 model(ONE_TOKEN.to(DEVICE))
-            hooked = [m for m in model.model.modules() if hasattr(m, "_rocketllm_expert")]
+            hooked = [m for m in model.model.modules() if hasattr(m, "_rocketllm_unit")]
             self.assertEqual(hooked, [])
         finally:
             model.close()

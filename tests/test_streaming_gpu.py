@@ -97,6 +97,14 @@ def run_reference(args):
 
 
 def main():
+    # A model may emit any codepoint, and Windows consoles still default to a legacy codepage. Left
+    # alone, this harness dies inside print() on the first non-ASCII token and takes the correctness
+    # verdict with it -- a run that had not even been compared yet looks like a crash.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except (AttributeError, OSError):
+        pass
+
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--prompt", default="The capital of France is")

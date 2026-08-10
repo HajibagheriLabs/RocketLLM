@@ -83,6 +83,11 @@ class ExpertContainer:
     #: ``{checkpoint key: full shape}`` for the fused layout. The shape is the checkpoint's, which
     #: is what the destination tensor has to be allocated at.
     fused_shapes: dict = dataclasses.field(default_factory=dict)
+    #: ``{module path: (checkpoint keys,)}`` for the always-on feed-forward paths beside the routed
+    #: experts -- what architectures variously call a shared expert. Every token takes these, so
+    #: they are worth keeping resident rather than streaming, and they are found by exclusion rather
+    #: than by name; see :func:`_find_shared_modules`.
+    shared_keys: dict = dataclasses.field(default_factory=dict)
 
     @property
     def is_fused(self):
@@ -90,15 +95,26 @@ class ExpertContainer:
 
     @property
     def keys(self):
-        """Every checkpoint tensor this container owns."""
+        """The checkpoint tensors of the ROUTED experts, and nothing else.
+
+        Deliberately excludes the shared modules: the fused path reads rows out of exactly these
+        tensors, so anything that is not expert-major must stay out of it.
+        """
         if self.is_fused:
             return tuple(self.fused_shapes)
         return tuple(key for keys in self.expert_keys.values() for key in keys)
 
+    @property
+    def owned_keys(self):
+        """Everything this container takes off the layer's own stream, shared modules included."""
+        shared = tuple(key for keys in self.shared_keys.values() for key in keys)
+        return self.keys + shared
+
     def describe(self):
         top_k = "unknown" if self.top_k is None else self.top_k
+        shared = f", {len(self.shared_keys)} shared" if self.shared_keys else ""
         return (f"{self.path or '<layer>'}: {self.layout} layout, {self.num_experts} experts, "
-                f"top-k {top_k}")
+                f"top-k {top_k}{shared}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,6 +193,27 @@ def _find_router(parent, container_name, num_experts):
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _find_shared_modules(parent, container_name, router_name):
+    """Siblings of the expert container that every token goes through anyway.
+
+    Inside a mixture block the children are the routed experts, the thing that routes to them, and
+    -- where the architecture has one -- a feed-forward path taken regardless of routing. This
+    returns that third group, defined by exclusion: whatever is neither the experts nor the router.
+
+    Exclusion rather than a name test, because the names are the part that varies (`shared_expert`,
+    `shared_experts`, `shared_mlp`, and a gate beside it) while the structure does not. Being
+    unrouted is exactly what makes them worth pinning: a routed expert earns residency by being
+    popular, and these are read on every token by construction, so they never have to earn it.
+    """
+    shared = []
+    for name, child in parent.named_children():
+        if name in (container_name, router_name):
+            continue
+        if any(True for _ in child.parameters()):
+            shared.append(name)
+    return tuple(shared)
+
+
 def _find_int(node, keys, depth=0):
     """First integer stored under any of `keys`, at any depth of a config.
 
@@ -225,7 +262,8 @@ def resolve_top_k(config, num_experts):
 
 # -- per-container recognition ----------------------------------------------------------------------
 
-def _module_list_container(path, children, keys_by_prefix, config):
+def _module_list_container(path, children, parent, parent_path, container_name, keys_by_prefix,
+                           config):
     """Recognise an expert list, or return ``(None, reason)``."""
     if not _interchangeable(children):
         # A pipeline of differently-shaped stages. Not experts at all, and not worth reporting.
@@ -244,14 +282,40 @@ def _module_list_container(path, children, keys_by_prefix, config):
         return None, (f"the module tree holds {len(children)} interchangeable entries but the shard "
                       f"stores per-expert tensors for {len(expert_keys)} of them")
 
-    # Reported, never relied on: this layout streams whichever expert modules the model chooses to
-    # call, so a config that does not declare its routing width costs nothing here.
+    # Unlike the fused layout this one does not *need* the router -- the model calls the expert
+    # modules itself -- but knowing it is what allows the top-k to be fetched in parallel the moment
+    # it fires, and what separates an always-on sibling from the thing that routes. Missing it costs
+    # those two, not correctness.
+    router_name = _find_router(parent, container_name, len(children)) if parent is not None else None
+    shared = _shared_key_map(parent, parent_path, container_name, router_name, keys_by_prefix)
+
     return ExpertContainer(layout=LAYOUT_MODULE_LIST, path=path, num_experts=len(children),
                            top_k=resolve_top_k(config, len(children)),
-                           expert_keys=expert_keys), None
+                           router_path=_qualify(parent_path, router_name),
+                           expert_keys=expert_keys, shared_keys=shared), None
 
 
-def _fused_container(path, module, parent, parent_path, container_name, shapes, prefix, config):
+def _qualify(parent_path, name):
+    if name is None:
+        return None
+    return f"{parent_path}.{name}" if parent_path else name
+
+
+def _shared_key_map(parent, parent_path, container_name, router_name, keys_by_prefix):
+    """``{module path: checkpoint keys}`` for the always-on siblings that the shard actually holds."""
+    if parent is None:
+        return {}
+    shared = {}
+    for name in _find_shared_modules(parent, container_name, router_name):
+        path = _qualify(parent_path, name)
+        found = keys_by_prefix.get(f"{path}.")
+        if found:
+            shared[path] = tuple(found)
+    return shared
+
+
+def _fused_container(path, module, parent, parent_path, container_name, shapes, prefix, config,
+                     keys_by_prefix):
     """Recognise a fused ``[num_experts, ...]`` expert tensor, or return ``(None, reason)``.
 
     The signature is a module whose own parameters -- not its children's -- all lead with the same
@@ -300,9 +364,10 @@ def _fused_container(path, module, parent, parent_path, container_name, shapes, 
         return None, (f"{num_experts} fused experts, but the config does not declare how many a "
                       f"token routes to under any of: {', '.join(TOP_K_KEYS)}")
 
-    router_path = f"{parent_path}.{router_name}" if parent_path else router_name
+    shared = _shared_key_map(parent, parent_path, container_name, router_name, keys_by_prefix)
     return ExpertContainer(layout=LAYOUT_FUSED, path=path, num_experts=num_experts, top_k=top_k,
-                           router_path=router_path, fused_shapes=fused_shapes), None
+                           router_path=_qualify(parent_path, router_name),
+                           fused_shapes=fused_shapes, shared_keys=shared), None
 
 
 def _outermost(containers):
@@ -370,10 +435,11 @@ def detect_expert_layout(layer_module, tensor_shapes, layer_name="", config=None
 
         children = _indexed_children(module)
         if children is not None:
-            container, reason = _module_list_container(path, children, keys_by_prefix, config)
+            container, reason = _module_list_container(path, children, parent, parent_path,
+                                                       container_name, keys_by_prefix, config)
         else:
             container, reason = _fused_container(path, module, parent, parent_path, container_name,
-                                                 relative, prefix, config)
+                                                 relative, prefix, config, keys_by_prefix)
         if container is not None:
             containers.append(container)
         elif reason:
@@ -383,7 +449,7 @@ def detect_expert_layout(layer_module, tensor_shapes, layer_name="", config=None
 
     owned = set()
     for container in containers:
-        owned.update(container.keys)
+        owned.update(container.owned_keys)
     other_keys = tuple(key for key in tensor_shapes if key not in owned)
 
     for path, reason in skipped:

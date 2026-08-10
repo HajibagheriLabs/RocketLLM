@@ -33,7 +33,29 @@ DEFAULTS = dict(hidden_size=256, intermediate_size=512, num_hidden_layers=4, num
                 max_position_embeddings=512)
 
 
-def build(out, tokenizer_id, seed=0, dtype=torch.float16, **overrides):
+def skew_router(model, strength):
+    """Bias every router toward a few experts, the way a trained one is biased.
+
+    Random weights route almost perfectly uniformly, and uniform routing is the one case where
+    hot-expert residency has nothing to exploit -- so a random fixture cannot tell whether the
+    policy works, only that it does no harm. Damping the rows of each router's weight matrix by a
+    Zipf-like profile concentrates the top-k on the first few experts and gives the residency policy
+    something real to find. The skew is synthetic and says nothing about any particular model; what
+    it exercises is the machinery that responds to skew.
+    """
+    scaled = 0
+    for name, param in model.named_parameters():
+        if param.ndim != 2 or not (name.endswith("gate.weight") or name.endswith("router.weight")):
+            continue
+        experts = param.shape[0]
+        damping = torch.tensor([1.0 / (1.0 + index) ** strength for index in range(experts)],
+                               dtype=param.dtype).unsqueeze(1)
+        param.data.mul_(damping)
+        scaled += 1
+    return scaled
+
+
+def build(out, tokenizer_id, seed=0, dtype=torch.float16, router_skew=0.0, **overrides):
     from transformers import AutoTokenizer, MixtralConfig, MixtralForCausalLM
 
     out = Path(out)
@@ -48,14 +70,16 @@ def build(out, tokenizer_id, seed=0, dtype=torch.float16, **overrides):
 
     torch.manual_seed(seed)
     model = MixtralForCausalLM(config).to(dtype).eval()
+    skewed = skew_router(model, router_skew) if router_skew else 0
     model.config.torch_dtype = str(dtype).replace("torch.", "")
     model.save_pretrained(out, safe_serialization=True)
     tokenizer.save_pretrained(out)
 
     params = sum(p.numel() for p in model.parameters())
+    note = f", router skew {router_skew} on {skewed} routers" if skewed else ""
     print(f"wrote {out} -- {params / 1e6:.0f}M parameters, "
           f"{settings['num_hidden_layers']} layers x {settings['num_local_experts']} experts, "
-          f"top-k {settings['num_experts_per_tok']}, dtype {dtype}")
+          f"top-k {settings['num_experts_per_tok']}, dtype {dtype}{note}")
     return out
 
 
@@ -74,9 +98,14 @@ def main():
     parser.add_argument("--kv-heads", type=int, default=DEFAULTS["num_key_value_heads"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--router-skew", type=float, default=0.0,
+                        help="Zipf exponent biasing each router toward its first few experts. "
+                             "Random weights route uniformly, which is the one case hot-expert "
+                             "residency cannot exploit; raise this to exercise the policy")
     args = parser.parse_args()
 
     build(args.out, args.tokenizer, seed=args.seed, dtype=getattr(torch, args.dtype),
+          router_skew=args.router_skew,
           num_local_experts=args.experts, num_experts_per_tok=args.top_k,
           num_hidden_layers=args.layers, hidden_size=args.hidden,
           intermediate_size=args.intermediate, num_attention_heads=args.heads,

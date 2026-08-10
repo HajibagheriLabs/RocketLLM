@@ -99,8 +99,8 @@ class TieredWeightCache:
     hard invariant here -- everything else is a performance decision.
     """
 
-    def __init__(self, fetch, sizer, device_bytes=0, host_bytes=0, pinned=(), window=1,
-                 aging_interval=4096, profile=None, to_device=None, to_host=None,
+    def __init__(self, fetch, sizer, device_bytes=0, host_bytes=None, pinned=(), window=1,
+                 aging_interval=None, profile=None, to_device=None, to_host=None,
                  discard=None, sequence=None, prefetch_workers=0):
         #: Read a key's packed payload from storage. The slow path, and the one being avoided.
         self._fetch = fetch
@@ -116,10 +116,18 @@ class TieredWeightCache:
         #: lookahead instead of the caller keeping a one-slot prefetch of its own.
         self._sequence = sequence
 
+        # A value the caller actually passed wins over the profile's. The caller is the engine,
+        # which has already folded in any user override, so letting the measurement win here would
+        # silently discard it -- and for the host tier that is not merely a wrong size. The engine
+        # stops keeping CPU-side copies when it believes there is no host tier, so a cache that
+        # kept one anyway would demote entries into it with nothing in them, and promoting one back
+        # would hand the loader a None. Hence `None` for "not specified" rather than 0, which is a
+        # legitimate size meaning exactly no host tier.
         self.device = _Tier("device", device_bytes)
-        self.host = _Tier("host", self._knob(profile, "host_cache_bytes", host_bytes))
-        self.aging_interval = max(1, int(self._knob(profile, "expert_aging_interval",
-                                                    aging_interval)))
+        self.host = _Tier("host", self._knob(profile, "host_cache_bytes", 0)
+                          if host_bytes is None else host_bytes)
+        self.aging_interval = max(1, int(self._knob(profile, "expert_aging_interval", 4096)
+                                         if aging_interval is None else aging_interval))
 
         self.pinned = set(pinned)
         #: How many dense layers may sit on the device at once, over and above the pinned subset.
@@ -146,7 +154,16 @@ class TieredWeightCache:
             "evicted_to_host": 0, "evicted_to_storage": 0, "host_evictions": 0,
             "fetches": 0, "promotions": 0, "agings": 0,
             "rejected_too_large": 0, "prefetches": 0, "prefetch_hits": 0,
+            # Counted separately for experts. A mixture's dense layers and its experts have
+            # different access patterns and different policies, so one combined hit rate averages
+            # away the only number that says whether expert residency is working.
+            "expert_hits_device": 0, "expert_hits_host": 0, "expert_misses": 0,
         }
+
+    def _record(self, name, key):
+        self.stats[name] += 1
+        if is_expert(key[1]):
+            self.stats["expert_" + name] += 1
 
     @staticmethod
     def _knob(profile, name, fallback):
@@ -189,7 +206,7 @@ class TieredWeightCache:
             entry = self._entries.get(key)
 
             if entry is not None and entry.tier == "device":
-                self.stats["hits_device"] += 1
+                self._record("hits_device", key)
                 self._touch(entry)
                 entry.refcount += 1
                 return self._resolve(entry)
@@ -197,14 +214,14 @@ class TieredWeightCache:
             if entry is not None and entry.tier == "transient":
                 # Still bound from a claim that has not been released yet. No tier holds it, but the
                 # payload is live and re-reading it would strand the copy already in use.
-                self.stats["hits_device"] += 1
+                self._record("hits_device", key)
                 entry.refcount += 1
                 return self._resolve(entry)
 
             if entry is not None and entry.tier == "host":
                 # Served from RAM over the link rather than re-read from disk. On a storage-bound
                 # machine this is the difference the host tier exists to make.
-                self.stats["hits_host"] += 1
+                self._record("hits_host", key)
                 self.host.remove(key)
                 self._make_room(entry.packed_bytes, exclude=key)
                 entry.payload = self._to_device(entry.payload)
@@ -214,7 +231,7 @@ class TieredWeightCache:
                 entry.refcount += 1
                 return self._resolve(entry)
 
-            self.stats["misses"] += 1
+            self._record("misses", key)
             payload = self._take_pending(key)
             if payload is None:
                 payload = self._fetch(key)
@@ -249,6 +266,26 @@ class TieredWeightCache:
                 if upcoming in self._entries or upcoming in self._pending:
                     continue
                 self._pending[upcoming] = self._executor.submit(self._prefetch_one, upcoming)
+            started += 1
+        return started
+
+    def prefetch(self, keys):
+        """Start reading exactly these keys now. Returns how many reads were started.
+
+        The named-keys counterpart to :meth:`prefetch_window`, which walks a sequence. A mixture has
+        no sequence to walk -- its next experts are a routing decision, not a position -- but once
+        the router has fired they are all known at once, and issuing them together is what lets k
+        reads overlap instead of costing k round trips. Anything already resident or already in
+        flight is skipped, so calling this on every router firing is cheap.
+        """
+        if self._executor is None:
+            return 0
+        started = 0
+        for key in keys:
+            with self._lock:
+                if key in self._entries or key in self._pending:
+                    continue
+                self._pending[key] = self._executor.submit(self._prefetch_one, key)
             started += 1
         return started
 

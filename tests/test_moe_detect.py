@@ -349,8 +349,8 @@ class TestRealArchitectures(unittest.TestCase):
         self.assertEqual(container.path, "block_sparse_moe.experts")
         self.assertEqual((container.num_experts, container.top_k), (4, 2))
 
-    def test_qwen2_moe_keeps_its_shared_expert_with_the_layer(self):
-        """A shared expert runs for every token, so it belongs to the layer, not to the mixture."""
+    def test_qwen2_moe_shared_expert_is_found_beside_the_routed_ones(self):
+        """A shared expert runs for every token, so it is pinned rather than streamed or routed."""
         from transformers import Qwen2MoeConfig, Qwen2MoeForCausalLM
         config = Qwen2MoeConfig(hidden_size=16, intermediate_size=32, moe_intermediate_size=16,
                                 shared_expert_intermediate_size=24, num_hidden_layers=1,
@@ -360,10 +360,15 @@ class TestRealArchitectures(unittest.TestCase):
         layout = self._detect(Qwen2MoeForCausalLM(config), config)
 
         self.assertEqual(len(layout.containers), 1)
-        self.assertEqual(layout.containers[0].path, "mlp.experts")
-        shared = [k for k in layout.other_keys if "shared_expert" in k]
-        self.assertTrue(shared, "the shared expert must stream with the layer")
+        container = layout.containers[0]
+        self.assertEqual(container.path, "mlp.experts")
+        self.assertEqual(container.router_path, "mlp.gate")
+        self.assertTrue(any("shared_expert" in path for path in container.shared_keys),
+                        f"shared expert not detected: {sorted(container.shared_keys)}")
+        # The router stays with the layer: it must be resident before it can choose.
         self.assertTrue(any("mlp.gate.weight" in k for k in layout.other_keys))
+        self.assertFalse([k for k in layout.other_keys if "shared_expert" in k],
+                         "a shared expert is its own entry, not part of the layer's stream")
 
     def test_llama4_is_fused(self):
         from transformers.models.llama4.configuration_llama4 import Llama4TextConfig
@@ -380,8 +385,9 @@ class TestRealArchitectures(unittest.TestCase):
         self.assertEqual(container.path, "feed_forward.experts")
         self.assertEqual(container.router_path, "feed_forward.router")
         self.assertEqual((container.num_experts, container.top_k), (4, 1))
-        # The shared expert and the router are the layer's, not the mixture's.
-        self.assertTrue(any("shared_expert" in k for k in layout.other_keys))
+        # The fused layout has a shared expert too, and it is found the same way.
+        self.assertTrue(any("shared_expert" in path for path in container.shared_keys),
+                        f"shared expert not detected: {sorted(container.shared_keys)}")
 
     def test_a_dense_llama_has_nothing_to_find(self):
         from transformers import LlamaConfig, LlamaForCausalLM

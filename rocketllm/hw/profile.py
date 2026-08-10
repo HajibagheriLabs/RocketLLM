@@ -82,6 +82,10 @@ class Policy:
     #: Accesses between halvings of the expert popularity counts. Aging is what keeps LFU from
     #: freezing around whatever was hot at the start of a long generation.
     expert_aging_interval: int = 4096
+    #: Router firings between rebuilds of the expert pin plan, as a share of the aging interval.
+    #: The two describe one timescale: re-ranking experts far more often than the counts they are
+    #: ranked by can move only pays for evictions and refetches that the next rebuild undoes.
+    expert_replan_fraction: float = 0.125
 
 
 DEFAULT_POLICY = Policy()
@@ -99,6 +103,7 @@ _OVERRIDABLE = {
     "budget_hysteresis_samples": int,
     "pin_replan_bytes": int,
     "expert_aging_interval": int,
+    "expert_replan_interval": int,
     "compute_dtype": str,
     "kv_dtype": str,
     "quant_compute_path": str,
@@ -775,6 +780,12 @@ class HardwareProfile:
         self._set("expert_aging_interval", int(policy.expert_aging_interval),
                   "policy: expert accesses between halvings of the popularity counts",
                   {"expert_aging_interval": policy.expert_aging_interval}, overrides)
+        self._set("expert_replan_interval",
+                  max(1, int(policy.expert_aging_interval * policy.expert_replan_fraction)),
+                  "expert_aging_interval * expert_replan_fraction", {
+                      "expert_aging_interval": policy.expert_aging_interval,
+                      "expert_replan_fraction": policy.expert_replan_fraction,
+                  }, overrides)
 
     def window_max(self, largest_layer_bytes):
         """How many layers of the largest size fit in the window budget. Never below 1.
