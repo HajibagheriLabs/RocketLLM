@@ -6,5 +6,13 @@ token, activations come and go, another process may take a slice of the card -- 
 once at startup is wrong by the end of the first generation.
 """
 from .budget import AllocatorSetup, BudgetSample, VramBudget, configure_allocator
+from .cache import CacheEntry, TieredWeightCache, expert_kind, is_expert, KIND_DENSE
+from .placement import (CLASS_ALWAYS, CLASS_ROUTED, CLASS_SHARED, PinCandidate, PinPlan, PinPlanner,
+                        pin_budget_from, plan_pins, rank)
 
-__all__ = ["VramBudget", "BudgetSample", "AllocatorSetup", "configure_allocator"]
+__all__ = [
+    "VramBudget", "BudgetSample", "AllocatorSetup", "configure_allocator",
+    "TieredWeightCache", "CacheEntry", "expert_kind", "is_expert", "KIND_DENSE",
+    "PinCandidate", "PinPlan", "PinPlanner", "plan_pins", "pin_budget_from", "rank",
+    "CLASS_ALWAYS", "CLASS_SHARED", "CLASS_ROUTED",
+]

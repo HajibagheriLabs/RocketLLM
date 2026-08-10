@@ -74,6 +74,14 @@ class Policy:
     #: at every layer boundary, so this is cheap to satisfy for a real shift and hard to satisfy
     #: for a single allocation spike.
     budget_hysteresis_samples: int = 3
+    #: How far the pin budget must move, as a share of the budget the current plan was built for,
+    #: before the plan is worth rebuilding. Damping on top of the budget's own hysteresis: acting on
+    #: a small shift means evicting pinned weights and refetching them, which costs more than the
+    #: residency it buys back.
+    pin_replan_fraction: float = 0.10
+    #: Accesses between halvings of the expert popularity counts. Aging is what keeps LFU from
+    #: freezing around whatever was hot at the start of a long generation.
+    expert_aging_interval: int = 4096
 
 
 DEFAULT_POLICY = Policy()
@@ -89,6 +97,8 @@ _OVERRIDABLE = {
     "window_fraction": float,
     "budget_hysteresis_bytes": int,
     "budget_hysteresis_samples": int,
+    "pin_replan_bytes": int,
+    "expert_aging_interval": int,
     "compute_dtype": str,
     "kv_dtype": str,
     "quant_compute_path": str,
@@ -753,6 +763,18 @@ class HardwareProfile:
         self._set("budget_hysteresis_samples", int(policy.budget_hysteresis_samples),
                   "policy: consecutive deviating samples before the published budget moves",
                   {"budget_hysteresis_samples": policy.budget_hysteresis_samples}, overrides)
+
+        # Damping for the pin plan, on top of the budget's own hysteresis. Rebuilding a plan is not
+        # free -- it evicts weights that were resident and refetches them from storage -- so the
+        # move has to be worth a streaming pass before it is acted on.
+        self._set("pin_replan_bytes", int(usable * policy.pin_replan_fraction),
+                  "usable_device * pin_replan_fraction", {
+                      "usable_device_bytes": usable,
+                      "pin_replan_fraction": policy.pin_replan_fraction,
+                  }, overrides)
+        self._set("expert_aging_interval", int(policy.expert_aging_interval),
+                  "policy: expert accesses between halvings of the popularity counts",
+                  {"expert_aging_interval": policy.expert_aging_interval}, overrides)
 
     def window_max(self, largest_layer_bytes):
         """How many layers of the largest size fit in the window budget. Never below 1.
