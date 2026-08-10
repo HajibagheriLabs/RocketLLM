@@ -307,20 +307,33 @@ class TestDtypes(unittest.TestCase):
         profile = make_profile(dtypes={"bf16": False, "fp16": False, "fp8": False, "fp4": False})
         self.assertEqual(profile.derived["compute_dtype"].value, "float32")
 
-    def test_kv_int4_when_the_device_is_the_smaller_pool(self):
+    def test_kv_is_int4_on_a_small_device(self):
         self.assertEqual(tiny_vram_machine().derived["kv_dtype"].value, "int4")
 
-    def test_kv_follows_compute_when_the_device_is_larger_than_the_host(self):
-        profile = make_profile(device_total_bytes=192 * GB, device_free_bytes=190 * GB,
-                               host_total_bytes=32 * GB, host_available_bytes=24 * GB)
-        self.assertEqual(profile.derived["kv_dtype"].value,
-                         profile.derived["compute_dtype"].value)
+    def test_a_bigger_card_does_not_downgrade_the_kv_cache(self):
+        """The regression this guards: more VRAM must mean more context, not more precision.
 
-    def test_kv_choice_does_not_flip_on_small_changes_in_free_ram(self):
-        """It keys off total RAM precisely so a browser tab cannot change the answer."""
+        Device memory buys context length in a streaming engine. Scaling the KV dtype off card
+        size had the perverse effect of switching to full-precision KV exactly when a user bought
+        room to run longer, spending their new memory on precision they did not ask for.
+        """
+        for total in (4 * GB, 10 * GB, 24 * GB, 80 * GB, 192 * GB):
+            profile = make_profile(device_total_bytes=total, device_free_bytes=total - GB,
+                                   host_total_bytes=16 * GB, host_available_bytes=8 * GB)
+            with self.subTest(device_total_gb=total // GB):
+                self.assertEqual(profile.derived["kv_dtype"].value, "int4")
+
+    def test_kv_choice_does_not_depend_on_free_ram(self):
         busy = tiny_vram_machine(host_available_bytes=1 * GB)
         idle = tiny_vram_machine(host_available_bytes=7 * GB)
         self.assertEqual(busy.derived["kv_dtype"].value, idle.derived["kv_dtype"].value)
+
+    def test_kv_can_be_overridden_to_full_precision(self):
+        """For the case the default is wrong for: a model that fits, where precision wins."""
+        profile = big_vram_machine()
+        profile.derive(overrides={"kv_dtype": "bfloat16"})
+        self.assertEqual(profile.derived["kv_dtype"].value, "bfloat16")
+        self.assertEqual(profile.derived["kv_dtype"].source, "override")
 
 
 class TestQuantPath(unittest.TestCase):

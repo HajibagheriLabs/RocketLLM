@@ -735,30 +735,32 @@ class HardwareProfile:
             compute, formula = "float32", "fp32 fallback: neither bf16 nor fp16 available"
         self._set("compute_dtype", compute, formula, {"dtype_support": self.dtypes}, overrides)
 
-        # Independent of the weight format, on purpose. int4 pays for itself when device memory is
-        # the binding constraint, and the stable way to ask that is against *total* host RAM:
-        # available RAM moves minute to minute, and a discrete choice should not flip because a
-        # browser opened a tab.
+        # Independent of the weight format, on purpose -- and deliberately not a function of how
+        # much device memory there is.
         #
-        # This is a machine-level default only. Whether to quantize the KV cache really depends on
-        # the context length and the model, neither of which the probe has any business knowing,
-        # so the caller overrides once it does.
+        # A bigger card is bought to run a longer context, not to hold the same context more
+        # precisely. In an engine whose whole premise is that the model does not fit, every byte
+        # the KV cache takes is a byte the streaming window cannot use, and that stays true at
+        # 24GB exactly as it was at 10GB -- the context simply grows to use the room. int4 buys
+        # roughly four times the context per byte, and the accuracy cost is already bounded by
+        # quantizing K per-channel and V per-token with the most recent tokens left in an fp16
+        # residual window.
+        #
+        # An earlier version of this scaled the choice off device memory against host RAM, which
+        # decides nothing about either, and had the perverse effect of downgrading to
+        # full-precision KV exactly when a user had bought room for more context.
         usable = self.derived["usable_device_bytes"].value
-        host_total = self.host_total_bytes or 0
-        if not usable:
-            kv, kv_formula = compute, "compute dtype: no device memory to economise on"
-        elif host_total and usable < host_total:
-            kv, kv_formula = "int4", ("int4 when usable_device < host_total: the device is the "
-                                      "smaller pool, so context length is what runs out first")
-        else:
-            kv, kv_formula = compute, ("compute dtype: usable device memory is at least host RAM, "
-                                       "so the KV cache is not the binding constraint")
-        self._set("kv_dtype", kv, kv_formula, {
+        kv_formula = ("int4 always: device memory buys context length in a streaming engine, and "
+                      "int4 quadruples the context a given budget holds. Not derived from device "
+                      "size -- a larger card means a longer context, not a more precise one. "
+                      "Override to the compute dtype when the model fits resident and precision "
+                      "matters more than length.")
+        self._set("kv_dtype", "int4", kv_formula, {
             "usable_device_bytes": usable,
-            "host_total_bytes": host_total,
             "compute_dtype": compute,
-            "note": "a machine-level default; the most recent tokens stay in an fp16 residual "
-                    "window regardless of this choice",
+            "quantization": "K per-channel, V per-token, group size 64",
+            "note": "the most recent ~128 tokens stay in an fp16 residual window regardless, so "
+                    "the tokens most sensitive to quantization are not quantized",
         }, overrides)
 
     def _derive_quant_path(self, policy, overrides):
