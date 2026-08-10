@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_streaming_gpu import cap_vram  # noqa: E402
 from rocketllm.hw import HardwareProfile  # noqa: E402
 from rocketllm.hw import caps  # noqa: E402
+from rocketllm.quant import registry as quant_registry  # noqa: E402
 
 RESULTS_DIR = REPO_ROOT / "bench_results"
 SCHEMA_VERSION = 1
@@ -353,17 +354,25 @@ class Instrumentation:
 
         self._patch(base, "load_layer", load_layer)
         self._patch(base, "load_layer_subset", load_layer_subset)
+        # Two modules place tensors: the base model binds the coalesced buffer's views, and the
+        # quant registry places whatever could not be coalesced. Both hold their own reference to
+        # accelerate's placer, so both have to be wrapped or the tier accounting quietly loses
+        # every weight that took the individual path.
         self._patch(base, "set_module_tensor_to_device", place)
+        self._patch(quant_registry, "set_module_tensor_to_device", place)
 
         model_cls = base.RocketModel
-        original_decompress = model_cls._decompress_state_dict
+        original_prepare = model_cls._prepare_layer
         original_pre = model_cls._pre_hook
         original_post = model_cls._post_hook
 
-        def decompress(model_self, state_dict):
+        def prepare_layer(model_self, state_dict):
+            # Whatever the checkpoint's format does to a shard before it can be placed. For an
+            # unquantized model that is nothing; for a packed one it is the dequantization, which
+            # is the only work worth calling a dequant phase.
             start = time.perf_counter()
             try:
-                return original_decompress(model_self, state_dict)
+                return original_prepare(model_self, state_dict)
             finally:
                 meters.add(dequant_seconds=time.perf_counter() - start)
 
@@ -419,7 +428,7 @@ class Instrumentation:
                 meters.add(transfer_bytes=nbytes,
                            transfer_seconds=time.perf_counter() - start, transfers=1)
 
-        self._patch(model_cls, "_decompress_state_dict", decompress)
+        self._patch(model_cls, "_prepare_layer", prepare_layer)
         if original_coalesced is not None:
             self._patch(model_cls, "_move_coalesced", move_coalesced)
         self._patch(model_cls, "_pre_hook", pre_hook)

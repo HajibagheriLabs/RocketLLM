@@ -290,6 +290,20 @@ class TestFusedKernelDecision(CapsTestCase):
         self.set_queries(kernels={"torch_int4pack": True, "any_usable": False})
         self.assertEqual(build("cpu").fused_4bit_plan().path, "dequant_to_scratch")
 
+    def test_providers_are_reported_by_name_and_not_just_as_a_winner(self):
+        """A checkpoint can only use a kernel written for its own packing, so it asks by name."""
+        self.set_queries(kernels={"torch_int4pack": True, "bitsandbytes": False,
+                                  "any_usable": True})
+        providers = build("cuda").fused_4bit_providers()
+        self.assertTrue(providers["torch_int4pack"])
+        self.assertFalse(providers["bitsandbytes"])
+        self.assertNotIn("any_usable", providers, "the verdict is not one of the providers")
+
+    def test_no_provider_counts_on_a_backend_that_cannot_run_any_of_them(self):
+        self.set_queries(kernels={"torch_int4pack": True, "bitsandbytes": True,
+                                  "any_usable": False})
+        self.assertFalse(any(build("mps").fused_4bit_providers().values()))
+
     def test_the_plan_is_computed_once_and_reused(self):
         self.set_queries(kernels={"torch_int4pack": True, "any_usable": True})
         caps = build("cuda")

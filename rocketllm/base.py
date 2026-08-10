@@ -17,6 +17,8 @@ from transformers.quantizers import AutoHfQuantizer
 from .hw import caps
 from .hw.caps import get_caps
 from .hw.profile import HardwareProfile
+from .quant import detect_backend
+from .quant.safetensors_quant import announce_backend
 from .streaming import HostStagingPool
 from .profiler import LayeredProfiler
 
@@ -281,6 +283,19 @@ class RocketModel:
                 hook.remove()
                 delattr(self.model, "ct_decompress_hook")
 
+        # Which checkpoint format this is, and what it costs to put on *this* device, is the quant
+        # package's business from here on. The model no longer inspects tensor names to work out
+        # what it is holding: it asks for the layer's logical weights and places what it is given.
+        self.quant = detect_backend(quantization_config,
+                                    caps=self.caps,
+                                    model=self.model,
+                                    hf_quantizer=self.hf_quantizer,
+                                    compute_dtype=self.running_dtype,
+                                    device=self.running_device,
+                                    shape_adopter=self._adopt_checkpoint_shape)
+        if quantization_config is not None:
+            announce_backend(self.quant)
+
         self.model.eval()
         self.model.tie_weights()
         self.model.generation_config = self.generation_config
@@ -366,114 +381,14 @@ class RocketModel:
         # speed up a copy that now never happens. Only the staging buffer is worth pinning.
         return state_dict
 
-    def _restore_plain_weight_modules(self, state_dict):
-        """Undo CT's packed-parameter layout when the checkpoint still ships a plain ``weight``.
+    def _prepare_layer(self, state_dict):
+        """Whatever the checkpoint's format has to do to a shard before its tensors can be placed.
 
-        Some checkpoints (Kimi K3) list residual/router Linears under the MXFP4 target list but
-        store them as bf16. After ``preprocess_model`` those modules expose ``weight_packed`` and
-        reject the real ``weight`` tensor. Restore a meta ``weight`` Parameter so the shard can load.
+        Nothing at all for most formats. For the packed ones it is the dequantization, which runs
+        on the device after the *packed* bytes have crossed the link -- so this is the seam the
+        benchmark charges its dequant phase to.
         """
-        plain = {k[:-len('.weight')] for k in state_dict if k.endswith('.weight')}
-        packed = {k[:-len('.weight_packed')] for k in state_dict if k.endswith('.weight_packed')}
-        for prefix in plain - packed:
-            try:
-                module = self.model.get_submodule(prefix)
-            except AttributeError:
-                continue
-            names = list(module._parameters.keys())
-            if 'weight' in names or 'weight_packed' not in names:
-                continue
-            weight = state_dict[f'{prefix}.weight']
-            for name in names:
-                if name == 'weight' or name.startswith('weight_'):
-                    module._parameters.pop(name, None)
-            module.register_parameter(
-                'weight',
-                torch.nn.Parameter(torch.empty(weight.shape, device='meta', dtype=weight.dtype),
-                                   requires_grad=False),
-            )
-            for attr in ('quantization_scheme', 'quantization_status', 'quantization_format'):
-                if hasattr(module, attr):
-                    delattr(module, attr)
-
-    def _decompress_state_dict(self, state_dict):
-        """Expand packed payloads into the plain weights the modules expect.
-
-        compressed-tensors has no quantized compute kernels: it registers a hook that decompresses
-        the whole model before the first forward, after which every quantized module wants a plain
-        ``weight``. Our shards still hold ``weight_packed``/``weight_scale``, so we expand them here.
-
-        The expansion happens on the GPU, after transferring the *packed* bytes. For MXFP4 that
-        moves 4x less data across PCIe than transferring an already-expanded weight would.
-        """
-        if self.hf_quantizer is None:
-            return state_dict
-
-        packed_prefixes = {k[: -len('.weight_packed')]
-                           for k in state_dict if k.endswith('.weight_packed')}
-        if not packed_prefixes:
-            return state_dict
-
-        from compressed_tensors.compressors.base import BaseCompressor
-        try:
-            from compressed_tensors.linear.compressed_linear import CompressedLinear
-        except ImportError:
-            CompressedLinear = None
-
-        out = dict(state_dict)
-        for prefix in packed_prefixes:
-            try:
-                module = self.model.get_submodule(prefix)
-            except AttributeError:
-                continue
-            # CompressedLinear's own forward consumes the packed payload, so leave it packed.
-            if CompressedLinear is not None and isinstance(module, CompressedLinear):
-                continue
-            scheme = getattr(module, 'quantization_scheme', None)
-            if scheme is None or getattr(scheme, 'format', None) is None:
-                continue
-
-            local = {k[len(prefix) + 1:]: v.to(self.running_device)
-                     for k, v in state_dict.items() if k.startswith(prefix + '.')}
-            # scheme.format is an enum on some compressed-tensors versions and a plain str on others.
-            fmt = getattr(scheme.format, 'value', scheme.format)
-            compressor = BaseCompressor.get_value_from_registry(fmt)
-            decompressed = compressor.decompress(local, scheme)
-
-            for k in local:
-                out.pop(f'{prefix}.{k}', None)
-            if 'weight' in decompressed:
-                # Once expanded, the module reads only `weight`; the scales that came back merely
-                # describe how the checkpoint stored it, and keeping them would waste VRAM.
-                out[f'{prefix}.weight'] = decompressed['weight']
-                self._expose_plain_weight(module, decompressed['weight'])
-            else:
-                for k, v in decompressed.items():
-                    out[f'{prefix}.{k}'] = v
-        return out
-
-    def _expose_plain_weight(self, module, weight):
-        """Swap a module's packed parameters for the plain ``weight`` its forward reads.
-
-        compressed-tensors patches a ``quantized_forward`` onto quantized Linears that reads
-        ``self.weight``; the packed parameters only describe how the checkpoint stores the value.
-        Marking the module COMPRESSED tells that forward the weight is already on the quantization
-        grid, so it skips a fake-quantize that would only reproduce what we just decompressed.
-        """
-        existing = module._parameters.get('weight')
-        if existing is None or existing.shape != weight.shape:
-            for name in [n for n in list(module._parameters) if n.startswith('weight')]:
-                module._parameters.pop(name, None)
-            module.register_parameter(
-                'weight',
-                torch.nn.Parameter(torch.empty(weight.shape, device='meta', dtype=weight.dtype),
-                                   requires_grad=False),
-            )
-        try:
-            from compressed_tensors.quantization import QuantizationStatus
-        except ImportError:
-            return
-        module.quantization_status = QuantizationStatus.COMPRESSED
+        return self.quant.prepare_layer(state_dict)
 
     def _adopt_checkpoint_shape(self, param_name, value):
         """Resize a meta placeholder whose shape disagrees with the checkpoint.
@@ -520,8 +435,7 @@ class RocketModel:
         quantizer reconstructs itself, or one that errors on the way in -- falls back to being
         placed on its own, because a slower correct path beats a faster broken one.
         """
-        self._restore_plain_weight_modules(state_dict)
-        state_dict = self._decompress_state_dict(state_dict)
+        state_dict = self._prepare_layer(state_dict)
 
         groups, individual = self._plan_transfer(state_dict)
 
@@ -529,38 +443,40 @@ class RocketModel:
         for target_dtype, entries in groups.items():
             if len(entries) < 2:
                 # One tensor is not a coalesce; packing it would just add a host-side copy.
-                individual.extend(name for name, _ in entries)
+                individual.extend((weight, name) for weight, name, _ in entries)
                 continue
             try:
-                moved.extend(self._move_coalesced(entries, target_dtype))
+                moved.extend(self._move_coalesced([(name, value) for _, name, value in entries],
+                                                  target_dtype))
             except Exception as exc:  # noqa: BLE001 - correctness over throughput
                 caps.announce_once(
                     "coalesce-fallback",
                     f"could not coalesce a layer's transfers ({exc}); falling back to placing "
                     f"tensors individually, which is slower but produces the same result.",
                     logging.INFO)
-                individual.extend(name for name, _ in entries)
+                individual.extend((weight, name) for weight, name, _ in entries)
 
-        for param_name in individual:
-            self._move_one(param_name, state_dict)
+        for weight, param_name in individual:
+            weight.place(param_name, self.running_device, shard=state_dict)
             moved.append(param_name)
         return moved
 
     def _plan_transfer(self, state_dict):
-        """Split a layer's params into coalescable groups and ones that must go on their own."""
+        """Split a layer's weights into coalescable groups and ones that must go on their own.
+
+        The split is the registry's to make, not this class's: which tensors are one logical weight,
+        and which of them the quantizer reconstructs rather than the loader placing, is a property
+        of the checkpoint's format. What is decided here is only how to move what comes back.
+        """
         groups = OrderedDict()
         individual = []
-        for param_name in self._param_names_from_state_dict(state_dict):
-            if self.hf_quantizer is not None and self._needs_quantization(param_name):
-                # The quantizer reconstructs these from the weight plus companion quant-state
-                # tensors and does its own placement; there is no plain buffer to pack.
-                individual.append(param_name)
-                continue
-            value = state_dict[param_name]
-            self._adopt_checkpoint_shape(param_name, value)
-            target = value.dtype if self._should_load_verbatim(param_name, value) \
-                else self.running_dtype
-            groups.setdefault(target, []).append((param_name, value))
+        for weight in self.quant.plan(state_dict):
+            for param_name, value, target in weight.placements():
+                self._adopt_checkpoint_shape(param_name, value)
+                groups.setdefault(target, []).append((weight, param_name, value))
+            # The quantizer reconstructs these from the payload plus companion quant-state tensors
+            # and does its own placement; there is no plain buffer to pack.
+            individual.extend((weight, name) for name in weight.quantizer_names())
         return groups, individual
 
     def _move_coalesced(self, entries, target_dtype):
@@ -592,24 +508,6 @@ class RocketModel:
             moved.append(param_name)
         return moved
 
-    def _move_one(self, param_name, state_dict):
-        """Place a single parameter. The original path, kept intact as the fallback."""
-        if self.hf_quantizer is not None and self._needs_quantization(param_name):
-            # On-the-fly-quantizing schemes (e.g. bitsandbytes) reconstruct the param from the
-            # weight plus companion quant-state tensors carried in state_dict.
-            self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name,
-                                                     self.running_device, state_dict)
-            return
-        # Normal load. Only ordinary high-precision tensors get cast to the runtime dtype;
-        # pre-quantized payloads must be placed verbatim (see _should_load_verbatim).
-        value = state_dict[param_name]
-        self._adopt_checkpoint_shape(param_name, value)
-        if self._should_load_verbatim(param_name, value):
-            set_module_tensor_to_device(self.model, param_name, self.running_device, value=value)
-        else:
-            set_module_tensor_to_device(self.model, param_name, self.running_device,
-                                        value=value, dtype=self.running_dtype)
-
     def _staging_buffer(self, count, dtype):
         """A flat host buffer to pack a layer into, reused across layers.
 
@@ -618,49 +516,6 @@ class RocketModel:
         accelerates, allocated once it costs nothing per token.
         """
         return self.staging_pool.buffer(count, dtype)
-
-    # Suffixes of the companion tensors that pre-quantized checkpoints ship alongside a weight
-    # (fp8 block scales, compressed-tensors/MXFP4 packed payloads and their scales, GPTQ indices).
-    _QUANT_COMPANION_SUFFIXES = ("_scale", "_scale_inv", "_packed", "_zero_point", "_g_idx", "_shape")
-
-    def _should_load_verbatim(self, param_name, value):
-        """Whether a checkpoint tensor must be placed on the device without a dtype cast.
-
-        Casting a pre-quantized payload to the runtime dtype destroys it: an fp8 weight loses its
-        quantization, and a 4-bit MXFP4 ``weight_packed`` tensor (stored as packed integers) becomes
-        meaningless floats. Equally important for very large models, decompressing on load would
-        multiply a layer's footprint by ~4x, which is what keeps Kimi-K3-class checkpoints from
-        fitting on a single GPU. So we keep anything that isn't a plain high-precision float as-is.
-        """
-        if not value.is_floating_point():
-            # Packed 4-bit payloads, zero points, g_idx, shape metadata.
-            return True
-        if value.element_size() == 1:
-            # Any 8-bit float: fp8 e4m3/e5m2 weights, and the e8m0 scales MXFP4 uses.
-            return True
-        return param_name.endswith(self._QUANT_COMPANION_SUFFIXES)
-
-    def _needs_quantization(self, param_name):
-        q = self.hf_quantizer
-        # transformers renamed check_quantized_param -> param_needs_quantization.
-        if hasattr(q, "param_needs_quantization"):
-            return q.param_needs_quantization(self.model, param_name)
-        return q.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
-
-    def _param_names_from_state_dict(self, state_dict):
-        names = []
-        for param_name in state_dict.keys():
-            # bitsandbytes stores a weight plus companion quant-state tensors named
-            # "<weight>.4bit.*" / "<weight>.8bit.*"; those are reconstructed together via
-            # create_quantized_param, so collapse them down to the base weight name. Everything
-            # else (including fp8 weight + weight_scale_inv pairs) is kept as distinct params.
-            if '.4bit.' in param_name or '.8bit.' in param_name:
-                base = param_name.split('.4bit.')[0].split('.8bit.')[0]
-                if base not in names:
-                    names.append(base)
-            elif param_name not in names:
-                names.append(param_name)
-        return names
 
     def _load_resident_modules(self):
         """Load modules that sit outside the streamed embed -> layers -> norm -> lm_head sequence.

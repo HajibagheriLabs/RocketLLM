@@ -579,6 +579,7 @@ class DeviceCaps:
     def __init__(self, device):
         self.device = device
         self._fused_plan = None
+        self._fused_providers = None
         self._compute_dtype = None
 
     # -- construction --------------------------------------------------------------------------
@@ -750,6 +751,21 @@ class DeviceCaps:
 
         self._fused_plan = plan
         return plan
+
+    def fused_4bit_providers(self):
+        """Which fused 4-bit kernels are usable here, by name.
+
+        ``fused_4bit_plan`` picks one winner for the engine's default path, but a checkpoint can
+        only be computed by a kernel that understands *its* packing: a bitsandbytes weight is not
+        made faster by a Marlin kernel being installed. A format that needs particular providers
+        asks for them by name rather than trusting the winner.
+        """
+        if self._fused_providers is None:
+            inventory = fused_4bit_kernels(self.device)
+            usable = bool(inventory.get("any_usable"))
+            self._fused_providers = {name: bool(found) and usable
+                                     for name, found in inventory.items() if name != "any_usable"}
+        return self._fused_providers
 
     # -- degradation announcements ---------------------------------------------------------------
 
