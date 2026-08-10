@@ -65,6 +65,15 @@ class Policy:
     #: Read bandwidth under which storage is called out as slow enough to dominate everything.
     #: Expressed in bytes/s; roughly where spinning rust and degraded links live.
     slow_storage_bytes_per_s: float = 150e6
+    #: How far a measured device budget must sit from the published one before the move is treated
+    #: as real rather than as allocator churn. A share of usable device memory, and only a floor:
+    #: the measured fragmentation is used instead wherever it is larger, because that is the actual
+    #: size of the noise this exists to reject.
+    budget_hysteresis_fraction: float = 0.02
+    #: Consecutive deviating samples required before the published budget moves. Sampling happens
+    #: at every layer boundary, so this is cheap to satisfy for a real shift and hard to satisfy
+    #: for a single allocation spike.
+    budget_hysteresis_samples: int = 3
 
 
 DEFAULT_POLICY = Policy()
@@ -78,6 +87,8 @@ _OVERRIDABLE = {
     "staging_pool_bytes": int,
     "io_workers": int,
     "window_fraction": float,
+    "budget_hysteresis_bytes": int,
+    "budget_hysteresis_samples": int,
     "compute_dtype": str,
     "kv_dtype": str,
     "quant_compute_path": str,
@@ -586,6 +597,7 @@ class HardwareProfile:
         self._derive_staging_pool(policy, chosen)
         self._derive_io_workers(policy, chosen)
         self._derive_window(policy, chosen)
+        self._derive_budget_hysteresis(policy, chosen)
         self._derive_dtypes(policy, chosen)
         self._derive_quant_path(policy, chosen)
         self._derive_speculative(policy, chosen)
@@ -712,6 +724,35 @@ class HardwareProfile:
         self.derived["usable_device_bytes"] = Derivation(
             usable, "total_device - reserve",
             {"total_device_bytes": total, "reserve_bytes": reserve})
+
+    def _derive_budget_hysteresis(self, policy, overrides):
+        """How much the live device budget must move, and for how long, before anyone acts on it.
+
+        The budget is measured rather than modelled, so it carries the allocator's own noise: blocks
+        get carved and released constantly, and free memory jogs up and down by that much without
+        anything having really changed. Reacting to that would make the cache evict and refetch on a
+        reading it will take back a sample later, which costs a whole streaming pass to learn
+        nothing. So the threshold is floored at the fragmentation actually measured on this machine
+        -- the size of the noise itself -- and never at a round number chosen elsewhere.
+        """
+        total = self.device_total_bytes or 0
+        usable = self.derived["usable_device_bytes"].value
+        frag = self.allocator.get("fragmentation_ratio")
+        churn = int(total * (frag or 0.0))
+        floor = int(usable * policy.budget_hysteresis_fraction)
+        self._set("budget_hysteresis_bytes", max(floor, churn),
+                  "max(usable_device * budget_hysteresis_fraction, "
+                  "total_device * measured_fragmentation_ratio)", {
+                      "usable_device_bytes": usable,
+                      "total_device_bytes": total,
+                      "budget_hysteresis_fraction": policy.budget_hysteresis_fraction,
+                      "measured_fragmentation_ratio": frag,
+                      "fraction_floor_bytes": floor,
+                      "measured_churn_bytes": churn,
+                  }, overrides)
+        self._set("budget_hysteresis_samples", int(policy.budget_hysteresis_samples),
+                  "policy: consecutive deviating samples before the published budget moves",
+                  {"budget_hysteresis_samples": policy.budget_hysteresis_samples}, overrides)
 
     def window_max(self, largest_layer_bytes):
         """How many layers of the largest size fit in the window budget. Never below 1.
