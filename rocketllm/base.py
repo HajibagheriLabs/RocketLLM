@@ -20,12 +20,14 @@ from .hw.caps import get_caps
 from .hw.profile import HardwareProfile
 from .quant import detect_backend
 from .quant.safetensors_quant import announce_backend
-from .memory import (CLASS_ALWAYS, KIND_DENSE, PinCandidate, TieredWeightCache, pin_budget_from,
-                     plan_pins)
+from .memory import (CLASS_ALWAYS, KIND_DENSE, PinCandidate, TieredWeightCache, expert_kind,
+                     is_expert, pin_budget_from, plan_pins)
+from .moe import (LAYOUT_MODULE_LIST, ExpertContainer, ExpertLayout, RouterSelection,
+                  detect_expert_layout, resolve_top_k, summarize as summarize_experts)
 from .streaming import HostStagingPool, LayerLoader, WeightTransfer
 from .profiler import LayeredProfiler
 
-from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
+from .utils import clean_memory, load_layer, load_layer_rows, load_layer_subset, \
     find_or_create_local_splitted_path, reject_compression_argument
 from .persist import ModelPersister
 
@@ -57,16 +59,19 @@ def restore_relocated_transformers_symbols():
 
 
 class _ResidentModule:
-    """One streamed module's weights, wherever they currently are.
+    """One streamed unit's weights, wherever they currently are.
+
+    A unit is a dense module or a single MoE expert -- the cache keys both the same way, so this
+    carries the cache key rather than a layer index.
 
     `host` is the CPU-side state dict and `moved` is the list of parameter names currently bound on
     the device. Both, one, or neither may be set: that is what the cache's tiers mean here.
     """
 
-    __slots__ = ("idx", "host", "moved")
+    __slots__ = ("key", "host", "moved")
 
-    def __init__(self, idx, host=None, moved=None):
-        self.idx = idx
+    def __init__(self, key, host=None, moved=None):
+        self.key = key
         self.host = host
         self.moved = moved
 
@@ -605,97 +610,265 @@ class RocketModel:
             module.register_forward_pre_hook(self._pre_hook)
             module.register_forward_hook(self._post_hook)
 
-    # ---- per-expert streaming ---------------------------------------------------------------
+    # ---- MoE expert streaming ---------------------------------------------------------------
 
     def _setup_expert_streaming(self):
-        """Stream individual MoE experts instead of whole decoder layers, where that is possible.
+        """Stream individual MoE experts instead of whole decoder layers, wherever a layer has any.
 
-        A sparse MoE layer holds hundreds of experts but routes each token to a handful of them.
-        Materialising the whole layer is therefore enormously wasteful: for Kimi K3 a layer's
-        experts are ~55GB expanded, of which a token touches ~1GB. Because the model calls each
-        selected expert as its own module (and skips unselected ones), a forward hook per expert
-        loads exactly the experts that actually run.
+        A sparse MoE layer holds tens to hundreds of experts and routes each token to a handful, so
+        materialising the layer moves one or two orders of magnitude more bytes than the token
+        reads: a Kimi K3 layer's experts are ~55GB expanded, of which a token touches ~1GB.
 
-        This needs `expert_prefix` in layer_names_dict and safetensors shards, since it relies on
-        reading individual tensors out of a shard.
+        Which layers those are is worked out from structure -- see rocketllm.moe.detect -- rather
+        than from a subclass declaring `expert_prefix`. That declaration was the old gate, and it
+        meant exactly one architecture got this and every other mixture streamed whole layers. It
+        survives as a manual override for a checkpoint whose experts detection cannot see.
+
+        Both layouts land here, and what each one saves differs.
+
+        A list of expert modules gets a forward hook per expert, and each expert becomes a cache
+        entry in its own right. That is the saving which holds unconditionally: residency is decided
+        per expert against the device budget instead of a layer being kept or dropped whole, so a
+        budget too small to hold one layer still holds a useful number of that layer's experts,
+        where whole-layer caching would keep nothing at all. Whether the *read* also drops is the
+        model's decision rather than ours -- an implementation that walks every expert and masks the
+        unrouted ones (transformers 4.51's Mixtral and Qwen2-MoE do exactly this) still touches them
+        all, while one that skips them reads only the routed few. The engine loads whatever runs.
+
+        A fused ``[num_experts, ...]`` tensor has no per-expert module to hook, so its container is
+        hooked instead and reads only the rows the router just chose. There the read always drops,
+        because the selection is intercepted rather than inferred from which modules get called.
         """
         self._expert_streaming = False
-        self._expert_keys = {}
         self._non_expert_keys = {}
+        self._expert_layouts = {}
+        #: Cache key -> the checkpoint tensors that expert is made of, and what they cost packed.
+        self._expert_tensor_keys = {}
+        self._expert_byte_counts = {}
 
-        expert_prefix = self.layer_names_dict.get('expert_prefix')
-        if not expert_prefix:
-            return
+        # Both layouts read individual tensors -- or individual rows of one -- out of a shard, which
+        # is a safetensors capability. Other persisters store something this cannot seek into.
         if type(ModelPersister.get_model_persister()).__name__ != 'SafetensorModelPersister':
             return
 
         layer_prefix = self.layer_names_dict['layer_prefix']
-        hooked = 0
+        hooked_experts = 0
+        fused_containers = 0
+        skipped = []
 
         for idx in self._streamed_indices:
             layer_name = self.layer_names[idx]
             if not layer_name.startswith(layer_prefix + '.'):
                 continue
             try:
-                names = layer_tensor_names(self.checkpoint_path, layer_name)
-            except Exception:
+                shapes, packed_bytes = self._layer_tensor_specs(layer_name)
+            except Exception:  # noqa: BLE001 - a layer we cannot inspect simply streams whole
                 continue
 
-            marker = f'.{expert_prefix}.'
-            per_expert = {}
-            others = []
-            for key in names:
-                pos = key.find(marker)
-                if pos == -1:
-                    others.append(key)
+            layout = detect_expert_layout(self.layers[idx], shapes, layer_name, self.config)
+            skipped.extend(layout.skipped)
+            containers = list(layout.containers) or self._configured_containers(shapes)
+
+            accepted = []
+            for container in containers:
+                reason = self._cannot_stream_alone(container)
+                if reason is not None:
+                    skipped.append((container.path, reason))
                     continue
-                rest = key[pos + len(marker):]
-                head = rest.split('.', 1)[0]
-                if not head.isdigit():
-                    others.append(key)
+                if container.is_fused:
+                    if self._hook_fused_container(idx, layer_name, container):
+                        accepted.append(container)
+                        fused_containers += 1
                     continue
+                count = self._hook_expert_modules(idx, container, packed_bytes)
+                if count:
+                    accepted.append(container)
+                    hooked_experts += count
+
+            if not accepted:
+                continue
+            # Recomputed rather than taken from the layout, because a container detection was happy
+            # with may still have been rejected just above; its tensors have to go back to the
+            # layer's own stream or nothing would ever load them.
+            owned = {key for container in accepted for key in container.keys}
+            self._non_expert_keys[idx] = [key for key in shapes if key not in owned]
+            self._expert_layouts[idx] = ExpertLayout(containers=tuple(accepted),
+                                                     other_keys=tuple(self._non_expert_keys[idx]))
+
+        self._expert_streaming = bool(hooked_experts or fused_containers)
+        self._report_expert_streaming(hooked_experts, fused_containers, skipped)
+
+    def _layer_tensor_specs(self, layer_name):
+        """Every tensor in a layer's shard, from the header alone -- shapes and packed sizes.
+
+        Detection needs the shapes; the cache needs the byte counts to size an expert before it
+        decides whether to keep it. Neither reads a byte of tensor data.
+        """
+        placements = self.loader.plan(layer_name).placements
+        return ({p.name: p.shape for p in placements},
+                {p.name: p.nbytes for p in placements})
+
+    def _cannot_stream_alone(self, container):
+        """Why a container has to stream with its layer, or None when it can stream by itself."""
+        if container.is_fused:
+            for key in container.keys:
+                if self.quant.needs_quantizer(key):
+                    return ("the checkpoint's quantizer reconstructs this tensor and needs all of "
+                            "it, not the routed rows")
+        return None
+
+    def _configured_containers(self, shapes):
+        """The container a subclass named outright, for when structure alone did not find it.
+
+        `expert_prefix` used to be the only way in. It stays as the manual override that this
+        project's working rules ask of every automatic decision -- measurement first, an override
+        behind it -- and it runs only when detection came back empty, so a checkpoint whose experts
+        are found structurally is never second-guessed by a stale hint.
+        """
+        prefix = self.layer_names_dict.get('expert_prefix')
+        if not prefix:
+            return []
+        marker = f'.{prefix}.'
+        per_expert = {}
+        for key in shapes:
+            pos = key.find(marker)
+            if pos == -1:
+                continue
+            head = key[pos + len(marker):].split('.', 1)[0]
+            if head.isdigit():
                 per_expert.setdefault(int(head), []).append(key)
+        if len(per_expert) < 2:
+            return []
+        return [ExpertContainer(layout=LAYOUT_MODULE_LIST, path=prefix,
+                                num_experts=len(per_expert),
+                                top_k=resolve_top_k(self.config, len(per_expert)),
+                                expert_keys={i: tuple(k) for i, k in per_expert.items()})]
 
-            if not per_expert:
-                continue
+    def _hook_expert_modules(self, idx, container, packed_bytes):
+        """A forward hook per expert module. Returns how many were hooked.
 
-            layer_module = self.layers[idx]
-            experts_container = layer_module
+        Each expert becomes a cache entry in its own right, keyed the way the cache already expects
+        one, so residency and eviction are decided for it individually rather than for the layer it
+        happens to sit in.
+        """
+        try:
+            experts = self.layers[idx].get_submodule(container.path)
+        except AttributeError:
+            return 0
+        hooked = 0
+        for expert_idx, keys in container.expert_keys.items():
             try:
-                for attr in expert_prefix.split('.'):
-                    experts_container = getattr(experts_container, attr)
+                module = experts.get_submodule(str(expert_idx))
             except AttributeError:
                 continue
+            key = (idx, expert_kind(expert_idx))
+            self._expert_tensor_keys[key] = keys
+            self._expert_byte_counts[key] = sum(packed_bytes.get(name, 0) for name in keys)
+            module._rocketllm_expert = key
+            module.register_forward_pre_hook(self._expert_pre_hook)
+            module.register_forward_hook(self._expert_post_hook)
+            hooked += 1
+        return hooked
 
-            self._non_expert_keys[idx] = others
-            self._expert_keys[idx] = per_expert
+    def _hook_fused_container(self, idx, layer_name, container):
+        """Watch the router, then stream the rows it chose into the fused tensor."""
+        layer = self.layers[idx]
+        try:
+            experts = layer.get_submodule(container.path)
+            router = layer.get_submodule(container.router_path)
+        except AttributeError:
+            return False
 
-            for expert_idx, keys in per_expert.items():
-                if expert_idx >= len(experts_container):
-                    continue
-                expert_module = experts_container[expert_idx]
-                expert_module._rocketllm_expert = (idx, expert_idx)
-                expert_module.register_forward_pre_hook(self._expert_pre_hook)
-                expert_module.register_forward_hook(self._expert_post_hook)
-                hooked += 1
+        selection = RouterSelection(container.num_experts, container.top_k,
+                                    path=f"{layer_name}.{container.path}")
+        router._rocketllm_selection = selection
+        router.register_forward_hook(self._router_hook)
 
-        if hooked:
-            self._expert_streaming = True
-            n_layers = len(self._expert_keys)
-            print(f"per-expert streaming enabled: {hooked} experts across {n_layers} layers "
-                  f"load on demand, so only the experts a token routes to are materialised.")
+        experts._rocketllm_fused = (idx, container, selection)
+        experts.register_forward_pre_hook(self._fused_pre_hook)
+        experts.register_forward_hook(self._fused_post_hook)
+        return True
+
+    def _report_expert_streaming(self, hooked_experts, fused_containers, skipped):
+        """Say what was found, at load, once. A user who lost the fast path has to be able to see."""
+        for line in summarize_experts(self._expert_layouts):
+            print(f"MoE: {line}")
+        if hooked_experts:
+            print(f"per-expert streaming: {hooked_experts} expert modules across "
+                  f"{len(self._expert_layouts)} layers are cached individually, so residency is "
+                  f"decided per expert rather than per layer.")
+        if fused_containers:
+            print(f"fused-expert streaming: {fused_containers} containers read only the rows their "
+                  f"router selects, so a token costs its own experts' bytes, not the layer's.")
+        for reason in dict.fromkeys(reason for _, reason in skipped):
+            print(f"expert container streamed with its layer instead: {reason}")
 
     def _expert_pre_hook(self, module, args):
-        layer_idx, expert_idx = module._rocketllm_expert
-        keys = self._expert_keys[layer_idx][expert_idx]
-        state_dict = load_layer_subset(self.checkpoint_path, self.layer_names[layer_idx], keys)
-        module._rocketllm_moved = self.move_layer_to_device(state_dict)
+        """Hand an expert to the cache, exactly as a dense module's hook does.
+
+        Going through the cache rather than reading the shard here is what stops a mixture paying
+        for the same expert on every token. An expert that is still resident from the last token
+        costs nothing; one that is not is read, and then competes for residency on its measured
+        popularity -- the LFU half of the cache's policy, which exists for precisely this and had no
+        caller until now.
+        """
+        self.cache.acquire(module._rocketllm_expert)
 
     def _expert_post_hook(self, module, args, output):
+        self.cache.release(module._rocketllm_expert)
+        return output
+
+    def _router_hook(self, module, args, output):
+        module._rocketllm_selection.observe(output)
+        return output
+
+    def _fused_pre_hook(self, module, args):
+        idx, container, selection = module._rocketllm_fused
+        layer_name = self.layer_names[idx]
+        rows = selection.take()
+        if rows is None:
+            # The router's choice could not be read. Every row is always correct, and costs what a
+            # whole layer has always cost -- which is the behaviour this replaces, not a regression.
+            state_dict = load_layer_subset(self.checkpoint_path, layer_name, container.keys)
+            module._rocketllm_moved = self.move_layer_to_device(state_dict)
+            return
+        compact = load_layer_rows(self.checkpoint_path, layer_name,
+                                  {key: rows for key in container.keys})
+        module._rocketllm_moved = self._place_expert_rows(container, rows, compact)
+
+    def _fused_post_hook(self, module, args, output):
         for param_name in getattr(module, '_rocketllm_moved', []):
             set_module_tensor_to_device(self.model, param_name, 'meta')
         module._rocketllm_moved = []
         return output
+
+    def _place_expert_rows(self, container, rows, compact):
+        """Bind a fused expert tensor holding only the rows this token routed to.
+
+        The parameter keeps its full width. The module's forward indexes it by expert ordinal, and
+        narrowing it would mean rewriting a forward that differs per architecture -- precisely what
+        this engine exists not to do, and what stops it needing a code change per model. So the
+        destination is allocated at the checkpoint's shape and the routed rows are scattered in.
+
+        Zero is the right filler for the rest, and not by luck: a row the router did not choose is
+        multiplied by a zero routing weight, which is what routing *is*. Architectures put the zero
+        in different places -- Llama 4 scales the expert's input by the score, others mask its
+        output or never call it -- and every one of them leaves the unrouted weights unable to reach
+        the result. What this saves is the read. Storage and the link carry the token's own experts
+        rather than the whole layer's, which is the tier that dominates on a streaming machine.
+        Device memory is unchanged, because the full-width tensor still has to exist.
+        """
+        moved = []
+        index = torch.tensor(list(rows), device=self.running_device, dtype=torch.long)
+        for key, value in compact.items():
+            target = self.quant.target_dtype(key, value)
+            full = torch.zeros(container.fused_shapes[key], dtype=target,
+                               device=self.running_device)
+            self._adopt_checkpoint_shape(key, full)
+            full.index_copy_(0, index, value.to(device=self.running_device, dtype=target))
+            set_module_tensor_to_device(self.model, key, self.running_device, value=full)
+            moved.append(key)
+        return moved
 
     def _knob(self, name, fallback=0):
         """A tuning value: the caller's override, else the profile's measurement, else a floor."""
@@ -737,7 +910,7 @@ class RocketModel:
         pinned = self._plan_pins(device_bytes, window_budget, largest)
 
         self.cache = TieredWeightCache(
-            fetch=self._cache_fetch, sizer=lambda key: self._layer_packed_bytes(key[0]),
+            fetch=self._cache_fetch, sizer=self._packed_bytes,
             to_device=self._cache_to_device, to_host=self._cache_to_host,
             discard=self._cache_discard,
             sequence=self._cache_sequence if self.prefetching else None,
@@ -775,8 +948,11 @@ class RocketModel:
     # ---- the cache's view of a streamed module ----------------------------------------------
 
     def _cache_fetch(self, key):
-        """Storage tier: read a module's shard. Runs on a prefetch worker, so it only reads."""
-        return _ResidentModule(key[0], host=self._load_streamed_layer(key[0]))
+        """Storage tier: read a unit's tensors. Runs on a prefetch worker, so it only reads."""
+        if is_expert(key[1]):
+            return _ResidentModule(key, host=load_layer_subset(
+                self.checkpoint_path, self.layer_names[key[0]], self._expert_tensor_keys[key]))
+        return _ResidentModule(key, host=self._load_streamed_layer(key[0]))
 
     def _cache_to_device(self, resident):
         """Device tier: place the weights and bind them to the module.
@@ -790,7 +966,7 @@ class RocketModel:
             # tier. A pinned entry never is, and neither is anything when there is no host tier, so
             # in both cases holding the CPU-side copy is pure waste -- and on a model that fits
             # entirely on the device that is every layer.
-            pinned = (resident.idx, KIND_DENSE) in self.cache.pinned
+            pinned = resident.key in self.cache.pinned
             if not self._keep_host_copies or pinned:
                 resident.host = None
         return resident
@@ -824,8 +1000,12 @@ class RocketModel:
 
         A forward runs embed -> layers -> norm -> lm_head in order, so lookahead is just the next
         few streamed indices. There is no cross-layer lookahead for MoE experts and none is implied
-        here: layer L's router has not run when layer L is being fetched.
+        here: layer L's router has not run when layer L is being fetched, so which experts layer
+        L+1 will want is not merely unknown, it is undefined. The guard below states that rather
+        than leaving it to the fact that nothing currently asks.
         """
+        if is_expert(key[1]):
+            return []
         idx = key[0]
         upcoming = []
         for step in range(1, max(1, width) + 1):
@@ -834,6 +1014,12 @@ class RocketModel:
                 break
             upcoming.append((nxt, KIND_DENSE))
         return upcoming
+
+    def _packed_bytes(self, key):
+        """Packed bytes of one cached unit, dense module or single expert."""
+        if is_expert(key[1]):
+            return self._expert_byte_counts.get(key, 0)
+        return self._layer_packed_bytes(key[0])
 
     def _layer_packed_bytes(self, idx):
         """Packed bytes of one streamed module, read from the shard header rather than the data."""

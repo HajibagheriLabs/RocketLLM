@@ -96,6 +96,27 @@ def load_layer_subset(local_path, layer_name, keys):
     return out
 
 
+def load_layer_rows(local_path, layer_name, rows):
+    """Read only the given rows of each named tensor out of a layer shard.
+
+    This is the fused-expert read. Where a mixture stores its experts as one batched tensor there is
+    no per-expert tensor to ask for, but safetensors can still seek inside one: ``get_slice(key)[e]``
+    reads that row's bytes and nothing else. So a token that routes to 8 of 128 experts pays for 8,
+    exactly as it would under the per-expert layout.
+
+    `rows` maps a tensor name to the row indices wanted. The result is one compacted tensor per name,
+    its rows in the order they were asked for -- the caller knows where each belongs and scatters
+    them into the full-width parameter on the device.
+    """
+    out = {}
+    with safe_open(str(Path(local_path) / (layer_name + ".safetensors")), framework="pt") as f:
+        for k, indices in rows.items():
+            entry = f.get_slice(k)
+            parts = [entry[i:i + 1] for i in indices]
+            out[k] = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+    return out
+
+
 def load_layer(local_path, layer_name):
     """Read one module's shard off disk, exactly as it is stored.
 

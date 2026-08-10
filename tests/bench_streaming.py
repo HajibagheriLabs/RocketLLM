@@ -506,7 +506,8 @@ def load_model(args, device):
     module_name, class_name = AutoModel.get_module_class(args.model)
     model_cls = getattr(importlib.import_module(module_name), class_name)
     print(f"streaming class: {class_name}")
-    return model_cls(args.model, device=str(device), prefetching=not args.no_prefetch)
+    return model_cls(args.model, device=str(device), prefetching=not args.no_prefetch,
+                     vram_reserve=args.vram_reserve)
 
 
 def run(args, device):
@@ -940,6 +941,10 @@ def main():
                         help=f"write the result record under {RESULTS_DIR.name}/")
     parser.add_argument("--out", default=None, help="explicit path for the result record")
     parser.add_argument("--compare-to", default=None, help="a previous result record to diff against")
+    parser.add_argument("--vram-reserve", type=int, default=None,
+                        help="bytes of device memory to hold back, shrinking the weight cache. "
+                             "--max-vram-gb caps the allocator but not the measured budget, so this "
+                             "is the lever for benchmarking a model that does not fit")
     parser.add_argument("--force", action="store_true",
                         help="compare across different hardware profiles anyway")
     parser.add_argument("--no-prefetch", action="store_true",

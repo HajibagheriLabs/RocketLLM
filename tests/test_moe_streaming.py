@@ -1,0 +1,551 @@
+"""End-to-end tests for MoE expert streaming.
+
+Detection deciding correctly is one thing; the engine then streaming the right bytes and producing
+the right numbers is another, and only this file checks the second. Each model is built, saved,
+loaded once normally and once through RocketLLM, and the two sets of logits must be *identical* --
+not close. Streaming changes when a weight is on the device, never what it holds, so any difference
+at all is a bug rather than a tolerance.
+
+Three paths are covered because this change can break any of them independently:
+
+  * a mixture stored as a list of expert modules, which streams one expert at a time;
+  * a mixture stored as fused ``[num_experts, ...]`` tensors, which streams the routed rows of one;
+  * a dense model, which must be entirely unaffected and has no MoE assertion of its own to fail.
+
+The fused architecture here is synthetic. It is written to the contract every real fused mixture
+follows -- experts batched into one tensor per projection, a router sibling, and unrouted experts
+scaled to zero -- because the small real ones are awkward to run on CPU, and pinning these
+assertions to one vendor's model would test that model rather than the contract.
+
+Savings are asserted as well as correctness, since a path that quietly streamed everything would
+still produce the right logits and would still be a total regression of the feature. What can be
+asserted differs by layout, and the difference is real rather than an oversight: the fused path
+intercepts the router, so a one-token forward provably reads exactly top-k rows. The module-list
+path streams whichever expert modules the model chooses to call, and some transformers versions call
+every expert and mask the unrouted ones -- so what is pinned there is the guarantee that does hold,
+that the experts are loaded one at a time and never all resident together.
+
+Runs on CPU by default. Set ROCKETLLM_TEST_DEVICE to exercise an accelerator's transfer path.
+"""
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+from rocketllm import base as base_module
+from rocketllm.base import RocketModel
+from rocketllm.memory import is_expert
+from rocketllm.moe.detect import LAYOUT_FUSED, LAYOUT_MODULE_LIST
+
+PROMPT = torch.tensor([[1, 5, 9, 14, 3]])
+ONE_TOKEN = torch.tensor([[7]])
+
+#: CPU by default so this file runs on a plain CI runner, which is a property the suite has to keep.
+#: Point it at an accelerator to exercise the real transfer path -- async copy streams, a genuine
+#: host-to-device copy, and the device-side scatter the fused path does -- none of which the CPU
+#: backend reaches. The reference runs on the same device, because the comparison is streaming
+#: against no streaming, not one device's kernels against another's.
+DEVICE = os.environ.get("ROCKETLLM_TEST_DEVICE", "cpu")
+
+
+class StreamedModel(RocketModel):
+    """RocketModel without the tokenizer, which these checkpoints have no reason to ship."""
+
+    def get_tokenizer(self, hf_token=None):
+        return None
+
+
+# -- a synthetic fused-expert architecture ---------------------------------------------------------
+
+class FusedMoeConfig(PretrainedConfig):
+    model_type = "rocketllm_test_fused_moe"
+
+    def __init__(self, hidden_size=16, expert_inner=12, num_hidden_layers=2, num_local_experts=4,
+                 num_experts_per_tok=2, vocab_size=32, **kwargs):
+        self.hidden_size = hidden_size
+        self.expert_inner = expert_inner
+        self.num_hidden_layers = num_hidden_layers
+        self.num_local_experts = num_local_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.vocab_size = vocab_size
+        kwargs.setdefault("tie_word_embeddings", False)
+        super().__init__(**kwargs)
+
+
+class FusedExperts(nn.Module):
+    """Every expert batched into one tensor per projection, run with a single bmm."""
+
+    def __init__(self, config):
+        super().__init__()
+        experts, hidden, inner = (config.num_local_experts, config.hidden_size,
+                                  config.expert_inner)
+        self.gate_up_proj = nn.Parameter(torch.empty(experts, hidden, 2 * inner))
+        self.down_proj = nn.Parameter(torch.empty(experts, inner, hidden))
+
+    def forward(self, routed):
+        gate_up = torch.bmm(routed, self.gate_up_proj)
+        gate, up = gate_up.chunk(2, dim=-1)
+        return torch.bmm(up * torch.nn.functional.silu(gate), self.down_proj)
+
+
+class FusedMoeBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
+        self.experts = FusedExperts(config)
+        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+
+    def forward(self, hidden):
+        shape = hidden.shape
+        flat = hidden.reshape(-1, self.hidden_size)
+        logits = self.router(flat)
+        top_values, top_indices = torch.topk(logits, self.top_k, dim=-1)
+        # Unselected experts get -inf, so the sigmoid below makes their scale exactly zero. That is
+        # what lets the engine leave their rows unread: a zero-scaled input carries no weight of
+        # theirs into the result. Real fused mixtures do the same thing.
+        scores = torch.sigmoid(torch.full_like(logits, float("-inf"))
+                               .scatter_(1, top_indices, top_values))
+        routed = flat.unsqueeze(0).expand(self.num_experts, -1, -1) * scores.t().unsqueeze(-1)
+        return self.experts(routed).sum(dim=0).reshape(shape)
+
+
+class FusedMoeLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(config.hidden_size)
+        self.attn_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.mlp = FusedMoeBlock(config)
+
+    def forward(self, hidden):
+        hidden = hidden + self.attn_proj(self.input_layernorm(hidden))
+        return hidden + self.mlp(hidden)
+
+
+class FusedMoePreTrainedModel(PreTrainedModel):
+    config_class = FusedMoeConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = False
+    _supports_sdpa = True
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.15)
+        elif isinstance(module, FusedExperts):
+            module.gate_up_proj.data.normal_(mean=0.0, std=0.15)
+            module.down_proj.data.normal_(mean=0.0, std=0.15)
+
+
+class FusedMoeModel(FusedMoePreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([FusedMoeLayer(config)
+                                     for _ in range(config.num_hidden_layers)])
+        self.norm = nn.LayerNorm(config.hidden_size)
+        self.post_init()
+
+    def forward(self, input_ids):
+        hidden = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            hidden = layer(hidden)
+        return self.norm(hidden)
+
+
+class FusedMoeForCausalLM(FusedMoePreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = FusedMoeModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+    def forward(self, input_ids=None, **kwargs):
+        return CausalLMOutputWithPast(logits=self.lm_head(self.model(input_ids)))
+
+
+def register_fused_architecture():
+    """Make the synthetic architecture visible to AutoConfig / AutoModelForCausalLM."""
+    try:
+        AutoConfig.register(FusedMoeConfig.model_type, FusedMoeConfig)
+        AutoModelForCausalLM.register(FusedMoeConfig, FusedMoeForCausalLM)
+    except ValueError:
+        pass  # already registered by an earlier test in this process
+
+
+# -- helpers ----------------------------------------------------------------------------------------
+
+def save(model, root):
+    model = model.to(torch.float32).eval()
+    model.config.torch_dtype = "float32"
+    model.save_pretrained(root, safe_serialization=True)
+    return model
+
+
+def mixtral(root):
+    from transformers import MixtralConfig, MixtralForCausalLM
+    config = MixtralConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+                           num_attention_heads=4, num_key_value_heads=2, vocab_size=128,
+                           num_local_experts=4, num_experts_per_tok=2,
+                           max_position_embeddings=64, tie_word_embeddings=False)
+    return save(MixtralForCausalLM(config), root)
+
+
+def qwen2_moe(root):
+    from transformers import Qwen2MoeConfig, Qwen2MoeForCausalLM
+    config = Qwen2MoeConfig(hidden_size=32, intermediate_size=64, moe_intermediate_size=32,
+                            shared_expert_intermediate_size=48, num_hidden_layers=2,
+                            num_attention_heads=4, num_key_value_heads=2, vocab_size=128,
+                            num_experts=4, num_experts_per_tok=2, decoder_sparse_step=1,
+                            max_position_embeddings=64, tie_word_embeddings=False)
+    return save(Qwen2MoeForCausalLM(config), root)
+
+
+def dense_llama(root):
+    from transformers import LlamaConfig, LlamaForCausalLM
+    config = LlamaConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+                         num_attention_heads=4, num_key_value_heads=2, vocab_size=128,
+                         max_position_embeddings=64, tie_word_embeddings=False)
+    return save(LlamaForCausalLM(config), root)
+
+
+def fused_moe(root):
+    register_fused_architecture()
+    return save(FusedMoeForCausalLM(FusedMoeConfig()), root)
+
+
+class StreamingCase(unittest.TestCase):
+    """Builds one checkpoint per class and reuses it: saving and splitting dominates the runtime."""
+
+    build = None
+
+    @classmethod
+    def setUpClass(cls):
+        if cls.build is None:
+            raise unittest.SkipTest("base class")
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls._tmp.name) / "model"
+        cls.root.mkdir(parents=True)
+        cls.reference = cls.build(cls.root).to(DEVICE)
+        with torch.no_grad():
+            cls.expected = cls.reference(PROMPT.to(DEVICE)).logits
+            cls.expected_one = cls.reference(ONE_TOKEN.to(DEVICE)).logits
+
+    @classmethod
+    def tearDownClass(cls):
+        tmp = getattr(cls, "_tmp", None)
+        if tmp is not None:
+            tmp.cleanup()
+
+    def stream(self):
+        return StreamedModel(str(self.root), device=DEVICE, dtype=torch.float32)
+
+    def assert_identical(self, model, ids, expected):
+        with torch.no_grad():
+            got = model(ids.to(DEVICE)).logits
+        self.assertEqual(got.shape, expected.shape)
+        self.assertTrue(torch.equal(got, expected),
+                        f"streamed logits differ by up to "
+                        f"{(got - expected).abs().max().item():.3e}; streaming must not change the "
+                        f"arithmetic, only where the weights live")
+
+
+class TestModuleListStreaming(StreamingCase):
+    build = staticmethod(mixtral)
+
+    def test_logits_are_identical_to_a_full_load(self):
+        model = self.stream()
+        try:
+            self.assert_identical(model, PROMPT, self.expected)
+        finally:
+            model.close()
+
+    def test_the_layout_is_recognised(self):
+        model = self.stream()
+        try:
+            self.assertTrue(model._expert_streaming)
+            self.assertEqual(len(model._expert_layouts), 2)
+            for layout in model._expert_layouts.values():
+                container = layout.containers[0]
+                self.assertEqual(container.layout, LAYOUT_MODULE_LIST)
+                self.assertEqual(container.num_experts, 4)
+                self.assertEqual(container.top_k, 2)
+        finally:
+            model.close()
+
+    def test_experts_are_not_loaded_with_their_layer(self):
+        """The saving only exists if the layer's own stream stops carrying the expert weights."""
+        model = self.stream()
+        try:
+            for idx, keys in model._non_expert_keys.items():
+                self.assertTrue(keys)
+                self.assertFalse([k for k in keys if ".experts." in k],
+                                 f"layer {idx} still streams expert tensors with the layer")
+        finally:
+            model.close()
+
+    def test_experts_are_cached_under_expert_keys(self):
+        """An expert filed as a dense entry would get a replacement policy chosen for something else.
+
+        The cache runs LFU-with-aging for experts and FIFO-plus-pinning for dense modules, and the
+        asymmetry is deliberate: expert popularity is skewed and predicts itself, while a cyclic
+        scan over decoder layers defeats any recency rule. The keys are what select between them.
+        """
+        model = self.stream()
+        try:
+            with torch.no_grad():
+                model(ONE_TOKEN.to(DEVICE))
+            keys = list(model._expert_tensor_keys)
+            self.assertTrue(keys)
+            self.assertTrue(all(is_expert(key[1]) for key in keys),
+                            f"expert entries are not keyed as experts: {keys[:3]}")
+            self.assertTrue(all(count > 0 for count in model._expert_byte_counts.values()),
+                            "an expert sized at zero bytes is free to keep and never evicted")
+        finally:
+            model.close()
+
+    def test_a_repeated_forward_does_not_re_read_its_experts(self):
+        """Residency across tokens is the reason experts go through the cache at all.
+
+        Without it a mixture re-reads every expert it touches on every token, which is worse than
+        the whole-layer streaming it replaced, because that at least kept the layer resident.
+        """
+        model = self.stream()
+        try:
+            with torch.no_grad():
+                model(ONE_TOKEN.to(DEVICE))
+            if model.cache.device.capacity <= 0:
+                # Pure streaming: nothing is kept, by design, and re-reading is then correct.
+                self.skipTest("device budget computes to zero, so the cache keeps nothing")
+            before = model.cache.report()["fetches"]
+            with torch.no_grad():
+                model(ONE_TOKEN.to(DEVICE))
+            self.assertEqual(model.cache.report()["fetches"], before,
+                             "the second token re-read weights the cache already held")
+        finally:
+            model.close()
+
+    def test_reset_gives_the_experts_back(self):
+        """Residency is bounded by the generation: reset() has to release experts like anything else."""
+        model = self.stream()
+        try:
+            with torch.no_grad():
+                model(ONE_TOKEN.to(DEVICE))
+            model.reset()
+            experts = model.model.model.layers[0].block_sparse_moe.experts
+            devices = {p.device.type for expert in experts for p in expert.parameters()}
+            self.assertEqual(devices, {"meta"})
+        finally:
+            model.close()
+
+
+class TestSharedExpertsStayWithTheLayer(StreamingCase):
+    """Qwen2-MoE: a mixture with a shared expert beside the routed ones.
+
+    A shared expert runs for every token, so streaming it per expert would add reads and save
+    nothing. It has to be recognised as part of the layer rather than part of the mixture, and that
+    is what these check.
+    """
+
+    build = staticmethod(qwen2_moe)
+
+    def test_logits_are_identical_to_a_full_load(self):
+        model = self.stream()
+        try:
+            self.assert_identical(model, PROMPT, self.expected)
+        finally:
+            model.close()
+
+    def test_the_shared_expert_and_router_stream_with_the_layer(self):
+        model = self.stream()
+        try:
+            self.assertTrue(model._non_expert_keys)
+            for keys in model._non_expert_keys.values():
+                self.assertTrue([k for k in keys if "shared_expert" in k])
+                self.assertTrue([k for k in keys if k.endswith("mlp.gate.weight")])
+                self.assertFalse([k for k in keys if ".experts." in k])
+        finally:
+            model.close()
+
+    def test_each_routed_expert_is_loaded_at_most_once_per_forward(self):
+        """Re-reading an expert within one forward would be a straight loss over whole-layer."""
+        model = self.stream()
+        loaded = []
+        original = model._expert_pre_hook
+
+        def counting(module, args):
+            original(module, args)
+            loaded.append(id(module))
+
+        for mod in model.model.modules():
+            if hasattr(mod, "_rocketllm_expert"):
+                mod._forward_pre_hooks.clear()
+                mod.register_forward_pre_hook(counting)
+        try:
+            with torch.no_grad():
+                model(ONE_TOKEN.to(DEVICE))
+        finally:
+            model.close()
+
+        self.assertTrue(loaded)
+        self.assertEqual(len(loaded), len(set(loaded)))
+        # How many of the eight actually run is the model's decision, not the engine's: transformers
+        # 4.51 walks every expert in the layer, later versions skip the unrouted ones. The engine
+        # loads exactly those that run, whichever it is.
+        self.assertLessEqual(len(loaded), 8)
+
+
+class TestFusedStreaming(StreamingCase):
+    build = staticmethod(fused_moe)
+
+    def test_logits_are_identical_to_a_full_load(self):
+        model = self.stream()
+        try:
+            self.assert_identical(model, PROMPT, self.expected)
+        finally:
+            model.close()
+
+    def test_a_single_token_is_identical_too(self):
+        """Decode is the case that matters: one token, and only its own experts read."""
+        model = self.stream()
+        try:
+            self.assert_identical(model, ONE_TOKEN, self.expected_one)
+        finally:
+            model.close()
+
+    def test_the_layout_is_recognised(self):
+        model = self.stream()
+        try:
+            self.assertTrue(model._expert_streaming)
+            self.assertEqual(len(model._expert_layouts), 2)
+            for layout in model._expert_layouts.values():
+                container = layout.containers[0]
+                self.assertEqual(container.layout, LAYOUT_FUSED)
+                self.assertEqual(container.path, "mlp.experts")
+                self.assertEqual(container.router_path, "mlp.router")
+                self.assertEqual((container.num_experts, container.top_k), (4, 2))
+        finally:
+            model.close()
+
+    def test_only_the_routed_rows_are_read(self):
+        """The whole point: one expert costs its own bytes, not the layer's."""
+        model = self.stream()
+        requests = []
+        original = base_module.load_layer_rows
+
+        def recording(path, layer_name, rows):
+            requests.append({key: tuple(indices) for key, indices in rows.items()})
+            return original(path, layer_name, rows)
+
+        base_module.load_layer_rows = recording
+        try:
+            with torch.no_grad():
+                model(ONE_TOKEN.to(DEVICE))
+        finally:
+            base_module.load_layer_rows = original
+            model.close()
+
+        self.assertEqual(len(requests), 2, "one row-read per fused container per forward")
+        for request in requests:
+            self.assertEqual({key.rsplit(".", 1)[-1] for key in request},
+                             {"gate_up_proj", "down_proj"},
+                             msg=f"unexpected tensors read: {sorted(request)}")
+            for key, indices in request.items():
+                self.assertEqual(len(indices), 2, f"{key}: a top-2 router read {len(indices)} of 4")
+
+    def test_the_bound_tensor_is_full_width_with_unrouted_rows_zeroed(self):
+        model = self.stream()
+        seen = {}
+
+        def inspect(module, args):
+            seen["gate_up"] = module.gate_up_proj.detach().clone()
+
+        experts = model.model.model.layers[0].mlp.experts
+        experts.register_forward_pre_hook(inspect)  # runs after RocketLLM's, so weights are bound
+        try:
+            with torch.no_grad():
+                model(ONE_TOKEN.to(DEVICE))
+        finally:
+            model.close()
+
+        gate_up = seen["gate_up"]
+        self.assertEqual(tuple(gate_up.shape), (4, 16, 24))
+        nonzero_rows = [e for e in range(4) if gate_up[e].abs().sum() > 0]
+        self.assertEqual(len(nonzero_rows), 2,
+                         "exactly the routed experts should carry weights")
+
+    def test_the_router_is_streamed_with_the_layer(self):
+        """It has to be resident before it can choose, so it is never part of the mixture."""
+        model = self.stream()
+        try:
+            for keys in model._non_expert_keys.values():
+                self.assertTrue([k for k in keys if k.endswith("mlp.router.weight")])
+                self.assertFalse([k for k in keys if "experts." in k])
+        finally:
+            model.close()
+
+    def test_an_unreadable_router_selection_still_produces_the_right_answer(self):
+        """The safe fallback: when the choice cannot be read, every row is read instead.
+
+        Silencing the router hook is how an unfamiliar routing rule looks from here -- the selection
+        slot is simply never filled -- and the answer must still be exact, just slower.
+        """
+        model = self.stream()
+        rows_read = []
+        original = base_module.load_layer_rows
+
+        def recording(path, layer_name, rows):
+            rows_read.append(rows)
+            return original(path, layer_name, rows)
+
+        for mod in model.model.modules():
+            if getattr(mod, "_rocketllm_selection", None) is not None:
+                mod._forward_hooks.clear()
+
+        base_module.load_layer_rows = recording
+        try:
+            self.assert_identical(model, ONE_TOKEN, self.expected_one)
+        finally:
+            base_module.load_layer_rows = original
+            model.close()
+
+        self.assertEqual(rows_read, [], "with no selection the whole container must be read")
+
+
+class TestDenseIsUnaffected(StreamingCase):
+    build = staticmethod(dense_llama)
+
+    def test_logits_are_identical_to_a_full_load(self):
+        model = self.stream()
+        try:
+            self.assert_identical(model, PROMPT, self.expected)
+        finally:
+            model.close()
+
+    def test_no_expert_streaming_is_installed(self):
+        model = self.stream()
+        try:
+            self.assertFalse(model._expert_streaming)
+            self.assertEqual(model._expert_layouts, {})
+            self.assertEqual(model._non_expert_keys, {})
+        finally:
+            model.close()
+
+    def test_layers_still_stream_whole(self):
+        model = self.stream()
+        try:
+            with torch.no_grad():
+                model(ONE_TOKEN.to(DEVICE))
+            hooked = [m for m in model.model.modules() if hasattr(m, "_rocketllm_expert")]
+            self.assertEqual(hooked, [])
+        finally:
+            model.close()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

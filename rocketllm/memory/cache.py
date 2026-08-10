@@ -194,6 +194,13 @@ class TieredWeightCache:
                 entry.refcount += 1
                 return self._resolve(entry)
 
+            if entry is not None and entry.tier == "transient":
+                # Still bound from a claim that has not been released yet. No tier holds it, but the
+                # payload is live and re-reading it would strand the copy already in use.
+                self.stats["hits_device"] += 1
+                entry.refcount += 1
+                return self._resolve(entry)
+
             if entry is not None and entry.tier == "host":
                 # Served from RAM over the link rather than re-read from disk. On a storage-bound
                 # machine this is the difference the host tier exists to make.
@@ -293,11 +300,25 @@ class TieredWeightCache:
         return entry.payload
 
     def release(self, key):
-        """Give up a claim on an entry. It becomes evictable once nobody holds it."""
+        """Give up a claim on an entry. It becomes evictable once nobody holds it.
+
+        A transient entry -- one admitted when there was nowhere to keep it -- is not merely
+        evictable at this point, it is finished, so this is where it is handed back. Without that
+        the pure-streaming configuration never releases anything: the entry is untracked, so nothing
+        else can ever discard it, and the weights stay bound for the rest of the run. That is the
+        exact opposite of streaming, and it is the configuration a device with no spare memory gets.
+        """
         with self._lock:
             entry = self._entries.get(key)
-            if entry is not None and entry.refcount > 0:
+            if entry is None:
+                return
+            if entry.refcount > 0:
                 entry.refcount -= 1
+            if entry.tier != "transient" or entry.refcount > 0:
+                return
+            self._entries.pop(key, None)
+            payload, entry.payload = entry.payload, None
+        self._discard(payload)
 
     def _admit(self, entry):
         self._clock += 1
@@ -307,10 +328,13 @@ class TieredWeightCache:
             # Nowhere to keep it. The caller still gets the payload -- the forward must run -- it
             # simply will not be here next time. This is the pure-streaming configuration, and it
             # is a supported one.
+            #
+            # It stays tracked until the caller releases it, even though no tier holds it. Dropping
+            # it here instead would leave the payload with no owner: release() would find nothing,
+            # and the weights would never be handed back.
             if entry.packed_bytes > self.device.capacity and self.device.capacity > 0:
                 self.stats["rejected_too_large"] += 1
             entry.tier = "transient"
-            self._entries.pop(entry.key, None)
             return
         self.device.add(entry)
         if not is_expert(entry.key[1]):

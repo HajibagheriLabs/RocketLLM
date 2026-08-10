@@ -1,0 +1,418 @@
+"""Finding a decoder layer's experts without being told where they are.
+
+A sparse mixture routes each token to a handful of its experts, so materialising a whole MoE layer
+moves one or two orders of magnitude more bytes than the token actually reads. Streaming experts
+individually is the largest single saving available on such a model -- but only if the engine can
+*find* them, and until now it could not: it had to be handed an ``expert_prefix`` by a subclass, so
+exactly one architecture got the fast path and every other mixture materialised whole layers.
+
+This module removes the configuration. It looks at the model transformers built and at the shapes
+the checkpoint stores, and works out where the experts are from the structure alone. Nothing here
+may key off an architecture name, a class name or a module name: a mixture released next month has
+to work in this build without a code change, and its names are exactly what will be different about
+it. What is stable across every mixture ever shipped is the shape of the thing -- many
+interchangeable sub-modules, or one batched tensor with an expert per row, sitting beside something
+that emits one score per expert.
+
+Two layouts exist in the wild and both are handled.
+
+``module_list``
+    The classic layout: a list of per-expert modules, addressed as ``...experts.7.gate_proj.weight``.
+    A forward hook per expert module streams exactly the experts that run, so neither the router nor
+    the top-k has to be understood at all. Note that "the experts that run" is the model's decision:
+    some implementations call only the routed ones, others walk the whole list and mask the rest, and
+    only the first kind reduces bytes read. Both stop the layer's experts being resident at once.
+    Mixtral, Qwen2/Qwen3-MoE, DeepSeek, OLMoE, Phi-MoE, Granite-MoE and Kimi K3 are all this.
+
+``fused``
+    Recent transformers batches several families' experts into one tensor per projection --
+    ``experts.gate_up_proj`` with shape ``[num_experts, ...]`` -- and runs them with a single
+    ``bmm``. There are no per-expert modules to hook, so the router's selection is read as it is
+    produced and only the routed rows are read out of the shard. Llama 4 and Aria are this.
+
+The result is per-container rather than per-layer, and that matters. A layer holding something this
+module recognises as experts but cannot stream *safely* does not poison the rest of the layer: that
+container's tensors come back in ``other_keys`` and stream with the layer exactly as they did
+before, the reason is recorded, and the layer's other containers still get the fast path. Guessing
+wrong about a mixture means silently wrong output, which is worth giving up every byte of savings to
+avoid -- so each uncertain case resolves to whole-layer streaming and says why.
+"""
+import dataclasses
+import logging
+
+log = logging.getLogger(__name__)
+
+#: The two layouts this module can recognise.
+LAYOUT_MODULE_LIST = "module_list"
+LAYOUT_FUSED = "fused"
+
+#: Config fields a checkpoint may declare its routing width under. This is the one number that
+#: cannot be recovered from structure -- the expert count is a tensor dimension, but how many of
+#: them a token visits is recorded only in the config. These are config field names, not
+#: architecture names: a new mixture spelling it any of these ways works untouched, and one that
+#: spells it otherwise is reported as ambiguous rather than guessed at.
+#:
+#: A bare ``top_k`` is deliberately absent. It is also the name of a sampling parameter, and reading
+#: a generation setting as a routing width would quietly stream the wrong experts.
+TOP_K_KEYS = ("num_experts_per_tok", "num_experts_per_token", "moe_topk", "moe_top_k",
+              "num_selected_experts", "topk_experts", "moe_k")
+
+#: How many entries a container needs before it is called a mixture. Two is the smallest number that
+#: means anything, and low enough to admit the toy mixtures people test with.
+MIN_EXPERTS = 2
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpertContainer:
+    """One streamable group of experts inside a decoder layer."""
+
+    #: LAYOUT_MODULE_LIST or LAYOUT_FUSED.
+    layout: str
+    #: Module path relative to the decoder layer, e.g. ``"mlp.experts"``.
+    path: str
+    num_experts: int
+    #: Experts a token routes to, where the config declares it. Never required for the module-list
+    #: layout -- the model itself decides which expert modules to call -- and always required for
+    #: the fused one, which has to reproduce the selection to know which rows to read.
+    top_k: int = None
+    #: Module path, relative to the decoder layer, of the thing that emits one score per expert.
+    #: Only the fused layout needs it.
+    router_path: str = None
+    #: ``{expert_index: (checkpoint keys,)}``, for the module-list layout.
+    expert_keys: dict = dataclasses.field(default_factory=dict)
+    #: ``{checkpoint key: full shape}`` for the fused layout. The shape is the checkpoint's, which
+    #: is what the destination tensor has to be allocated at.
+    fused_shapes: dict = dataclasses.field(default_factory=dict)
+
+    @property
+    def is_fused(self):
+        return self.layout == LAYOUT_FUSED
+
+    @property
+    def keys(self):
+        """Every checkpoint tensor this container owns."""
+        if self.is_fused:
+            return tuple(self.fused_shapes)
+        return tuple(key for keys in self.expert_keys.values() for key in keys)
+
+    def describe(self):
+        top_k = "unknown" if self.top_k is None else self.top_k
+        return (f"{self.path or '<layer>'}: {self.layout} layout, {self.num_experts} experts, "
+                f"top-k {top_k}")
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpertLayout:
+    """What one decoder layer turned out to hold."""
+
+    containers: tuple = ()
+    #: The layer's tensors that no streamable container owns -- attention, norms, the router, shared
+    #: experts, and anything belonging to a container that was recognised but rejected. This is what
+    #: the layer's ordinary streaming hook has to load.
+    other_keys: tuple = ()
+    #: ``(path, reason)`` for containers that look like experts but stream with the layer.
+    skipped: tuple = ()
+
+    def __bool__(self):
+        return bool(self.containers)
+
+    @property
+    def num_experts(self):
+        return sum(c.num_experts for c in self.containers)
+
+
+# -- structural predicates ------------------------------------------------------------------------
+
+def _indexed_children(module):
+    """Child modules named by integers, or ``None``.
+
+    This is the structural signature of an ``nn.ModuleList``, expressed over the thing the module
+    tree and the checkpoint agree on -- a child's name -- rather than over the container's Python
+    type. A model building its experts in some other sequence container, or a remote-code class
+    subclassing ModuleList, is the same thing to a streaming engine and is recognised here.
+    """
+    children = dict(module.named_children())
+    if len(children) < MIN_EXPERTS or not all(name.isdigit() for name in children):
+        return None
+    return {int(name): child for name, child in children.items()}
+
+
+def _parameter_signature(module):
+    """A module's parameters as (name, shape) pairs, for comparing one expert against another."""
+    return tuple(sorted((name, tuple(int(d) for d in param.shape))
+                        for name, param in module.named_parameters()))
+
+
+def _interchangeable(children):
+    """Whether every entry has the same parameters with the same shapes.
+
+    Experts are alternatives to one another, so they are built identically; the stages of a
+    ``Sequential`` are a pipeline and are not. That difference separates a real expert list from any
+    other integer-named container, and it is free to check -- the model is on the meta device, so
+    its shapes are known without reading a weight.
+    """
+    signatures = {_parameter_signature(child) for child in children.values()}
+    return len(signatures) == 1 and bool(next(iter(signatures)))
+
+
+def _find_router(parent, container_name, num_experts):
+    """The sibling of an expert container that emits one score per expert.
+
+    Structural again: a router turns a hidden state into ``num_experts`` numbers, so it holds a
+    parameter with an expert-sized leading dimension, and beside a set of experts nothing else does.
+    The search covers a sibling's whole subtree, because some routers wrap their linear layer in a
+    gating module rather than being one.
+
+    ``None`` unless exactly one sibling qualifies. Two candidates means the structure is not saying
+    which one drives the experts, and the honest response to that is to stop.
+    """
+    candidates = []
+    for name, child in parent.named_children():
+        if name == container_name:
+            continue
+        for _, param in child.named_parameters():
+            if param.ndim >= 1 and int(param.shape[0]) == num_experts:
+                candidates.append(name)
+                break
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _find_int(node, keys, depth=0):
+    """First integer stored under any of `keys`, at any depth of a config.
+
+    Multimodal checkpoints keep the decoder's settings in a sub-config, and mixtures differ in where
+    they record the routing width, so the search cannot be a fixed path.
+    """
+    if depth > 6:
+        return None
+    if isinstance(node, dict):
+        for key in keys:
+            value = node.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return int(value)
+        children = list(node.values())
+    elif isinstance(node, (list, tuple)):
+        children = list(node)
+    elif hasattr(node, "__dict__"):
+        for key in keys:
+            value = getattr(node, key, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return int(value)
+        children = [v for k, v in vars(node).items() if not k.startswith("_")]
+    else:
+        return None
+    for child in children:
+        found = _find_int(child, keys, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def resolve_top_k(config, num_experts):
+    """How many experts a token visits, or ``None`` when the config does not say.
+
+    Bounded by the expert count on the way out: a value outside ``1..num_experts`` is not a routing
+    width but some other field that happened to share a name, and acting on it would stream the
+    wrong rows.
+    """
+    if config is None:
+        return None
+    found = _find_int(config, TOP_K_KEYS)
+    if found is None or not 1 <= found <= num_experts:
+        return None
+    return found
+
+
+# -- per-container recognition ----------------------------------------------------------------------
+
+def _module_list_container(path, children, keys_by_prefix, config):
+    """Recognise an expert list, or return ``(None, reason)``."""
+    if not _interchangeable(children):
+        # A pipeline of differently-shaped stages. Not experts at all, and not worth reporting.
+        return None, None
+
+    expert_keys = {}
+    for index in sorted(children):
+        found = keys_by_prefix.get(f"{path}.{index}.")
+        if found:
+            expert_keys[index] = tuple(found)
+
+    if len(expert_keys) < MIN_EXPERTS:
+        # The module tree says experts, the shard does not store them per expert. That is a
+        # checkpoint this code does not understand; stream the layer whole rather than invent a
+        # mapping between the two.
+        return None, (f"the module tree holds {len(children)} interchangeable entries but the shard "
+                      f"stores per-expert tensors for {len(expert_keys)} of them")
+
+    # Reported, never relied on: this layout streams whichever expert modules the model chooses to
+    # call, so a config that does not declare its routing width costs nothing here.
+    return ExpertContainer(layout=LAYOUT_MODULE_LIST, path=path, num_experts=len(children),
+                           top_k=resolve_top_k(config, len(children)),
+                           expert_keys=expert_keys), None
+
+
+def _fused_container(path, module, parent, parent_path, container_name, shapes, prefix, config):
+    """Recognise a fused ``[num_experts, ...]`` expert tensor, or return ``(None, reason)``.
+
+    The signature is a module whose own parameters -- not its children's -- all lead with the same
+    dimension, at least one of them batched into three. That is what a fused expert tensor is, and
+    it is hard to produce by accident; but "hard" is not "impossible", so the expert count is
+    confirmed against a router before any row is streamed off the back of it.
+    """
+    direct = list(module.named_parameters(recurse=False))
+    if not direct:
+        return None, None
+
+    batched = any(param.ndim >= 3 for _, param in direct)
+    fused_shapes = {}
+    for name, _ in direct:
+        relative_key = f"{path}.{name}"
+        shape = shapes.get(relative_key)
+        if shape is None:
+            # A parameter this shard does not carry, so nothing can be read row-wise from it. Worth
+            # reporting only when the module did look like a fused mixture, which is the case where
+            # a user would otherwise wonder why the fast path went missing.
+            reason = (f"the module holds batched expert tensors but the shard has no "
+                      f"{prefix}{relative_key}" if batched else None)
+            return None, reason
+        # Keyed the way the checkpoint names it, because that is what will be read and what the
+        # layer's own stream has to be told not to load.
+        fused_shapes[prefix + relative_key] = shape
+
+    leading = {shape[0] for shape in fused_shapes.values() if shape}
+    if len(leading) != 1:
+        return None, None
+    num_experts = int(leading.pop())
+    if num_experts < MIN_EXPERTS:
+        return None, None
+    if not any(len(shape) >= 3 for shape in fused_shapes.values()):
+        # Every fused expert projection is a batch of matrices. A stack of vectors is a bias table
+        # or an embedding, and slicing it per expert would be reading something else entirely.
+        return None, None
+
+    router_name = _find_router(parent, container_name, num_experts) if parent is not None else None
+    if router_name is None:
+        return None, (f"tensors are batched {num_experts} ways but no single sibling emits "
+                      f"{num_experts} scores, so the expert axis is unconfirmed")
+
+    top_k = resolve_top_k(config, num_experts)
+    if top_k is None:
+        return None, (f"{num_experts} fused experts, but the config does not declare how many a "
+                      f"token routes to under any of: {', '.join(TOP_K_KEYS)}")
+
+    router_path = f"{parent_path}.{router_name}" if parent_path else router_name
+    return ExpertContainer(layout=LAYOUT_FUSED, path=path, num_experts=num_experts, top_k=top_k,
+                           router_path=router_path, fused_shapes=fused_shapes), None
+
+
+def _outermost(containers):
+    """Drop containers nested inside another container's experts.
+
+    An expert that is itself built from an indexed list would otherwise be detected twice, once as
+    part of its mixture and once on its own. The outer match is the one that streams a whole expert.
+    """
+    paths = [c.path for c in containers]
+    return [c for c in containers
+            if not any(c.path.startswith(other + ".") for other in paths if other != c.path)]
+
+
+# -- the entry point ----------------------------------------------------------------------------------
+
+def detect_expert_layout(layer_module, tensor_shapes, layer_name="", config=None):
+    """Work out where one decoder layer keeps its experts.
+
+    Parameters
+    ----------
+    layer_module : torch.nn.Module
+        The decoder layer as transformers built it. It is on the meta device -- no weights, but
+        every shape is known, which is all this needs.
+    tensor_shapes : Mapping[str, tuple]
+        The layer shard's tensor names and shapes, straight from the safetensors header. Detection
+        reads no tensor data.
+    layer_name : str
+        The layer's fully-qualified prefix, so checkpoint keys can be matched to module paths.
+    config : optional
+        The model config, consulted for the routing width and nothing else.
+
+    Returns
+    -------
+    ExpertLayout
+        Empty when the layer is dense, which is the common case and stays cheap.
+    """
+    prefix = f"{layer_name}." if layer_name else ""
+    relative = {}
+    for key, shape in tensor_shapes.items():
+        if prefix and not key.startswith(prefix):
+            continue
+        relative[key[len(prefix):]] = tuple(int(d) for d in shape)
+
+    # Checkpoint keys bucketed under every module path that prefixes them, so a candidate container
+    # can ask what it owns without rescanning the shard.
+    keys_by_prefix = {}
+    for rel in relative:
+        parts = rel.split(".")
+        for cut in range(1, len(parts)):
+            keys_by_prefix.setdefault(".".join(parts[:cut]) + ".", []).append(prefix + rel)
+
+    parents = {"": layer_module}
+    for path, module in layer_module.named_modules():
+        if path:
+            parents[path] = module
+
+    containers = []
+    skipped = []
+    for path in sorted(parents):
+        if not path:
+            continue
+        module = parents[path]
+        parent_path, _, container_name = path.rpartition(".")
+        parent = parents.get(parent_path)
+
+        children = _indexed_children(module)
+        if children is not None:
+            container, reason = _module_list_container(path, children, keys_by_prefix, config)
+        else:
+            container, reason = _fused_container(path, module, parent, parent_path, container_name,
+                                                 relative, prefix, config)
+        if container is not None:
+            containers.append(container)
+        elif reason:
+            skipped.append((path, reason))
+
+    containers = _outermost(containers)
+
+    owned = set()
+    for container in containers:
+        owned.update(container.keys)
+    other_keys = tuple(key for key in tensor_shapes if key not in owned)
+
+    for path, reason in skipped:
+        log.info("%s%s looks like an expert container but streams with its layer: %s",
+                 prefix, path, reason)
+
+    return ExpertLayout(containers=tuple(containers), other_keys=other_keys,
+                        skipped=tuple(skipped))
+
+
+def summarize(layouts):
+    """One line per distinct container shape across the model, for the load-time report.
+
+    A mixture's layers are structurally identical, so reporting each of ninety-four of them says
+    nothing the first one did not. Collapsing to distinct shapes keeps the load log readable while
+    still surfacing a model whose layers genuinely differ -- an every-other-layer mixture, which is
+    a thing that exists.
+    """
+    seen = {}
+    for idx, layout in sorted(layouts.items()):
+        for container in layout.containers:
+            key = (container.layout, container.path, container.num_experts,
+                   -1 if container.top_k is None else container.top_k)
+            seen.setdefault(key, []).append(idx)
+
+    lines = []
+    for key in sorted(seen):
+        layout, path, num_experts, top_k = key
+        shown = "unknown" if top_k < 0 else top_k
+        lines.append(f"{len(seen[key])} layers x {path}: {layout} layout, {num_experts} experts, "
+                     f"top-k {shown}")
+    return lines

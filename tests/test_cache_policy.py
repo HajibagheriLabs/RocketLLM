@@ -202,6 +202,39 @@ class TestZeroBudget(unittest.TestCase):
         cache.release(dense_key(0))
         self.assertEqual(cache.report()["rejected_too_large"], 1)
 
+    def test_a_streamed_entry_is_handed_back_when_it_is_released(self):
+        """REGRESSION TEST. Pure streaming has to actually release what it streamed.
+
+        An entry admitted with nowhere to keep it belongs to no tier, so nothing else in the cache
+        can ever discard it -- eviction only walks the tiers. If release does not hand it back, the
+        owner is never told to unbind those weights and they stay on the device for the rest of the
+        run. The cache reports an empty device tier throughout, so the symptom is a model that
+        quietly materialises itself while every counter says it is streaming.
+        """
+        discarded = []
+        cache, _ = build_cache(device_bytes=0, host_bytes=0, window=1,
+                               discard=discarded.append)
+        for key in (dense_key(0), expert_key(0, 3)):
+            held = len(discarded)
+            cache.acquire(key)
+            self.assertEqual(len(discarded), held, "released before the reader was done with it")
+            cache.release(key)
+            self.assertEqual(discarded[-1], f"payload:{key}")
+        self.assertEqual(cache.report()["entries"], 0, "a released transient entry is still tracked")
+
+    def test_a_streamed_entry_survives_a_nested_claim(self):
+        """Two readers, one payload: it goes back only when the last of them is finished."""
+        discarded = []
+        cache, storage = build_cache(device_bytes=0, host_bytes=0, discard=discarded.append)
+        key = dense_key(0)
+        cache.acquire(key)
+        cache.acquire(key)
+        self.assertEqual(storage.read_count, 1, "the second claim re-read a payload already held")
+        cache.release(key)
+        self.assertEqual(discarded, [])
+        cache.release(key)
+        self.assertEqual(discarded, [f"payload:{key}"])
+
 
 class TestFitsEntirely(unittest.TestCase):
     """A device that holds the whole model must never evict anything."""
@@ -308,6 +341,31 @@ class TestHostTier(unittest.TestCase):
 
 class TestExpertPolicy(unittest.TestCase):
     """Experts use LFU with aging. The asymmetry with dense FIFO is deliberate."""
+
+    def test_expert_granularity_caches_what_a_whole_layer_cannot(self):
+        """Why a mixture is worth streaming per expert even when every expert gets read.
+
+        A device budget smaller than one layer cannot hold that layer at all: the entry does not fit
+        the tier, so it is rejected outright and asking for it a thousand times still reads it a
+        thousand times. The same budget holds a useful number of that layer's experts. Granularity
+        is what turns "nothing fits" into "most of it fits", and it does that whether or not the
+        model's forward skips the experts a token did not route to -- which some do and some, at any
+        given transformers version, do not.
+        """
+        budget = 50 * MB
+
+        whole, whole_storage = build_cache(device_bytes=budget, layer_bytes=100 * MB, window=1)
+        for _ in range(3):
+            walk(whole, [dense_key(0)])
+        self.assertEqual(whole.report()["hit_rate"], 0.0)
+        self.assertEqual(whole_storage.read_count, 3, "a layer too large to cache is re-read")
+
+        split, split_storage = build_cache(device_bytes=budget, layer_bytes=10 * MB, window=1)
+        experts = [expert_key(0, e) for e in range(4)]
+        for _ in range(3):
+            walk(split, experts)
+        self.assertEqual(split_storage.read_count, 4, "each expert should be read once, then hit")
+        self.assertAlmostEqual(split.report()["hit_rate"], 8 / 12, places=6)
 
     def test_the_least_popular_expert_is_evicted_first(self):
         cache, _ = build_cache(device_bytes=3 * 10 * MB, window=1)

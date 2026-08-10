@@ -132,8 +132,11 @@ class LayerLoader:
                                              thread_name_prefix="rocketllm-io")
                           if self.io_workers > 1 else None)
         # safetensors handles are cheap but not documented as thread-safe, so each worker opens its
-        # own rather than sharing one across the pool.
+        # own rather than sharing one across the pool. Every one of them is also recorded centrally,
+        # because thread-local state is not reachable from the thread that shuts the loader down.
         self._local = threading.local()
+        self._handles = []
+        self._handles_lock = threading.Lock()
         self.reads = 0
         self.bytes_read = 0
 
@@ -159,6 +162,8 @@ class LayerLoader:
         handle = handles.get(path)
         if handle is None:
             handle = handles[path] = safe_open(path, framework="pt")
+            with self._handles_lock:
+                self._handles.append(handle)
         return handle
 
     # -- planning ------------------------------------------------------------------------------
@@ -245,6 +250,20 @@ class LayerLoader:
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
+        # One open handle is kept per shard per reader thread, so a deep model on a wide pool holds
+        # hundreds of them at once -- enough to reach a default descriptor limit. They also keep the
+        # shard mapped, which on Windows means the file cannot be deleted while the loader lives.
+        # Waiting for the garbage collector to notice is not good enough for either.
+        with self._handles_lock:
+            handles, self._handles = self._handles, []
+        for handle in handles:
+            closer = getattr(handle, "__exit__", None)
+            if closer is not None:
+                try:
+                    closer(None, None, None)
+                except Exception:  # noqa: BLE001 - shutting down; a stuck handle must not propagate
+                    pass
+        self._local = threading.local()
 
     def __enter__(self):
         return self

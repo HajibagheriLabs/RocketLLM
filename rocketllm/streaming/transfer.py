@@ -173,9 +173,28 @@ class WeightTransfer:
             return self._send_async(host, lease)
         return self._send_sync(host, lease)
 
+    @staticmethod
+    def _unaliased(device_buffer, host):
+        """Guarantee the device buffer is its own memory rather than a view of the staged one.
+
+        ``Tensor.to(device)`` returns *self* when the tensor is already on that device. So on a
+        backend whose device is the host -- the CPU path, and any build where the copy is elided
+        because the two share memory -- the "device" buffer IS the staging buffer. Parameters are
+        then bound as views into it and the lease goes back to the pool, and the next staged read
+        writes straight over live weights.
+
+        This is the same hazard the module docstring describes, one tier down, and it fails the same
+        way: nothing raises, a few weights come out wrong, and the output is subtly bad. Copying
+        costs nothing on a real accelerator, where the transfer already produced distinct memory and
+        this check simply never fires.
+        """
+        if device_buffer.data_ptr() == host.data_ptr():
+            return host.clone()
+        return device_buffer
+
     def _send_async(self, host, lease):
         with self.stream:
-            device_buffer = host.to(self.device, non_blocking=True)
+            device_buffer = self._unaliased(host.to(self.device, non_blocking=True), host)
             event = self.stream.record_event()
         handle = TransferHandle(device_buffer, event, lease, self)
         with self._lock:
@@ -190,7 +209,7 @@ class WeightTransfer:
         The lease is still released through the guard rather than directly: one release path means
         one thing to get right, and it costs nothing when the event is always complete.
         """
-        device_buffer = host.to(self.device)
+        device_buffer = self._unaliased(host.to(self.device), host)
         handle = SyncTransferHandle(device_buffer, self.caps.event(), lease, self)
         with self._lock:
             self.transfers += 1
