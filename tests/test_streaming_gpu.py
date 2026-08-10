@@ -54,8 +54,7 @@ def cap_vram(max_vram_gb):
 def run_rocketllm(args):
     from rocketllm import AutoModel
 
-    model = AutoModel.from_pretrained(args.model, compression=args.compression,
-                                      delete_original=args.delete_original)
+    model = AutoModel.from_pretrained(args.model, delete_original=args.delete_original)
     ids = model.tokenizer([args.prompt], return_tensors="pt",
                           return_attention_mask=False)["input_ids"].cuda()
 
@@ -103,7 +102,6 @@ def main():
     p.add_argument("--prompt", default="The capital of France is")
     p.add_argument("--max-new-tokens", type=int, default=12)
     p.add_argument("--max-vram-gb", type=float, default=None)
-    p.add_argument("--compression", default=None, choices=[None, "4bit", "8bit"])
     p.add_argument("--delete-original", action="store_true",
                    help="delete the original checkpoint shards while splitting (saves disk for big models)")
     p.add_argument("--compare", action="store_true",

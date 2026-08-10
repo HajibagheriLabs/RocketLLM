@@ -15,7 +15,7 @@ from .persist import ModelPersister
 import psutil
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, GenerationMixin, LlamaForCausalLM, GenerationConfig
 from .utils import clean_memory, load_layer, \
-    find_or_create_local_splitted_path
+    find_or_create_local_splitted_path, reject_compression_argument
 
 
 
@@ -212,6 +212,8 @@ class RocketLlamaMlx:
                  hf_token=None, prefetching=True, test_nonlayered=False, show_memory_util=False,
                  delete_original=False):
 
+        reject_compression_argument(compression)
+
         self.hf_token = hf_token
         self.set_layer_names_dict()
         self.test_nonlayered = test_nonlayered
@@ -223,7 +225,6 @@ class RocketLlamaMlx:
 
         self.model_local_path, self.checkpoint_path = find_or_create_local_splitted_path(model_local_path_or_repo_id,
                                                                                          layer_shards_saving_path,
-                                                                                         compression=compression,
                                                                                          layer_names=self.layer_names_dict,
                                                                                          hf_token=hf_token,
                                                                                          delete_original=delete_original)

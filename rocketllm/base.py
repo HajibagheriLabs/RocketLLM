@@ -23,16 +23,8 @@ from .streaming import HostStagingPool
 from .profiler import LayeredProfiler
 
 from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
-    find_or_create_local_splitted_path
+    find_or_create_local_splitted_path, reject_compression_argument
 from .persist import ModelPersister
-
-try:
-    import bitsandbytes as bnb
-
-    bitsandbytes_installed = True
-    print('>>>> bitsandbytes installed')
-except ImportError:
-    bitsandbytes_installed = False
 
 
 # Helpers that transformers 5.0 moved out of transformers.utils.generic. Remote model code is
@@ -104,7 +96,8 @@ class RocketModel:
         profiling_mode : bool, optional
             whether to profile the model loading time, default False
         compression: str, optional
-            '4bit' or '8bit' to enable block-wise quantization of the on-disk shards
+            removed. RocketLLM imports pre-quantized checkpoints and does not quantize models
+            itself; passing anything here raises with the list of formats it does read.
         hf_token: str, optional
             huggingface api token
         prefetching: bool, optional
@@ -118,14 +111,10 @@ class RocketModel:
 
         self.total_disk_loading_time = None
         self.total_gpu_loading_time = None
-        self.total_compression_overhead_time = None
         self.hf_quantizer = None
 
-        if compression is not None and not bitsandbytes_installed:
-            raise ImportError('WARNING: bitsandbytes not found. Compression needs bitsandbytes. '
-                              'To use compression, please install bitsandbytes: `pip install bitsandbytes`')
+        reject_compression_argument(compression)
 
-        self.compression = compression
         self.hf_token = hf_token
 
         restore_relocated_transformers_symbols()
@@ -135,7 +124,6 @@ class RocketModel:
         self.model_local_path, self.checkpoint_path = find_or_create_local_splitted_path(
             model_local_path_or_repo_id,
             layer_shards_saving_path,
-            compression=compression,
             layer_names=self.layer_names_dict,
             hf_token=hf_token,
             delete_original=delete_original)
@@ -180,9 +168,6 @@ class RocketModel:
 
         # prefetch executor / state
         self.prefetching = prefetching
-        if self.compression is not None and self.prefetching:
-            print("prefetching is not supported together with compression for now; disabling prefetching.")
-            self.prefetching = False
         self._executor = ThreadPoolExecutor(max_workers=1) if self.prefetching else None
         self._prefetch_future = None
         self._prefetched_idx = None
@@ -364,16 +349,9 @@ class RocketModel:
 
     def load_layer_to_cpu(self, layer_name):
         t = time.time()
-        load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
-        elapsed_time = time.time() - t
-
+        state_dict = load_layer(self.checkpoint_path, layer_name)
         if self.profiling_mode:
-            state_dict, compression_time = load_layer_output
-            disk_loading_time = elapsed_time - compression_time
-            self.profiler.add_profiling_time('load_safe_tensor', disk_loading_time)
-            self.profiler.add_profiling_time('compression_time', compression_time)
-        else:
-            state_dict = load_layer_output
+            self.profiler.add_profiling_time('load_safe_tensor', time.time() - t)
 
         # These tensors are no longer what crosses the link: move_layer_to_device packs them into
         # one staging buffer and transfers that. Pinning each of them here would page-lock the

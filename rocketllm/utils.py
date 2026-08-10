@@ -25,52 +25,39 @@ from safetensors.torch import load_file, save_file
 
 from .persist import ModelPersister
 
-
-try:
-    import bitsandbytes as bnb
-
-    bitsandbytes_installed = True
-except ImportError:
-    bitsandbytes_installed = False
-
-
 import huggingface_hub
-
-
-# replacement for bnb quantstat.as_dict(True), until the bug is fixed....
-def save_quant_state_to_dict(self, packed=True):
-    """
-    returns dict of tensors and strings to use in serialization via _save_to_state_dict()
-    param: packed -- returns dict[str, torch.Tensor] for state_dict
-    """
-    qs_dict = {
-        'quant_type': self.quant_type,
-        'absmax': self.absmax,
-        'blocksize': self.blocksize,
-        'quant_map': self.code,
-        'dtype': str(self.dtype).strip('torch.'),
-        'shape': tuple(self.shape),
-    }
-    if self.nested:
-        qs_dict.update({
-            'nested_absmax': self.state2.absmax,
-            'nested_blocksize': self.state2.blocksize,
-            'nested_quant_map': self.state2.code,
-            'nested_dtype': str(self.state2.dtype).strip('torch.'),
-            'nested_offset': self.offset.item(),
-        })
-    if not packed:
-        return qs_dict
-
-    qs_packed_dict = {k: v for k, v in qs_dict.items() if isinstance(v, torch.Tensor)}
-    non_tensor_dict = {k: v for k, v in qs_dict.items() if not isinstance(v, torch.Tensor)}
-    qs_packed_dict["quant_state." + "bitsandbytes__" + self.quant_type] = bnb.utils.pack_dict_to_tensor(non_tensor_dict)
-    return qs_packed_dict
-
 
 
 class NotEnoughSpaceException(Exception):
     pass
+
+
+# RocketLLM used to quantize a checkpoint's shards itself as it split them. That is gone: the engine
+# imports checkpoints someone else quantized deliberately, with a toolchain built for it, rather
+# than squeezing weights on the way past. Ignoring the argument silently would leave a user
+# believing they were streaming 4-bit weights while the engine moved 16-bit ones -- the one failure
+# this project can least afford, since bytes moved per token is the whole performance model. So it
+# raises, and the message says where to get a checkpoint that does what was asked.
+_COMPRESSION_REMOVED = """\
+compression={value!r} is no longer supported: RocketLLM loads pre-quantized checkpoints and does \
+not quantize models itself.
+
+Point it at a checkpoint that is already quantized. Supported formats:
+  AWQ, GPTQ, compressed-tensors W4A16, MXFP4, bitsandbytes-prequantized.
+Most widely-used models already have such a repository on the Hugging Face hub; searching the model \
+name together with "AWQ" or "GPTQ" usually finds one.
+
+The compressed-tensors and bitsandbytes formats need their reader packages, which are optional: \
+`pip install "rocketllm[quant]"` installs both. AWQ and GPTQ need nothing extra.
+
+To load this checkpoint exactly as it is stored, drop the compression= argument."""
+
+
+def reject_compression_argument(compression):
+    """Refuse an on-the-fly quantization request, naming what to do instead."""
+    if compression is None:
+        return
+    raise ValueError(_COMPRESSION_REMOVED.format(value=compression))
 
 # Function to clean RAM & vRAM
 def clean_memory(device=None):
@@ -89,36 +76,6 @@ def clean_memory(device=None):
     from .hw.caps import get_caps
     get_caps(device, announce=False).empty_cache()
 
-
-def uncompress_layer_state_dict(layer_state_dict):
-    uncompressed_layer_state_dict = None
-    if any(['4bit' in k for k in layer_state_dict.keys()]):
-        uncompressed_layer_state_dict = {}
-        for k, v in layer_state_dict.items():
-            if '4bit' not in k:
-                quant_state_dict = {kk[len(k):]: kv for kk, kv in layer_state_dict.items() if kk.startswith(k) and k != kk}
-                quant_state = bnb.functional.QuantState.from_dict(qs_dict=quant_state_dict, device="cuda")
-
-                dqv = bnb.functional.dequantize_nf4(v.cuda(), quant_state)
-                uncompressed_layer_state_dict[k] = dqv
-        del layer_state_dict
-    elif any(['8bit' in k for k in layer_state_dict.keys()]):
-        uncompressed_layer_state_dict = {}
-        for k, v in layer_state_dict.items():
-            if '8bit' not in k:
-
-                absmax = layer_state_dict[k + ".8bit.absmax"]
-                code = layer_state_dict[k + ".8bit.code"]
-
-                dqv = bnb.functional.dequantize_blockwise(v.cuda(),
-                                                          bnb.functional.QuantState(absmax=absmax.cuda(),
-                                                                                    code=code.cuda(),
-                                                                                    blocksize=2048,
-                                                                                    dtype=torch.float16))
-                uncompressed_layer_state_dict[k] = dqv
-        del layer_state_dict
-
-    return layer_state_dict if uncompressed_layer_state_dict is None else uncompressed_layer_state_dict
 
 def layer_tensor_names(local_path, layer_name):
     """List the tensors in a layer shard without reading any tensor data."""
@@ -139,26 +96,17 @@ def load_layer_subset(local_path, layer_name, keys):
     return out
 
 
-def load_layer(local_path, layer_name, profiling=False):
-    #layer_state_dict = load_file(Path(local_path) / (layer_name + ".safetensors"), device="cpu")
-    layer_state_dict = ModelPersister.get_model_persister().load_model(layer_name, local_path)
+def load_layer(local_path, layer_name):
+    """Read one module's shard off disk, exactly as it is stored.
 
-    if profiling:
-        t = time.process_time()
-
-    to_return = uncompress_layer_state_dict(layer_state_dict)
-
-    #clean_memory()
-
-    if profiling:
-        elapsed_time = time.process_time() - t
-        return to_return, elapsed_time
-    else:
-        return to_return
+    Nothing is decoded here. A pre-quantized checkpoint's packed payloads stay packed all the way
+    to the device, which is the whole point: expanding them on the host would multiply what crosses
+    the link by four and undo the reason for reading a quantized checkpoint at all.
+    """
+    return ModelPersister.get_model_persister().load_model(layer_name, local_path)
 
 
-
-def check_space(checkpoint_path, layer_shards_saving_path=None, compression=None, splitted_model_dir_name='splitted_model'):
+def check_space(checkpoint_path, layer_shards_saving_path=None, splitted_model_dir_name='splitted_model'):
     total_shard_files_size_bytes = 0
     for model_shard_file in glob(str(checkpoint_path / '*')):
         total_shard_files_size_bytes += os.path.getsize(model_shard_file)
@@ -168,11 +116,7 @@ def check_space(checkpoint_path, layer_shards_saving_path=None, compression=None
         for saved_split_file in glob(str(Path(layer_shards_saving_path) / splitted_model_dir_name / '*')):
             total_saved_split_files_size_bytes += os.path.getsize(saved_split_file)
 
-    if compression == '4bit':
-        total_shard_files_size_bytes = int(total_shard_files_size_bytes / 0.2813)
-    elif compression == '8bit':
-        total_shard_files_size_bytes = total_shard_files_size_bytes // 2
-
+    # Shards are copied byte for byte, so the split costs exactly what the checkpoint costs.
     total, used, free = shutil.disk_usage(checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path)
 
     if free + total_saved_split_files_size_bytes < total_shard_files_size_bytes:
@@ -180,27 +124,6 @@ def check_space(checkpoint_path, layer_shards_saving_path=None, compression=None
                                       f" {free / 1024 / 1024 / 1024:.02f}GB. Model total size: {total_shard_files_size_bytes / 1024 / 1024 / 1024:.02f}GB. " \
                                       f"existing space under {checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path} assuming can reuse: {total_saved_split_files_size_bytes/ 1024 / 1024 / 1024:.02f}GB. "
                                       )
-
-def compress_layer_state_dict(layer_state_dict, compression=None):
-    compressed_layer_state_dict = None
-    if compression == '4bit':
-        compressed_layer_state_dict = {}
-        for k, v in layer_state_dict.items():
-            v_quant, quant_state = bnb.functional.quantize_nf4(v.cuda(), blocksize=64)
-            compressed_layer_state_dict[k] = v_quant
-            for quant_state_k, quant_state_v in save_quant_state_to_dict(quant_state).items():
-                compressed_layer_state_dict[k + ".4bit." + quant_state_k] = quant_state_v
-    elif compression == '8bit':
-        compressed_layer_state_dict = {}
-        for k, v in layer_state_dict.items():
-            v_quant, quant_state = bnb.functional.quantize_blockwise(v.cuda(), blocksize=2048)
-            absmax = quant_state.absmax.clone().contiguous()
-            code = quant_state.code.clone().contiguous()
-            compressed_layer_state_dict[k] = v_quant
-            compressed_layer_state_dict[k + ".8bit.absmax"] = absmax
-            compressed_layer_state_dict[k + ".8bit.code"] = code
-
-    return compressed_layer_state_dict if compressed_layer_state_dict is not None else layer_state_dict
 
 def remove_real_and_linked_file(to_delete):
     if (os.path.realpath(to_delete) != to_delete):
@@ -240,14 +163,10 @@ def link_or_copy_file(src, dst):
 
 
 def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitted_model_dir_name='splitted_model',
-                          compression=None, layer_names=None, delete_original=False, repo_id=None, hf_token=None):
+                          layer_names=None, delete_original=False, repo_id=None, hf_token=None):
     """
     Save the all layers of a model sharded checkpoint using safetensors.
     """
-
-    if compression is not None:
-        assert bitsandbytes_installed, f"when using compression bitsandbytes has to be installed."
-        splitted_model_dir_name = splitted_model_dir_name + "." + compression
 
     checkpoint_path = Path(checkpoint_path)
 
@@ -348,7 +267,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     # Linking only produces a file the loader can read when shards are stored in the same format
     # the persister writes; the MLX persister, for instance, writes .mlx.npz.
     persister_is_safetensors = type(ModelPersister.get_model_persister()).__name__ == 'SafetensorModelPersister'
-    if compression is None and safetensors_format and persister_is_safetensors:
+    if safetensors_format and persister_is_safetensors:
         shard_contents = defaultdict(list)
         for k, v in index.items():
             shard_contents[v].append(k)
@@ -369,7 +288,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
     # A copy is only made for the layers we cannot link, so only those need free space.
     if not delete_original and len(passthrough) < len(layers):
-        check_space(checkpoint_path, layer_shards_saving_path, compression, splitted_model_dir_name=splitted_model_dir_name)
+        check_space(checkpoint_path, layer_shards_saving_path, splitted_model_dir_name=splitted_model_dir_name)
 
 
     shard = 0
@@ -459,8 +378,6 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         # Get layer state dict
         layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
 
-        layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
-
         # Save layer state dict as using safetensors
 
         marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
@@ -483,7 +400,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
     return str(saving_path)
 
-def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards_saving_path=None, compression=None,
+def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards_saving_path=None,
                                        layer_names=None, hf_token=None, delete_original=False):
     """
     find the model's local cache path, download the cache if not exists, then split and save the model.
@@ -501,8 +418,6 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
         local model path
     saved_layer_shards_path : str
         the path saved layer shards
-    compression: str, optinal
-        setting to '4bit' or '8bit' to enable compression from 16 bits to 4 bits/8 bits which speeed up 4x or 2x inference time with a tiny accuracy loss.
     hf_token: str, optional
         huggingface api token could be provided, by default None
     """
@@ -517,7 +432,7 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
         if any(os.path.exists(Path(model_local_path_or_repo_id) / f) for f in local_weight_files):
             print(f"found local checkpoint...")
             return Path(model_local_path_or_repo_id), split_and_save_layers(model_local_path_or_repo_id, layer_shards_saving_path,
-                                                                            compression=compression, layer_names=layer_names, delete_original=delete_original)
+                                                                            layer_names=layer_names, delete_original=delete_original)
         else:
             print(
                 f"Found local directory in {model_local_path_or_repo_id}, but didn't find downloaded model. Try using {model_local_path_or_repo_id} as a HF repo...")
@@ -559,5 +474,5 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
 
     # if splitted_model subdir exists under cache use it, otherwise split and save
     return Path(hf_cache_path), split_and_save_layers(hf_cache_path, layer_shards_saving_path,
-                                                      compression=compression, layer_names=layer_names,
+                                                      layer_names=layer_names,
                                                       delete_original=delete_original, repo_id=model_local_path_or_repo_id, hf_token=hf_token)

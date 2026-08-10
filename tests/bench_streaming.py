@@ -304,12 +304,11 @@ class Instrumentation:
         original_load_subset = base.load_layer_subset
         original_place = base.set_module_tensor_to_device
 
-        def load_layer(local_path, layer_name, profiling=False):
+        def load_layer(local_path, layer_name):
             start = time.perf_counter()
-            result = original_load_layer(local_path, layer_name, profiling)
+            state_dict = original_load_layer(local_path, layer_name)
             elapsed = time.perf_counter() - start
 
-            state_dict = result[0] if isinstance(result, tuple) else result
             shard = Path(local_path) / (layer_name + ".safetensors")
             try:
                 # A whole-shard load reads the whole file, so the file itself is the exact number.
@@ -320,7 +319,7 @@ class Instrumentation:
                 read_bytes = sum(v.numel() * v.element_size() for v in state_dict.values())
                 meters.storage_bytes_exact = False
             meters.add(storage_bytes=read_bytes, storage_seconds=elapsed, storage_reads=1)
-            return result
+            return state_dict
 
         def load_layer_subset(local_path, layer_name, keys):
             start = time.perf_counter()

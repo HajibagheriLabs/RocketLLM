@@ -28,6 +28,7 @@ from rocketllm.quant.registry import quant_method_of
 from rocketllm.quant.safetensors_quant import (BitsAndBytesBackend, CompressedTensorsBackend,
                                                GptqAwqBackend, HfQuantizerBackend,
                                                announce_backend)
+from rocketllm.utils import reject_compression_argument
 
 LINEAR = "model.layers.0.self_attn.q_proj"
 #: One 512x512 Linear, which is 262144 values -- the number every count below is derived from.
@@ -625,6 +626,76 @@ class TestTensorSpec(unittest.TestCase):
             self.assertIn(key, described)
         self.assertIsInstance(weight, PackedWeight)
         self.assertIn("gptq", repr(weight))
+
+
+class TestOnTheFlyQuantizationIsGone(unittest.TestCase):
+    """RocketLLM imports pre-quantized checkpoints; it no longer makes them.
+
+    The argument that used to request it is kept in the signature on purpose. Dropping it outright
+    would raise TypeError, which tells a user their call is malformed rather than that the feature
+    moved -- and the useful answer is where to get a checkpoint that is already quantized.
+    """
+
+    def test_asking_for_compression_raises_rather_than_being_ignored(self):
+        """Silently ignoring it would stream 16-bit weights to someone who believes otherwise."""
+        for requested in ("4bit", "8bit", "nf4"):
+            with self.subTest(compression=requested):
+                with self.assertRaises(ValueError):
+                    reject_compression_argument(requested)
+
+    def test_no_compression_requested_is_the_normal_path(self):
+        self.assertIsNone(reject_compression_argument(None))
+
+    def test_the_error_names_the_formats_that_do_work(self):
+        """An error that only says no costs the user the search this message saves them."""
+        with self.assertRaises(ValueError) as raised:
+            reject_compression_argument("4bit")
+        message = str(raised.exception)
+
+        self.assertIn("4bit", message, "the message must quote what was actually asked for")
+        for fmt in ("AWQ", "GPTQ", "compressed-tensors", "MXFP4", "bitsandbytes"):
+            self.assertIn(fmt, message, f"{fmt} is supported but the message does not mention it")
+        # The two things a user has to do next: find such a checkpoint, and install its reader.
+        self.assertIn("rocketllm[quant]", message)
+        self.assertIn("drop the compression= argument", message.lower())
+
+    def test_the_engine_no_longer_carries_a_quantizing_code_path(self):
+        """A leftover helper is an invitation to wire it back up."""
+        import rocketllm.utils as utils
+
+        for gone in ("compress_layer_state_dict", "uncompress_layer_state_dict",
+                     "save_quant_state_to_dict"):
+            with self.subTest(symbol=gone):
+                self.assertFalse(hasattr(utils, gone))
+
+    def test_nothing_in_the_engine_imports_bitsandbytes_to_load_a_model(self):
+        """bitsandbytes is the reader for one format now, not a dependency of the engine.
+
+        Reloading the modules with it blocked is what proves it, rather than trusting that this
+        machine happens not to have it installed. ``rocketllm.base`` is deliberately not reloaded:
+        it would rebind RocketModel to a second class object for the rest of the session, so what
+        is checked there is that the import-time flag it used to keep is gone.
+        """
+        import importlib
+        import sys
+
+        import rocketllm.base as base
+
+        self.assertFalse(hasattr(base, "bitsandbytes_installed"))
+
+        blocked = {name: None for name in sys.modules if name.startswith("bitsandbytes")}
+        saved = {name: sys.modules[name] for name in blocked}
+        sys.modules.update(blocked)
+        try:
+            for module in ("rocketllm.utils", "rocketllm.quant.registry",
+                           "rocketllm.quant.safetensors_quant"):
+                with self.subTest(module=module):
+                    self.assertIsNotNone(importlib.reload(importlib.import_module(module)))
+        finally:
+            sys.modules.update(saved)
+            for name in blocked:
+                if sys.modules.get(name) is None:
+                    del sys.modules[name]
 
 
 if __name__ == "__main__":
