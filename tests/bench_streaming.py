@@ -564,6 +564,36 @@ def run(args, device):
                         peak_device, physical_before, physical_after, text, model, hardware)
 
 
+def cache_hit_rate(model):
+    """Hit rate by tier, straight from the cache the run actually used.
+
+    Reported per acquire rather than per byte, which is the number the replacement policy is
+    steering: a hit is a layer that did not have to be read again, whatever it weighed.
+    """
+    cache = getattr(model, "cache", None)
+    report = cache.report() if cache is not None else None
+    if not report:
+        return {"device": 0.0, "host": 0.0, "stub": True,
+                "note": "this run had no weight cache; every byte came from storage every pass"}
+    return {
+        "device": report["device_hit_rate"],
+        "host": report["host_hit_rate"],
+        "stub": False,
+        "acquires": report["hits_device"] + report["hits_host"] + report["misses"],
+        "hits_device": report["hits_device"],
+        "hits_host": report["hits_host"],
+        "misses": report["misses"],
+        "evicted_to_host": report["evicted_to_host"],
+        "evicted_to_storage": report["evicted_to_storage"],
+        "prefetches": report.get("prefetches", 0),
+        "prefetch_hits": report.get("prefetch_hits", 0),
+        "pinned": report["pinned"],
+        "window": report["window"],
+        "note": (f"window {report['window']} layers, {report['pinned']} pinned, "
+                 f"{report['device_entries']} resident on the device"),
+    }
+
+
 def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt_tokens,
                  new_tokens, wall_seconds, build_seconds, peak_device,
                  physical_before, physical_after, text, model, hardware):
@@ -636,12 +666,7 @@ def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt
             "decode": {"host": decode_snapshot["transfer_bytes"],
                        "storage": decode_snapshot["storage_bytes"]},
         },
-        "cache_hit_rate": {
-            "device": 0.0,
-            "host": 0.0,
-            "stub": True,
-            "note": "no tiered cache exists yet; every byte is fetched from storage every pass",
-        },
+        "cache_hit_rate": cache_hit_rate(model),
         # The critical path: these four are sequential and sum toward wall time. The worker-thread
         # read time is reported alongside them but deliberately kept out of the sum, because with
         # prefetching on it runs underneath compute and adding it would double-count.

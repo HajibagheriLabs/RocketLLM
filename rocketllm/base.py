@@ -1,5 +1,6 @@
 
 import logging
+import os
 from collections import OrderedDict
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
@@ -19,7 +20,9 @@ from .hw.caps import get_caps
 from .hw.profile import HardwareProfile
 from .quant import detect_backend
 from .quant.safetensors_quant import announce_backend
-from .streaming import HostStagingPool, WeightTransfer
+from .memory import (CLASS_ALWAYS, KIND_DENSE, PinCandidate, TieredWeightCache, pin_budget_from,
+                     plan_pins)
+from .streaming import HostStagingPool, LayerLoader, WeightTransfer
 from .profiler import LayeredProfiler
 
 from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
@@ -53,6 +56,21 @@ def restore_relocated_transformers_symbols():
             setattr(generic, name, symbol)
 
 
+class _ResidentModule:
+    """One streamed module's weights, wherever they currently are.
+
+    `host` is the CPU-side state dict and `moved` is the list of parameter names currently bound on
+    the device. Both, one, or neither may be set: that is what the cache's tiers mean here.
+    """
+
+    __slots__ = ("idx", "host", "moved")
+
+    def __init__(self, idx, host=None, moved=None):
+        self.idx = idx
+        self.host = host
+        self.moved = moved
+
+
 class RocketModel:
     """
     Memory-frugal wrapper around a Hugging Face ``*ForCausalLM`` model.
@@ -77,7 +95,9 @@ class RocketModel:
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
-                 hf_token=None, prefetching=True, delete_original=False):
+                 hf_token=None, prefetching=True, delete_original=False,
+                 vram_reserve=None, host_cache_gb=None, io_workers=None, window_max=None,
+                 pin_policy="auto"):
         """
         Parameters
         ----------
@@ -101,9 +121,35 @@ class RocketModel:
         hf_token: str, optional
             huggingface api token
         prefetching: bool, optional
-            overlap the next layer's disk load with the current layer's compute
+            overlap the next layers' disk reads with the current layer's compute
         delete_original: bool, optional
             delete the original downloaded checkpoint after splitting to save disk space
+
+        The five options below are all DEBUGGING OVERRIDES. Every one of them defaults to None,
+        meaning "take the value the HardwareProfile measured for this machine", and that is the
+        setting you want. RocketLLM has no reference machine: a number that is right on the box it
+        was chosen on is wrong on the next one, so these exist to reproduce a problem or to bisect
+        a suspected bad measurement, not to tune a healthy run.
+
+        vram_reserve: int, optional
+            bytes of device memory held back for activations, workspace and fragmentation.
+            Default: profile `reserve_bytes`, built from the allocator's measured fragmentation
+            ratio and workspace high-water mark.
+        host_cache_gb: float, optional
+            gigabytes of host RAM the cache may hold as its middle tier. Default: profile
+            `host_cache_bytes`, a share of *available* RAM after OS headroom. Zero is valid and
+            means evictions drop straight to storage.
+        io_workers: int, optional
+            concurrent storage readers. Default: profile `io_workers`, the concurrency that was
+            measured to saturate this machine's storage -- one reader is latency-bound below a fast
+            drive's rated bandwidth, too many thrash a slow one.
+        window_max: int, optional
+            hard cap on how many decoder layers the prefetch window may hold. Default: profile
+            `window_budget_bytes` divided by the largest layer, which is the memory-derived answer.
+        pin_policy: str, optional
+            "auto" (default) ranks candidates by access-frequency-per-packed-byte and fills the pin
+            budget; "off" pins nothing and streams everything, which is the pure-streaming
+            configuration and is what a device with no spare memory gets anyway.
         """
 
         self.profiling_mode = profiling_mode
@@ -166,11 +212,18 @@ class RocketModel:
         self.generation_config = self.get_generation_config()
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
 
-        # prefetch executor / state
         self.prefetching = prefetching
-        self._executor = ThreadPoolExecutor(max_workers=1) if self.prefetching else None
-        self._prefetch_future = None
-        self._prefetched_idx = None
+        # Debugging overrides; None everywhere means "use what the machine measured".
+        self._overrides = {
+            "reserve_bytes": vram_reserve,
+            "host_cache_bytes": None if host_cache_gb is None else int(host_cache_gb * 1024 ** 3),
+            "io_workers": io_workers,
+            "window_max": window_max,
+        }
+        if pin_policy not in ("auto", "off"):
+            raise ValueError(f"pin_policy must be 'auto' or 'off', not {pin_policy!r}")
+        self.pin_policy = pin_policy
+        self._layer_bytes = {}
 
         # Staging buffers are sized from the machine, not from a constant. Probing is cached by
         # hardware fingerprint, so this is a one-off cost; if it fails for any reason the pool
@@ -180,6 +233,9 @@ class RocketModel:
         # fires. Built here because the pool has to know how to ask it for finished transfers
         # before it decides it has no free buffer.
         self.transfer = WeightTransfer(self.caps, pool=self.staging_pool)
+        # Header-only reads for sizing, and the byte-range reads the cache's storage tier uses.
+        self.loader = LayerLoader(self.checkpoint_path, self.staging_pool, profile=self.profile,
+                                  io_workers=self._overrides.get("io_workers"))
 
         self.init_model()
 
@@ -198,6 +254,7 @@ class RocketModel:
         self.set_layers_from_layer_names()
         self._load_resident_modules()
         self._install_streaming_hooks()
+        self._build_cache()
 
     # ---- customization hooks for subclasses -------------------------------------------------
 
@@ -640,9 +697,73 @@ class RocketModel:
         module._rocketllm_moved = []
         return output
 
-    def _next_streamed_idx(self, idx):
-        nxt = idx + 1
-        return nxt if nxt in self._streamed_set else None
+    def _knob(self, name, fallback=0):
+        """A tuning value: the caller's override, else the profile's measurement, else a floor."""
+        override = self._overrides.get(name)
+        if override is not None:
+            return int(override)
+        if self.profile is not None:
+            derivation = self.profile.derived.get(name)
+            if derivation is not None:
+                return int(derivation.value)
+        return int(fallback)
+
+    def _build_cache(self):
+        """Hand residency over to the cache.
+
+        Everything the cache needs to size itself comes from the HardwareProfile, and every one of
+        those numbers was measured on this machine rather than chosen. The window is the memory
+        answer -- how many of the largest layer fit in the window budget -- clamped to at least one,
+        because a cache that cannot hold a single layer cannot run a forward at all.
+        """
+        largest = max((self._layer_packed_bytes(i) for i in self._streamed_indices), default=0)
+        window_budget = self._knob("window_budget_bytes")
+        window = max(1, window_budget // largest) if largest else 1
+        ceiling = self._overrides.get("window_max")
+        if ceiling is None and self.profile is not None:
+            ceiling = self.profile.window_max(largest)
+        if ceiling:
+            window = max(1, min(window, int(ceiling)))
+
+        host_bytes = self._knob("host_cache_bytes")
+        self._keep_host_copies = host_bytes > 0
+
+        device_bytes = self._knob("usable_device_bytes")
+        if self._overrides.get("reserve_bytes") is not None and self.profile is not None:
+            # usable_device_bytes was derived from the measured reserve, so an overridden reserve
+            # has to be folded back in or the override would silently do nothing.
+            total = self.profile.device_total_bytes or 0
+            device_bytes = max(0, total - int(self._overrides["reserve_bytes"]))
+        pinned = self._plan_pins(device_bytes, window_budget, largest)
+
+        self.cache = TieredWeightCache(
+            fetch=self._cache_fetch, sizer=lambda key: self._layer_packed_bytes(key[0]),
+            to_device=self._cache_to_device, to_host=self._cache_to_host,
+            discard=self._cache_discard,
+            sequence=self._cache_sequence if self.prefetching else None,
+            device_bytes=device_bytes, host_bytes=host_bytes, window=window, pinned=pinned,
+            profile=self.profile, prefetch_workers=self._knob("io_workers", 1))
+
+        print(f"cache: window {window} layers, device budget "
+              f"{device_bytes / 1024 ** 3:.1f}GB, host tier {host_bytes / 1024 ** 3:.1f}GB, "
+              f"{len(pinned)} pinned, pin_policy={self.pin_policy}")
+
+    def _plan_pins(self, device_bytes, window_budget, largest):
+        """Which modules to keep resident for the whole run.
+
+        Every streamed module here is touched once per token, so they all sit in the same priority
+        class and the ranking reduces to size: pinning the smallest first keeps the most of them,
+        which is what buys the hit rate. An MoE's experts are ranked separately by the placement
+        module and are not part of this list.
+        """
+        if self.pin_policy == "off":
+            return ()
+        budget = pin_budget_from(device_bytes, window_budget)
+        candidates = [PinCandidate(key=(idx, KIND_DENSE),
+                                   packed_bytes=self._layer_packed_bytes(idx),
+                                   priority=CLASS_ALWAYS, accesses_per_token=1.0)
+                      for idx in self._streamed_indices]
+        return plan_pins(candidates, budget).pinned
 
     def _load_streamed_layer(self, idx):
         """Load one streamed module's weights. Experts are excluded when they stream themselves."""
@@ -651,37 +772,95 @@ class RocketModel:
             return self.load_layer_to_cpu(self.layer_names[idx])
         return load_layer_subset(self.checkpoint_path, self.layer_names[idx], keys)
 
+    # ---- the cache's view of a streamed module ----------------------------------------------
+
+    def _cache_fetch(self, key):
+        """Storage tier: read a module's shard. Runs on a prefetch worker, so it only reads."""
+        return _ResidentModule(key[0], host=self._load_streamed_layer(key[0]))
+
+    def _cache_to_device(self, resident):
+        """Device tier: place the weights and bind them to the module.
+
+        Always on the thread that called acquire. Binding parameters mutates the model, and doing
+        that from a prefetch worker while a forward is running is a race with no recovery.
+        """
+        if resident.moved is None:
+            resident.moved = self.move_layer_to_device(resident.host)
+            # The host copy is only worth its RAM if this entry can ever be evicted to the host
+            # tier. A pinned entry never is, and neither is anything when there is no host tier, so
+            # in both cases holding the CPU-side copy is pure waste -- and on a model that fits
+            # entirely on the device that is every layer.
+            pinned = (resident.idx, KIND_DENSE) in self.cache.pinned
+            if not self._keep_host_copies or pinned:
+                resident.host = None
+        return resident
+
+    def _cache_to_host(self, resident):
+        """Host tier: unbind from the module but keep the CPU copy to serve the next hit."""
+        self._unbind(resident)
+        return resident
+
+    def _cache_discard(self, resident):
+        """The entry is leaving the cache: unbind and let the host copy go."""
+        if resident is None:
+            return
+        self._unbind(resident)
+        resident.host = None
+
+    def _unbind(self, resident):
+        """Send this module's parameters back to meta.
+
+        Sending the weights to meta is all the releasing this needs to do. It used to also empty the
+        allocator cache, which handed the blocks back to the driver and made the next layer pay for
+        a fresh, synchronizing allocation -- every layer, every token. The expensive release happens
+        once per generation, in reset().
+        """
+        for param_name in resident.moved or ():
+            set_module_tensor_to_device(self.model, param_name, 'meta')
+        resident.moved = None
+
+    def _cache_sequence(self, key, width):
+        """The modules that will be wanted after `key`, for the cache to read ahead.
+
+        A forward runs embed -> layers -> norm -> lm_head in order, so lookahead is just the next
+        few streamed indices. There is no cross-layer lookahead for MoE experts and none is implied
+        here: layer L's router has not run when layer L is being fetched.
+        """
+        idx = key[0]
+        upcoming = []
+        for step in range(1, max(1, width) + 1):
+            nxt = idx + step
+            if nxt not in self._streamed_set:
+                break
+            upcoming.append((nxt, KIND_DENSE))
+        return upcoming
+
+    def _layer_packed_bytes(self, idx):
+        """Packed bytes of one streamed module, read from the shard header rather than the data."""
+        cached = self._layer_bytes.get(idx)
+        if cached is not None:
+            return cached
+        size = 0
+        try:
+            layout = self.loader.plan(self.layer_names[idx],
+                                      keys=self._non_expert_keys.get(idx)
+                                      if getattr(self, '_expert_streaming', False) else None)
+            size = layout.total_bytes
+        except Exception:  # noqa: BLE001 - sizing must not be able to fail a load
+            try:
+                size = os.path.getsize(self.loader.shard_path(self.layer_names[idx]))
+            except OSError:
+                size = 0
+        self._layer_bytes[idx] = size
+        return size
+
     def _pre_hook(self, module, args):
-        idx = module._rocketllm_idx
-
-        if self.prefetching and self._prefetch_future is not None and self._prefetched_idx == idx:
-            state_dict = self._prefetch_future.result()
-            self._prefetch_future = None
-        else:
-            state_dict = self._load_streamed_layer(idx)
-
-        module._rocketllm_moved = self.move_layer_to_device(state_dict)
-
-        if self.prefetching:
-            nxt = self._next_streamed_idx(idx)
-            if nxt is not None:
-                self._prefetch_future = self._executor.submit(self._load_streamed_layer, nxt)
-                self._prefetched_idx = nxt
+        key = (module._rocketllm_idx, KIND_DENSE)
+        self.cache.acquire(key)
+        self.cache.prefetch_window(key)
 
     def _post_hook(self, module, args, output):
-        # module.to('meta') would also evict the experts, which manage their own lifetime, so with
-        # expert streaming we only release exactly what this hook placed.
-        #
-        # Sending the weights to meta is all the releasing this needs to do. It used to also empty
-        # the allocator cache here, which handed the blocks back to the driver and made the next
-        # layer pay for a fresh, synchronizing allocation -- every layer, every token. Leaving the
-        # blocks in the pool lets the next layer reuse them, which is the whole point of a caching
-        # allocator. The expensive release now happens once per generation, in reset().
-        if self.hf_quantizer is not None or getattr(self, '_expert_streaming', False):
-            for param_name in getattr(module, '_rocketllm_moved', []):
-                set_module_tensor_to_device(self.model, param_name, 'meta')
-        else:
-            module.to('meta')
+        self.cache.release((module._rocketllm_idx, KIND_DENSE))
         return output
 
     # ---- lifecycle --------------------------------------------------------------------------
@@ -710,8 +889,20 @@ class RocketModel:
         Staging buffers deliberately survive: they are what makes the next generation cheap, and
         holding them is the whole point of the pool. close() is what gives them back.
         """
-        self._prefetch_future = None
-        self._prefetched_idx = None
+        # Drop the cache's residency first: it is holding device buffers, and freeing them before
+        # the allocator is asked to hand memory back is the whole point of doing this here.
+        cache = getattr(self, "cache", None)
+        if cache is not None:
+            cache.clear()
+        self._end_generation()
+
+    def _end_generation(self):
+        """Settle everything in flight and hand freed blocks back, keeping cache residency.
+
+        What a generation boundary actually requires: no copy still reading a staging buffer, and
+        the allocator's freed blocks returned. Evicting the weights themselves is a separate
+        decision, and usually the wrong one -- see generate().
+        """
         # Nothing may be in flight when the allocator is asked to hand memory back, and a staged
         # buffer cannot be freed while a copy is still reading it.
         self.transfer.drain()
@@ -719,9 +910,12 @@ class RocketModel:
 
     def close(self):
         """Shut the model down for good: stop the prefetch worker and release everything."""
-        executor, self._executor = getattr(self, '_executor', None), None
-        if executor is not None:
-            executor.shutdown(wait=True)
+        cache = getattr(self, "cache", None)
+        if cache is not None:
+            cache.close()
+        loader = getattr(self, "loader", None)
+        if loader is not None:
+            loader.close()
         self.prefetching = False
         self.transfer.close()
         self.staging_pool.clear()
@@ -740,8 +934,12 @@ class RocketModel:
         try:
             return self.model.generate(*args, **kwargs)
         finally:
-            # One release per generation, in place of one per layer per token.
-            self.reset()
+            # One release per generation, in place of one per layer per token -- but NOT a cache
+            # clear. Residency is the whole point of the cache, and a second generation that had to
+            # re-read every layer from storage would pay the full first-token cost again. The cache
+            # is bounded by the device budget, so keeping it costs nothing that was not already
+            # budgeted. Call reset() explicitly to give it back.
+            self._end_generation()
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)

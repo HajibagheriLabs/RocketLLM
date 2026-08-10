@@ -20,6 +20,7 @@ import dataclasses
 import logging
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 log = logging.getLogger(__name__)
 
@@ -99,7 +100,8 @@ class TieredWeightCache:
     """
 
     def __init__(self, fetch, sizer, device_bytes=0, host_bytes=0, pinned=(), window=1,
-                 aging_interval=4096, profile=None, to_device=None, to_host=None):
+                 aging_interval=4096, profile=None, to_device=None, to_host=None,
+                 discard=None, sequence=None, prefetch_workers=0):
         #: Read a key's packed payload from storage. The slow path, and the one being avoided.
         self._fetch = fetch
         #: Packed bytes for a key. In the engine this comes from the quant registry's PackedWeight,
@@ -108,6 +110,11 @@ class TieredWeightCache:
         #: Optional tier transfer hooks, so the engine can move real tensors and the tests can not.
         self._to_device = to_device or (lambda payload: payload)
         self._to_host = to_host or (lambda payload: payload)
+        #: Called when an entry leaves the cache entirely, so the owner can unbind or free it.
+        self._discard = discard or (lambda payload: None)
+        #: Given a key, the keys that will be wanted next. This is what lets the cache own
+        #: lookahead instead of the caller keeping a one-slot prefetch of its own.
+        self._sequence = sequence
 
         self.device = _Tier("device", device_bytes)
         self.host = _Tier("host", self._knob(profile, "host_cache_bytes", host_bytes))
@@ -123,11 +130,22 @@ class TieredWeightCache:
         self._clock = 0
         self._expert_accesses = 0
 
+        # Lookahead. Only the storage read runs on a worker: moving a layer onto the device binds
+        # parameters on the model, and doing that from another thread while a forward is running is
+        # a race the engine would never recover from. So the worker reads, the caller places.
+        # An explicit width wins over the profile's: the caller passing one is a debugging override
+        # and has to be able to override the measurement it is there to question.
+        workers = int(prefetch_workers or self._knob(profile, "io_workers", 0) or 0)
+        self._executor = (ThreadPoolExecutor(max_workers=workers,
+                                             thread_name_prefix="rocketllm-prefetch")
+                          if workers > 0 and self._sequence is not None else None)
+        self._pending = {}
+
         self.stats = {
             "hits_device": 0, "hits_host": 0, "misses": 0,
             "evicted_to_host": 0, "evicted_to_storage": 0, "host_evictions": 0,
             "fetches": 0, "promotions": 0, "agings": 0,
-            "rejected_too_large": 0,
+            "rejected_too_large": 0, "prefetches": 0, "prefetch_hits": 0,
         }
 
     @staticmethod
@@ -190,8 +208,12 @@ class TieredWeightCache:
                 return self._resolve(entry)
 
             self.stats["misses"] += 1
-            payload = self._fetch(key)
-            self.stats["fetches"] += 1
+            payload = self._take_pending(key)
+            if payload is None:
+                payload = self._fetch(key)
+                self.stats["fetches"] += 1
+            else:
+                self.stats["prefetch_hits"] += 1
             entry = CacheEntry(key=key, packed_bytes=int(self._sizer(key)), tier="device",
                                payload=self._to_device(payload),
                                pinned=key in self.pinned)
@@ -200,6 +222,57 @@ class TieredWeightCache:
             self._touch(entry)
             entry.refcount += 1
             return self._resolve(entry)
+
+    # -- lookahead -----------------------------------------------------------------------------
+
+    def prefetch_window(self, key):
+        """Start reading the layers that come after `key`, up to the window's width.
+
+        Only the storage read is started here, on a worker; the placement happens on whichever
+        thread calls acquire. That is deliberate -- see the note where the executor is built.
+
+        Anything already resident, already in flight, or pinned is skipped, so this is cheap to
+        call on every layer boundary and does no work at all once the model fits.
+        """
+        if self._executor is None or self._sequence is None:
+            return 0
+        started = 0
+        for upcoming in self._sequence(key, self.window):
+            with self._lock:
+                if upcoming in self._entries or upcoming in self._pending:
+                    continue
+                self._pending[upcoming] = self._executor.submit(self._prefetch_one, upcoming)
+            started += 1
+        return started
+
+    def _prefetch_one(self, key):
+        self.stats["fetches"] += 1
+        self.stats["prefetches"] += 1
+        return self._fetch(key)
+
+    def _take_pending(self, key):
+        """Collect a prefetched payload, waiting for it if the read is still running."""
+        with self._lock:
+            future = self._pending.pop(key, None)
+        if future is None:
+            return None
+        try:
+            return future.result()
+        except Exception:  # noqa: BLE001 - a failed prefetch must fall back to a direct read
+            log.debug("prefetch of %s failed; reading it directly", key, exc_info=True)
+            return None
+
+    def _drop_pending(self):
+        with self._lock:
+            pending, self._pending = list(self._pending.values()), {}
+        for future in pending:
+            future.cancel()
+        for future in pending:
+            if not future.cancelled():
+                try:
+                    future.result()
+                except Exception:  # noqa: BLE001 - draining, not using the result
+                    pass
 
     def _resolve(self, entry):
         """Settle a payload that is still arriving before handing it to the caller.
@@ -356,6 +429,7 @@ class TieredWeightCache:
                 self.stats["evicted_to_host"] += 1
                 return
         self._entries.pop(entry.key, None)
+        self._discard(entry.payload)
         entry.payload = None
         entry.tier = "storage"
         self.stats["evicted_to_storage"] += 1
@@ -372,6 +446,7 @@ class TieredWeightCache:
             self._entries.pop(victim.key, None)
             victim.payload = None
             victim.tier = "storage"
+            self._discard(victim.payload)
             self.stats["host_evictions"] += 1
 
     # -- pinning -------------------------------------------------------------------------------
@@ -398,6 +473,32 @@ class TieredWeightCache:
             self._make_room(0)
 
     # -- reporting -----------------------------------------------------------------------------
+
+    def clear(self, keep_pinned=False):
+        """Drop everything the cache is holding and unbind it from whoever owns it.
+
+        For a generation boundary. An in-use entry is still not touched -- releasing weights a
+        forward is reading would be the same bug eviction is careful about -- so anything acquired
+        and not yet released survives, and there should be none of those between generations.
+        """
+        self._drop_pending()
+        with self._lock:
+            for key, entry in list(self._entries.items()):
+                if entry.in_use or (keep_pinned and entry.pinned):
+                    continue
+                self.device.remove(key)
+                self.host.remove(key)
+                self._entries.pop(key, None)
+                self._discard(entry.payload)
+                entry.payload = None
+                entry.tier = "storage"
+
+    def close(self):
+        self._drop_pending()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+        self.clear()
 
     def tier_of(self, key):
         entry = self._entries.get(key)
