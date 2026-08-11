@@ -252,6 +252,7 @@ class RocketModel:
             dtype = self.caps.select_compute_dtype(requested)
         self.running_dtype = dtype
         self.dtype = self.running_dtype
+        self._declare_runtime_dtype()
 
         self.generation_config = self.get_generation_config()
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
@@ -343,6 +344,38 @@ class RocketModel:
             return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
 
     # ---- model construction -----------------------------------------------------------------
+
+    def _declare_runtime_dtype(self):
+        """Tell the config what dtype this run is actually in, before the model is built.
+
+        The model is built from the config, so the config's dtype is what every meta placeholder
+        gets -- and a placeholder's dtype is not inert. accelerate's placement casts an incoming
+        value to the existing parameter's dtype whenever it is not told otherwise, so a config
+        saying bf16 silently pulls every weight back to bf16 however carefully the runtime dtype was
+        chosen. With `dtype=` left alone the two agree and nothing is visible; override it and the
+        model declares one dtype while the engine intends another, which surfaces as a dtype
+        mismatch inside the first matmul rather than as anything pointing back here.
+
+        Nested sub-configs are set too, for the same reason the attention implementation is: a
+        multimodal wrapper keeps the real decoder under `text_config`, and a value set only on the
+        outer config never reaches it.
+        """
+        from transformers import PretrainedConfig
+
+        def declare(cfg, depth=0):
+            if depth > 2:
+                return
+            # `torch_dtype` up to transformers 4.5x, `dtype` from 4.56 on. Set whichever the object
+            # already carries so this works either side of the rename, and `torch_dtype` regardless,
+            # since that is what the versions this project supports read.
+            cfg.torch_dtype = self.running_dtype
+            if hasattr(cfg, "dtype"):
+                cfg.dtype = self.running_dtype
+            for sub in vars(cfg).values():
+                if isinstance(sub, PretrainedConfig):
+                    declare(sub, depth + 1)
+
+        declare(self.config)
 
     def _propagate_attn_implementation(self, impl):
         """Push the attention choice down into nested sub-configs.
@@ -619,7 +652,14 @@ class RocketModel:
         for param_name, value in entries:
             count = value.numel()
             view = device_buffer.narrow(0, offset, count).view(value.shape)
-            set_module_tensor_to_device(self.model, param_name, self.running_device, value=view)
+            # The dtype is stated rather than left to default, and that is not belt-and-braces.
+            # Given no dtype, accelerate casts the value to whatever the existing parameter is --
+            # which is the meta placeholder built from the config. That silently reverses the
+            # decision the registry already made in _plan_transfer, AND allocates a copy, which is
+            # exactly what coalescing into one buffer exists to avoid. Passing the group's own
+            # target keeps the bind a view.
+            set_module_tensor_to_device(self.model, param_name, self.running_device, value=view,
+                                        dtype=target_dtype)
             offset += count
             moved.append(param_name)
         return moved
