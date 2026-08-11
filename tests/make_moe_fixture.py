@@ -96,6 +96,8 @@ def main():
     parser.add_argument("--intermediate", type=int, default=DEFAULTS["intermediate_size"])
     parser.add_argument("--heads", type=int, default=DEFAULTS["num_attention_heads"])
     parser.add_argument("--kv-heads", type=int, default=DEFAULTS["num_key_value_heads"])
+    parser.add_argument("--max-pos", type=int, default=DEFAULTS["max_position_embeddings"],
+                        help="raise this to make the KV cache large enough to measure")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--router-skew", type=float, default=0.0,
@@ -109,7 +111,7 @@ def main():
           num_local_experts=args.experts, num_experts_per_tok=args.top_k,
           num_hidden_layers=args.layers, hidden_size=args.hidden,
           intermediate_size=args.intermediate, num_attention_heads=args.heads,
-          num_key_value_heads=args.kv_heads)
+          num_key_value_heads=args.kv_heads, max_position_embeddings=args.max_pos)
 
 
 if __name__ == "__main__":

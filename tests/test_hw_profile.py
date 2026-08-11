@@ -307,21 +307,34 @@ class TestDtypes(unittest.TestCase):
         profile = make_profile(dtypes={"bf16": False, "fp16": False, "fp8": False, "fp4": False})
         self.assertEqual(profile.derived["compute_dtype"].value, "float32")
 
-    def test_kv_is_int4_on_a_small_device(self):
-        self.assertEqual(tiny_vram_machine().derived["kv_dtype"].value, "int4")
+    def test_the_profile_defers_the_kv_choice(self):
+        """Card size alone cannot decide it, so the probe does not pretend to.
 
-    def test_a_bigger_card_does_not_downgrade_the_kv_cache(self):
-        """The regression this guards: more VRAM must mean more context, not more precision.
+        Whether memory is the binding constraint is a question about the machine AND the model:
+        the same card is roomy for one checkpoint and hopeless for the next, and the probe runs
+        before any model is known. So it derives the inputs and the engine resolves the answer once
+        it can weigh measured weight bytes against the budget.
 
-        Device memory buys context length in a streaming engine. Scaling the KV dtype off card
-        size had the perverse effect of switching to full-precision KV exactly when a user bought
-        room to run longer, spending their new memory on precision they did not ask for.
+        What this still guards is the original regression -- a bigger card must not, by itself,
+        change the answer. It cannot, because at this level there is no answer yet.
         """
         for total in (4 * GB, 10 * GB, 24 * GB, 80 * GB, 192 * GB):
             profile = make_profile(device_total_bytes=total, device_free_bytes=total - GB,
                                    host_total_bytes=16 * GB, host_available_bytes=8 * GB)
             with self.subTest(device_total_gb=total // GB):
-                self.assertEqual(profile.derived["kv_dtype"].value, "int4")
+                self.assertEqual(profile.derived["kv_dtype"].value, "auto")
+
+    def test_the_kv_layout_knobs_are_derived_not_hardcoded(self):
+        profile = tiny_vram_machine()
+        self.assertEqual(profile.derived["kv_group_size"].value, 64)
+        self.assertEqual(profile.derived["kv_residual_tokens"].value, 128)
+        self.assertGreater(profile.derived["kv_fit_headroom_percent"].value, 0)
+
+    def test_the_residual_window_can_hold_a_whole_group(self):
+        """Below one group nothing could ever be quantized, so the two knobs are not independent."""
+        profile = tiny_vram_machine()
+        self.assertGreaterEqual(profile.derived["kv_residual_tokens"].value,
+                                profile.derived["kv_group_size"].value)
 
     def test_kv_choice_does_not_depend_on_free_ram(self):
         busy = tiny_vram_machine(host_available_bytes=1 * GB)

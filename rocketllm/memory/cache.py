@@ -485,10 +485,16 @@ class TieredWeightCache:
         if self.host.capacity > 0:
             self._make_host_room(entry.packed_bytes)
             if self.host.fits(entry.packed_bytes):
-                entry.payload = self._to_host(entry.payload)
-                self.host.add(entry)
-                self.stats["evicted_to_host"] += 1
-                return
+                # The owner may refuse: an entry whose host-side copy was released has nothing to
+                # keep in this tier, and admitting it anyway would leave the tier holding an entry
+                # with no data in it -- which does not fail here, it fails later, when something
+                # asks for it back. A refusal means storage.
+                hosted = self._to_host(entry.payload)
+                if hosted is not None:
+                    entry.payload = hosted
+                    self.host.add(entry)
+                    self.stats["evicted_to_host"] += 1
+                    return
         self._entries.pop(entry.key, None)
         self._discard(entry.payload)
         entry.payload = None

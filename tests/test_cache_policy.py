@@ -351,6 +351,25 @@ class TestHostTier(unittest.TestCase):
         self.assertEqual(cache.tier_of(dense_key(0)), "storage")
         self.assertEqual(cache.report()["evicted_to_host"], 0)
 
+    def test_an_owner_that_cannot_host_an_entry_sends_it_to_storage(self):
+        """REGRESSION TEST. A tier must never hold an entry with no data behind it.
+
+        The engine releases the host-side copy of anything pinned, because a pinned entry never
+        falls back and keeping one would be pure waste. Once pin plans became dynamic, a later plan
+        could unpin such an entry -- and demoting it into the host tier then parked an empty entry
+        there. Nothing failed at that moment; it failed on the next hit, when the loader was handed
+        the nothing that had been stored.
+        """
+        cache, storage = build_cache(device_bytes=10 * MB, host_bytes=100 * MB, window=1,
+                                     to_host=lambda payload: None)
+        walk(cache, [dense_key(0), dense_key(1)])
+        self.assertEqual(cache.tier_of(dense_key(0)), "storage",
+                         "an entry with no host copy was parked in the host tier")
+        self.assertEqual(cache.report()["host_entries"], 0)
+        # And it is re-read rather than served from an entry that holds nothing.
+        self.assertEqual(cache.acquire(dense_key(0)), f"payload:{dense_key(0)}")
+        cache.release(dense_key(0))
+
     def test_a_full_host_tier_drops_its_coldest_rather_than_refusing(self):
         cache, _ = build_cache(window=1, device_bytes=1 * 10 * MB, host_bytes=2 * 10 * MB)
         walk(cache, [dense_key(i) for i in range(5)])

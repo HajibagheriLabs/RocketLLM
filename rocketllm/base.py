@@ -20,8 +20,9 @@ from .hw.caps import get_caps
 from .hw.profile import HardwareProfile
 from .quant import detect_backend
 from .quant.safetensors_quant import announce_backend
-from .memory import (CLASS_ALWAYS, KIND_DENSE, PinCandidate, TieredWeightCache, expert_kind,
-                     is_expert, pin_budget_from, plan_pins)
+from .memory import (CLASS_ALWAYS, KIND_DENSE, PinCandidate, TieredWeightCache, VramBudget,
+                     configure_allocator, expert_kind, is_expert, pin_budget_from, plan_pins)
+from .quant.kv_cache import KV_CHOICES, KV_FP16, KVCacheConfig, build_kv_cache, resolve_kv_cache
 from .moe import (LAYOUT_MODULE_LIST, ExpertContainer, ExpertLayout, ExpertResidency,
                   RouterSelection, detect_expert_layout, resolve_top_k, shared_kind,
                   summarize as summarize_experts)
@@ -103,7 +104,7 @@ class RocketModel:
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
                  vram_reserve=None, host_cache_gb=None, io_workers=None, window_max=None,
-                 pin_policy="auto", expert_residency="auto"):
+                 pin_policy="auto", expert_residency="auto", kv_cache="auto"):
         """
         Parameters
         ----------
@@ -161,7 +162,24 @@ class RocketModel:
             resident; "off" leaves a mixture's experts to the ordinary cache without ever pinning
             one. Exists so the policy can be measured against its own absence on the same build,
             and because a model that routes uniformly has nothing for it to exploit.
+        kv_cache: str, optional
+            How to hold the KV cache. "auto" (default) keeps it in the compute dtype when the
+            weights fit resident with headroom to spare, and quantizes to int4 when they do not --
+            because only in the second case is a byte of context a byte of weights re-read next
+            token. "fp16" and "int4" force the choice. "hqq" and "quanto" delegate to transformers'
+            own quantized cache on those backends, as a reference to check the int4 path against;
+            both are optional packages and fall back with a message when absent.
+
+            This is INDEPENDENT of the weight format and must stay so: the checkpoint's
+            quantization describes what someone else produced, this describes what fits here.
         """
+
+        # First thing, before anything in this constructor touches the device. The allocator reads
+        # its configuration once, when the context is created, so asking for expandable segments
+        # after the hardware probe has run is asking too late -- and under a streaming workload,
+        # where a layer's blocks are carved and released hundreds of times per token, that setting
+        # is the difference between reusing those blocks and stranding them.
+        self.allocator = configure_allocator(device)
 
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
@@ -238,12 +256,25 @@ class RocketModel:
             raise ValueError(
                 f"expert_residency must be 'auto' or 'off', not {expert_residency!r}")
         self.expert_residency = expert_residency
+        if kv_cache not in KV_CHOICES:
+            raise ValueError(f"kv_cache must be one of {', '.join(KV_CHOICES)}, not {kv_cache!r}")
+        self.kv_cache_setting = kv_cache
+        self.kv_cache_choice = None
         self._layer_bytes = {}
 
         # Staging buffers are sized from the machine, not from a constant. Probing is cached by
         # hardware fingerprint, so this is a one-off cost; if it fails for any reason the pool
         # runs with a zero budget, which means no pooling and no pinning -- slower, still correct.
         self.staging_pool = HostStagingPool(self.caps, self._staging_budget_bytes())
+
+        # Built before anything allocates on the device, because it is what asks for expandable
+        # segments and that setting is read once, when the context is created. It measures from
+        # here on; the cache is wired to it in _build_cache, once there is a cache to resize.
+        # Configured at the top of the constructor already, so it is not attempted a second time
+        # here -- doing so would report "too late" against a context this object created itself.
+        self.budget = VramBudget(device_caps=self.caps, profile=self.profile,
+                                 reserve_bytes=self._overrides.get("reserve_bytes"),
+                                 configure_allocator_env=False)
         # The copy stream, and the thing that owns a staged buffer's lifetime until its event
         # fires. Built here because the pool has to know how to ask it for finished transfers
         # before it decides it has no free buffer.
@@ -611,6 +642,8 @@ class RocketModel:
             self._streamed_indices = list(range(n))
 
         self._streamed_set = set(self._streamed_indices)
+        #: Where a forward pass begins, so the device budget is sampled once per token.
+        self._first_streamed = self._streamed_indices[0] if self._streamed_indices else None
 
         self._setup_expert_streaming()
 
@@ -1006,6 +1039,16 @@ class RocketModel:
             if device_bytes > 0:
                 window_budget = int(window_budget * overridden / device_bytes)
             device_bytes = overridden
+
+        # The profile's figure was measured on an idle card before this model existed. What is
+        # actually free now, with the weights already placed, is what the budget is reading, so
+        # prefer it -- on any backend that can report it honestly. Sizing the cache against the
+        # older, larger number is how a run ends up pinning more than the card has left.
+        live = self.budget.measure()
+        if not live.estimated:
+            window_share = (window_budget / device_bytes) if device_bytes else 0.0
+            device_bytes = self._capacity_for(live.usable)
+            window_budget = int(device_bytes * window_share)
         pinned = self._plan_pins(device_bytes, window_budget, largest)
 
         self.cache = TieredWeightCache(
@@ -1022,9 +1065,73 @@ class RocketModel:
         self.experts.cache = self.cache
         self.experts.on_replan(self._replan_expert_pins)
 
+        # The window is a share of the budget, so when the budget moves the window has to move with
+        # it. Kept as the ratio rather than the bytes for exactly that reason.
+        self._window_share = (window_budget / device_bytes) if device_bytes else 0.0
+        self.budget.on_change = self._budget_changed
+
+        self._resolve_kv_cache(device_bytes)
+
         print(f"cache: window {window} layers, device budget "
               f"{device_bytes / 1024 ** 3:.1f}GB, host tier {host_bytes / 1024 ** 3:.1f}GB, "
               f"{len(pinned)} pinned, pin_policy={self.pin_policy}")
+
+    def _resolve_kv_cache(self, device_bytes):
+        """Settle the KV cache now that both the weights and the budget have been measured."""
+        weight_bytes = sum(self._layer_packed_bytes(idx) for idx in self._streamed_indices)
+        weight_bytes += sum(self._unit_byte_counts.values())
+        headroom = self._knob("kv_fit_headroom_percent", 15) / 100.0
+        self.kv_cache_choice, reason = resolve_kv_cache(
+            self.kv_cache_setting, weight_bytes=weight_bytes, device_bytes=device_bytes,
+            headroom=headroom)
+        self.kv_cache_config = KVCacheConfig(
+            group_size=self._knob("kv_group_size", 64),
+            residual_length=self._knob("kv_residual_tokens", 128),
+            compute_dtype=self.running_dtype)
+        print(f"kv cache: {self.kv_cache_choice} -- {reason}")
+
+    def _new_kv_cache(self):
+        """A fresh cache for one generation, or None to let transformers use its own."""
+        return build_kv_cache(self.kv_cache_choice, self.kv_cache_config,
+                              device=self.running_device, compute_dtype=self.running_dtype)
+
+    def _budget_changed(self, old_bytes, new_bytes, sample):
+        """Free device memory moved, so re-size the cache and re-rank what it keeps.
+
+        This is the path a dropped KV cache travels down. At the end of a generation the context is
+        released, the budget jumps by its whole size, and without this nothing would notice: the
+        cache would go on sizing itself against whatever was free while the longest context of the
+        run was still resident. The window keeps its share and the rest goes to pinning, so the
+        memory a shorter context frees turns directly into resident weights.
+        """
+        cache = getattr(self, "cache", None)
+        if cache is None:
+            return
+        if sample is not None and sample.estimated:
+            # The backend could not report the allocator's own totals, so this reading is free
+            # memory and nothing else -- on the CPU backend that is host RAM, which the profile
+            # deliberately does not treat as a device pool. Following it would silently replace a
+            # derived budget with an unrelated number. Track, do not act.
+            return
+        capacity = self._capacity_for(new_bytes)
+        cache.resize_device(capacity)
+        window_budget = int(capacity * self._window_share)
+        self._pin_budget = pin_budget_from(capacity, window_budget)
+        if self.pin_policy != "off":
+            cache.apply_plan(plan_pins(self._pin_candidates(), self._pin_budget))
+
+    def _capacity_for(self, free_bytes):
+        """What the cache may hold, given how many bytes are free right now.
+
+        The budget measures what is FREE, and what the cache is already holding is not free -- it is
+        allocated, by this cache, for exactly the purpose being sized. So the capacity is what it
+        holds plus what is still free. Setting the capacity to the free figure alone would tell a
+        cache holding a gigabyte of pinned weights that its budget is the few hundred megabytes left
+        over, and it would evict most of itself to get there, on every sample, for nothing.
+        """
+        cache = getattr(self, "cache", None)
+        held = cache.device.bytes if cache is not None else 0
+        return max(0, int(free_bytes) + int(held))
 
     def _plan_pins(self, device_bytes, window_budget, largest):
         """Which modules to keep resident for the whole run.
@@ -1100,9 +1207,16 @@ class RocketModel:
         return resident
 
     def _cache_to_host(self, resident):
-        """Host tier: unbind from the module but keep the CPU copy to serve the next hit."""
+        """Host tier: unbind from the module but keep the CPU copy to serve the next hit.
+
+        Returns None when there is no CPU copy to keep, which sends the entry to storage instead.
+        That happens to an entry that was pinned when it was placed -- pinned entries never fall
+        back, so holding their host copy is pure waste and it is dropped -- and which a later plan
+        then unpinned. Nothing could unpin an entry until residency became dynamic, which is why
+        this could not arise before and why it must be handled now.
+        """
         self._unbind(resident)
-        return resident
+        return resident if resident.host is not None else None
 
     def _cache_discard(self, resident):
         """The entry is leaving the cache: unbind and let the host copy go."""
@@ -1171,6 +1285,13 @@ class RocketModel:
 
     def _pre_hook(self, module, args):
         key = (module._rocketllm_idx, KIND_DENSE)
+        # Once per forward, at the first streamed module, rather than at every layer boundary. The
+        # driver query behind this is not free -- sampling per layer cost ~20% of decode throughput
+        # on a small model, which is the whole saving a budget this precise could ever buy back --
+        # and it measures nothing extra: what the reading tracks is the KV cache growing and that
+        # happens per token, not per layer.
+        if module._rocketllm_idx == self._first_streamed:
+            self.budget.sample()
         self.cache.acquire(key)
         self.cache.prefetch_window(key)
 
@@ -1222,6 +1343,13 @@ class RocketModel:
         # buffer cannot be freed while a copy is still reading it.
         self.transfer.drain()
         clean_memory(self.running_device)
+        # The context has just been dropped, so the budget is about to jump by its whole size.
+        # Republish immediately rather than waiting for the hysteresis streak: this is the one
+        # moment the change is known to be real, and making it wait would leave the weight cache
+        # sized for a context that no longer exists.
+        budget = getattr(self, "budget", None)
+        if budget is not None:
+            budget.reset()
 
     def close(self):
         """Shut the model down for good: stop the prefetch worker and release everything."""
@@ -1246,6 +1374,15 @@ class RocketModel:
     # ---- delegation to the underlying transformers model ------------------------------------
 
     def generate(self, *args, **kwargs):
+        # A quantized context has to be handed in, because transformers builds its own DynamicCache
+        # otherwise and nothing here would ever see it. A caller who passed one keeps it: an
+        # explicit cache is an instruction, not a suggestion. At fp16 this adds nothing at all --
+        # build_kv_cache returns None and the stock path runs untouched.
+        if kwargs.get("past_key_values") is None and self.kv_cache_choice != KV_FP16:
+            cache = self._new_kv_cache()
+            if cache is not None:
+                kwargs["past_key_values"] = cache
+                kwargs.setdefault("use_cache", True)
         try:
             return self.model.generate(*args, **kwargs)
         finally:

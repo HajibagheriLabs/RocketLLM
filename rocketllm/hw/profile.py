@@ -82,6 +82,15 @@ class Policy:
     #: Accesses between halvings of the expert popularity counts. Aging is what keeps LFU from
     #: freezing around whatever was hot at the start of a long generation.
     expert_aging_interval: int = 4096
+    #: Values sharing one scale in the KV cache. 64 is the KIVI recipe's group.
+    kv_group_size: int = 64
+    #: Most recent tokens kept unquantized. They are the ones attention weights most sharply, and
+    #: quantizing K per channel cannot compute a scale until a whole group of tokens exists, so the
+    #: window is what makes the layout possible as well as what protects quality.
+    kv_residual_tokens: int = 128
+    #: How much room beyond the weights must be free before an automatic KV choice keeps the context
+    #: in full precision. Below this the device is the binding constraint and int4 buys context.
+    kv_fit_headroom_fraction: float = 0.15
     #: Router firings between rebuilds of the expert pin plan, as a share of the aging interval.
     #: The two describe one timescale: re-ranking experts far more often than the counts they are
     #: ranked by can move only pays for evictions and refetches that the next rebuild undoes.
@@ -104,6 +113,9 @@ _OVERRIDABLE = {
     "pin_replan_bytes": int,
     "expert_aging_interval": int,
     "expert_replan_interval": int,
+    "kv_group_size": int,
+    "kv_residual_tokens": int,
+    "kv_fit_headroom_percent": int,
     "compute_dtype": str,
     "kv_dtype": str,
     "quant_compute_path": str,
@@ -809,33 +821,45 @@ class HardwareProfile:
             compute, formula = "float32", "fp32 fallback: neither bf16 nor fp16 available"
         self._set("compute_dtype", compute, formula, {"dtype_support": self.dtypes}, overrides)
 
-        # Independent of the weight format, on purpose -- and deliberately not a function of how
-        # much device memory there is.
+        # Independent of the weight format, on purpose. Nothing in this decision may consult it:
+        # the checkpoint's format is a property of what someone else produced, and this is a
+        # property of how much room the running machine has for a context.
         #
-        # A bigger card is bought to run a longer context, not to hold the same context more
-        # precisely. In an engine whose whole premise is that the model does not fit, every byte
-        # the KV cache takes is a byte the streaming window cannot use, and that stays true at
-        # 24GB exactly as it was at 10GB -- the context simply grows to use the room. int4 buys
-        # roughly four times the context per byte, and the accuracy cost is already bounded by
-        # quantizing K per-channel and V per-token with the most recent tokens left in an fp16
-        # residual window.
+        # The probe cannot settle it either, and says so rather than guessing. Whether memory is the
+        # binding constraint is a question about the machine AND the model together -- the same card
+        # is roomy for one checkpoint and hopeless for the next -- and the model is not known until
+        # something is loaded. So what is derived here is the *inputs* to that choice, and the
+        # engine resolves it once it can measure the weights against the budget.
         #
-        # An earlier version of this scaled the choice off device memory against host RAM, which
-        # decides nothing about either, and had the perverse effect of downgrading to
-        # full-precision KV exactly when a user had bought room for more context.
+        # An earlier revision hardcoded int4 on the reasoning that a bigger card is bought for a
+        # longer context rather than a more precise one. That holds when the model does not fit,
+        # which is the case this engine exists for, but it also spent quality on a model that fits
+        # resident with room to spare -- where nothing is gained by compressing the context, because
+        # no weight was going to be evicted for it.
         usable = self.derived["usable_device_bytes"].value
-        kv_formula = ("int4 always: device memory buys context length in a streaming engine, and "
-                      "int4 quadruples the context a given budget holds. Not derived from device "
-                      "size -- a larger card means a longer context, not a more precise one. "
-                      "Override to the compute dtype when the model fits resident and precision "
-                      "matters more than length.")
-        self._set("kv_dtype", "int4", kv_formula, {
-            "usable_device_bytes": usable,
-            "compute_dtype": compute,
-            "quantization": "K per-channel, V per-token, group size 64",
-            "note": "the most recent ~128 tokens stay in an fp16 residual window regardless, so "
-                    "the tokens most sensitive to quantization are not quantized",
-        }, overrides)
+        self._set("kv_dtype", "auto",
+                  "deferred: decided at load from measured weight bytes against the device budget",
+                  {
+                      "usable_device_bytes": usable,
+                      "compute_dtype": compute,
+                      "rule": "weights fitting resident with kv_fit_headroom left over -> the "
+                              "compute dtype; otherwise int4",
+                      "quantization": "K per-channel, V per-token, group size "
+                                      f"{policy.kv_group_size}",
+                      "note": f"the most recent ~{policy.kv_residual_tokens} tokens stay in an fp16 "
+                              f"residual window either way, so the tokens most sensitive to "
+                              f"quantization are never quantized",
+                  }, overrides)
+        self._set("kv_group_size", int(policy.kv_group_size),
+                  "policy: values sharing one KV scale",
+                  {"kv_group_size": policy.kv_group_size}, overrides)
+        self._set("kv_residual_tokens", int(policy.kv_residual_tokens),
+                  "policy: most recent tokens left unquantized",
+                  {"kv_residual_tokens": policy.kv_residual_tokens}, overrides)
+        self._set("kv_fit_headroom_percent",
+                  int(round(policy.kv_fit_headroom_fraction * 100)),
+                  "policy: free room beyond the weights required before the context is kept exact",
+                  {"kv_fit_headroom_fraction": policy.kv_fit_headroom_fraction}, overrides)
 
     def _derive_quant_path(self, policy, overrides):
         """Compute on packed weights, or dequantize into scratch first."""

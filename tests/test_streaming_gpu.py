@@ -54,7 +54,8 @@ def cap_vram(max_vram_gb):
 def run_rocketllm(args):
     from rocketllm import AutoModel
 
-    model = AutoModel.from_pretrained(args.model, delete_original=args.delete_original)
+    model = AutoModel.from_pretrained(args.model, delete_original=args.delete_original,
+                                      kv_cache=args.kv_cache)
     ids = model.tokenizer([args.prompt], return_tensors="pt",
                           return_attention_mask=False)["input_ids"].cuda()
 
@@ -112,6 +113,9 @@ def main():
     p.add_argument("--max-vram-gb", type=float, default=None)
     p.add_argument("--delete-original", action="store_true",
                    help="delete the original checkpoint shards while splitting (saves disk for big models)")
+    p.add_argument("--kv-cache", default="auto", dest="kv_cache",
+                   help="auto | fp16 | int4 | hqq | quanto. int4 changes the output by design, so "
+                        "a MATCH is only meaningful at fp16; run both and say which is which")
     p.add_argument("--compare", action="store_true",
                    help="also run a full-load reference and assert outputs match")
     args = p.parse_args()
