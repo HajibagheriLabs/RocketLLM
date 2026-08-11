@@ -55,7 +55,8 @@ def run_rocketllm(args):
     from rocketllm import AutoModel
 
     model = AutoModel.from_pretrained(args.model, delete_original=args.delete_original,
-                                      kv_cache=args.kv_cache)
+                                      kv_cache=args.kv_cache, draft_model=args.draft_model,
+                                      speculative=args.speculative)
     ids = model.tokenizer([args.prompt], return_tensors="pt",
                           return_attention_mask=False)["input_ids"].cuda()
 
@@ -65,13 +66,19 @@ def run_rocketllm(args):
                          return_dict_in_generate=True)
     elapsed = time.time() - t
 
-    text = model.tokenizer.decode(out.sequences[0])
+    # The speculative loop is not transformers' loop and returns the sequence itself.
+    sequences = out if isinstance(out, torch.Tensor) else out.sequences
+    text = model.tokenizer.decode(sequences[0])
     peak = torch.cuda.max_memory_allocated() / 1e6
     print(f"\n=== RocketLLM ===")
     print(f"output : {text!r}")
     print(f"peak VRAM: {peak:.1f} MB")
     print(f"time   : {elapsed:.1f}s ({args.max_new_tokens} new tokens)")
-    return out.sequences[0].tolist()
+    if getattr(model, "spec", None) is not None:
+        stats = model.spec.stats
+        print(f"spec   : {stats.acceptance_rate:.0%} accepted, "
+              f"{stats.tokens_per_pass:.2f} tokens/pass over {stats.passes} passes")
+    return sequences[0].tolist()
 
 
 def run_reference(args):
@@ -116,6 +123,15 @@ def main():
     p.add_argument("--kv-cache", default="auto", dest="kv_cache",
                    help="auto | fp16 | int4 | hqq | quanto. int4 changes the output by design, so "
                         "a MATCH is only meaningful at fp16; run both and say which is which")
+    p.add_argument("--draft-model", default=None, dest="draft_model",
+                   help="a small model sharing this one's tokenizer, for speculative decoding. "
+                        "Note that greedy speculation is only bit-exact in exact arithmetic: a "
+                        "verification pass computes a token's logits alongside others, and in a "
+                        "reduced dtype that reduces in a different order than computing it alone. "
+                        "A near-tie can therefore resolve differently, in the stock model too")
+    p.add_argument("--speculative", default="auto", choices=("auto", "on", "off"),
+                   help="auto takes the profile's recommendation, which is no for a model that is "
+                        "already resident")
     p.add_argument("--compare", action="store_true",
                    help="also run a full-load reference and assert outputs match")
     args = p.parse_args()

@@ -40,8 +40,9 @@ log = logging.getLogger(__name__)
 #: a stale one would keep supplying a knob that no longer means what it did. Version 2 replaced the
 #: absolute budget_hysteresis_bytes with budget_hysteresis_ratio; a cache still carrying the old key
 #: would pin the band to a byte count measured against the whole card, which is the bug that change
-#: exists to fix.
-SCHEMA_VERSION = 2
+#: exists to fix. Version 3 added speculative_lookahead; a cache without it leaves speculation on a
+#: stated fallback rather than on this machine's measured amortization ratio.
+SCHEMA_VERSION = 3
 
 # Dimensionless policy factors. Not hardware facts -- design choices, gathered here so they are
 # visible and overridable rather than sprinkled through the engine as literals.
@@ -64,6 +65,12 @@ class Policy:
     #: How much slower than device memory the slowest weight-serving tier must be before
     #: speculative decoding is worth it: below this, a streaming pass is not the dominant cost.
     speculative_amortization_threshold: float = 10.0
+    #: Most tokens one verification pass may be asked to check. A ceiling rather than a setting:
+    #: how many are actually proposed is adapted from the acceptance rate at runtime. It exists
+    #: because the expected yield of a pass saturates -- at an acceptance rate of 0.8, going from
+    #: 8 proposals to 16 buys under 3% more tokens and doubles the draft's work -- so past a point
+    #: a larger lookahead is only a way to spend device time on proposals that get thrown away.
+    speculative_lookahead_ceiling: int = 8
     #: A concurrency level must beat the best so far by this much to be judged a real improvement,
     #: rather than run-to-run noise.
     io_concurrency_improvement: float = 0.10
@@ -128,6 +135,7 @@ _OVERRIDABLE = {
     "kv_dtype": str,
     "quant_compute_path": str,
     "speculative_recommended": lambda v: v.strip().lower() in ("1", "true", "yes", "on"),
+    "speculative_lookahead": int,
 }
 
 
@@ -922,6 +930,26 @@ class HardwareProfile:
             "slowest_weight_tier_bandwidth": slowest,
             "amortization_ratio": ratio,
             "threshold": policy.speculative_amortization_threshold,
+        }, overrides)
+
+        # How many tokens one pass is worth waiting for, from the same measurement. The threshold is
+        # the point at which a pass becomes worth one extra token, so the ratio expressed in units
+        # of the threshold is how many extra tokens it is worth -- one more than that is what to
+        # propose. A machine at the boundary gets 2; a storage-bound one saturates at the ceiling,
+        # because the yield of a pass stops growing long before the ratio does.
+        ceiling = max(1, int(policy.speculative_lookahead_ceiling))
+        if ratio is None:
+            lookahead = None
+            formula = "unavailable: the amortization ratio was not measured"
+        else:
+            lookahead = max(1, min(ceiling, int(round(
+                ratio / policy.speculative_amortization_threshold)) + 1))
+            formula = ("clamp(round(amortization_ratio / speculative_amortization_threshold) + 1, "
+                       "1, speculative_lookahead_ceiling)")
+        self._set("speculative_lookahead", lookahead, formula, {
+            "amortization_ratio": ratio,
+            "threshold": policy.speculative_amortization_threshold,
+            "ceiling": ceiling,
         }, overrides)
 
     def _collect_warnings(self, policy):

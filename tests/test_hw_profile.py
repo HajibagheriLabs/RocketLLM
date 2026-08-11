@@ -387,6 +387,44 @@ class TestSpeculativeRecommendation(unittest.TestCase):
         self.assertIsNone(profile.derived["speculative_recommended"].value)
 
 
+class TestSpeculativeLookahead(unittest.TestCase):
+    """How many tokens a pass is worth waiting for, from the same measurement as the decision."""
+
+    def test_a_storage_bound_machine_gets_the_ceiling(self):
+        profile = slow_storage_machine()
+        self.assertEqual(profile.derived["speculative_lookahead"].value,
+                         DEFAULT_POLICY.speculative_lookahead_ceiling)
+
+    def test_a_machine_at_the_threshold_is_worth_two_tokens_a_pass(self):
+        """One extra over the single token an unspeculated pass produces, which is the whole
+        claim the threshold encodes."""
+        profile = make_profile(
+            device_memory_bandwidth=100e9,
+            host_to_device_pinned_bandwidth=10e9, host_to_device_pageable_bandwidth=10e9,
+            storage=dict(big_vram_machine().storage, best_bytes_per_s=20e9))
+        self.assertEqual(profile.derived["speculative_lookahead"].value, 2)
+
+    def test_it_never_computes_to_zero(self):
+        """Zero would mean proposing nothing, which is a slower way to decode normally."""
+        profile = make_profile(
+            device_memory_bandwidth=1e9,
+            host_to_device_pinned_bandwidth=50e9, host_to_device_pageable_bandwidth=50e9,
+            storage=dict(big_vram_machine().storage, best_bytes_per_s=50e9))
+        self.assertEqual(profile.derived["speculative_lookahead"].value, 1)
+
+    def test_unavailable_when_the_ratio_was_not_measured(self):
+        profile = make_profile(device_memory_bandwidth=None)
+        self.assertIsNone(profile.derived["speculative_lookahead"].value)
+        self.assertIn("not measured", profile.derived["speculative_lookahead"].formula)
+
+    def test_it_is_a_ceiling_and_not_a_setting(self):
+        """The engine adapts K downwards from the acceptance rate; this only bounds it."""
+        from rocketllm.spec import lookahead_ceiling
+
+        self.assertEqual(lookahead_ceiling(slow_storage_machine()),
+                         DEFAULT_POLICY.speculative_lookahead_ceiling)
+
+
 class TestWarnings(unittest.TestCase):
     def test_slow_storage_is_called_out_with_its_measured_rate(self):
         profile = slow_storage_machine()

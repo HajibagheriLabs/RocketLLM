@@ -211,6 +211,9 @@ class VramBudget:
                                                        hysteresis_samples, 1))
 
         self.on_change = on_change
+        #: label -> device bytes claimed by something that is not this budget's owner, for
+        #: reporting. See :meth:`register_external` for why these are recorded and not subtracted.
+        self.external = {}
         self.history = deque(maxlen=history) if history else None
         self._lock = threading.Lock()
         self._streak = 0
@@ -447,6 +450,30 @@ class VramBudget:
         """The published budget. Size caches against this, not against `current()`."""
         return self._target
 
+    def register_external(self, label, nbytes):
+        """Record device memory claimed by something other than this budget's owner, and republish.
+
+        Note carefully what this does NOT do: it does not subtract the bytes. They are already
+        allocated on the device, so the very next reading measures them as gone, and subtracting
+        them again would charge the owner twice for one claim. What the registration is for is the
+        other two things a silent allocation cannot do -- attribute the dip to whoever caused it, so
+        a shrunken cache has a stated reason rather than looking like a bad measurement, and
+        republish AT ONCE rather than waiting out a hysteresis streak, because a deliberate claim by
+        a known component is not the allocator noise the band exists to reject.
+
+        Pass zero, or None, to withdraw a claim.
+        """
+        nbytes = max(0, int(nbytes or 0))
+        if nbytes:
+            self.external[label] = nbytes
+        else:
+            self.external.pop(label, None)
+        return self.reset()
+
+    @property
+    def external_bytes(self):
+        return sum(self.external.values())
+
     def reset(self):
         """Forget the hysteresis state and republish whatever is true now.
 
@@ -484,6 +511,8 @@ class VramBudget:
             "reserve_bytes": self.reserve_bytes,
             "reclaimable_bytes": latest.reclaimable if latest is not None else 0,
             "headroom_bytes": latest.headroom if latest is not None else 0,
+            "external_bytes": self.external_bytes,
+            "external": dict(self.external),
             "hysteresis_bytes": self.hysteresis_bytes,
             "hysteresis_ratio": self.hysteresis_ratio,
             "hysteresis_scale_bytes": self.scale(),

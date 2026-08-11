@@ -282,6 +282,37 @@ class QuantizedKVCache(Cache):
         return (keys.narrow(-2, take, remaining).contiguous(),
                 values.narrow(-2, take, remaining).contiguous())
 
+    def crop(self, max_length):
+        """Drop everything past `max_length` tokens. What speculative decoding needs after a
+        rejection, and the one operation an append-only cache does not get for free.
+
+        Only the fp16 residual window is cropped, and that is a real restriction rather than an
+        oversight. A quantized block is a whole group of tokens sharing one scale per channel, so
+        cutting one in half would mean re-encoding it from its own dequantized values -- compounding
+        the error of a block that has already been through the quantizer once, to serve tokens that
+        are being thrown away anyway. Since the window holds `residual_length` tokens and a
+        speculative pass can never be asked to take back more than its lookahead, this covers the
+        case it exists for; anything deeper says so rather than quietly corrupting the history.
+        """
+        for layer_idx in range(len(self.key_cache)):
+            length = self.get_seq_length(layer_idx)
+            if max_length < 0:
+                max_length = length - abs(max_length)
+            if length <= max_length:
+                continue
+            quantized = sum(block.length for block in self._blocks[layer_idx][0])
+            keep = max_length - quantized
+            if keep < 0:
+                raise ValueError(
+                    f"cannot crop this cache to {max_length} tokens: {quantized} of them are "
+                    f"already quantized into whole groups and only the {length - quantized} most "
+                    f"recent are still exact. Cropping into a quantized block would mean "
+                    f"re-encoding it, which compounds its error. Raise residual_length above the "
+                    f"speculative lookahead if a deeper rollback is really needed.")
+            self.key_cache[layer_idx] = self.key_cache[layer_idx][..., :keep, :]
+            self.value_cache[layer_idx] = self.value_cache[layer_idx][..., :keep, :]
+        self._seen_tokens = min(self._seen_tokens, max(0, int(max_length)))
+
     def get_seq_length(self, layer_idx=0):
         if layer_idx >= len(self.key_cache):
             return 0

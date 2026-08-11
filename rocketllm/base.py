@@ -26,6 +26,8 @@ from .quant.kv_cache import KV_CHOICES, KV_FP16, KVCacheConfig, build_kv_cache, 
 from .moe import (LAYOUT_MODULE_LIST, ExpertContainer, ExpertLayout, ExpertResidency,
                   RouterSelection, detect_expert_layout, resolve_top_k, shared_kind,
                   summarize as summarize_experts)
+from .spec import (SPEC_CHOICES, DraftModel, SamplingParams, SpeculativeDecoder,
+                   announce as announce_speculation, lookahead_ceiling, resolve_speculation)
 from .streaming import HostStagingPool, LayerLoader, WeightTransfer
 from .profiler import LayeredProfiler
 
@@ -104,7 +106,8 @@ class RocketModel:
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
                  vram_reserve=None, host_cache_gb=None, io_workers=None, window_max=None,
-                 pin_policy="auto", expert_residency="auto", kv_cache="auto"):
+                 pin_policy="auto", expert_residency="auto", kv_cache="auto",
+                 draft_model=None, speculative="auto"):
         """
         Parameters
         ----------
@@ -172,6 +175,18 @@ class RocketModel:
 
             This is INDEPENDENT of the weight format and must stay so: the checkpoint's
             quantization describes what someone else produced, this describes what fits here.
+        draft_model: str or Path, optional
+            a small model, from the same family and sharing the target's tokenizer, kept fully
+            resident to propose tokens that one pass of this model then verifies. It must share the
+            vocabulary and tokenizer exactly; that is checked at load and refused with a message
+            naming what differs, because a mismatch produces plausible wrong output rather than an
+            error. Nothing happens without one.
+        speculative: str, optional
+            "auto" (default) takes the profile's measured recommendation: speculation pays when a
+            streaming pass costs far more than device memory does, and costs residency when it does
+            not, so on a machine where the model already fits it is left off. "on" and "off" force
+            it. "auto" never enables it silently against the profile's own measurement, and it never
+            enables it on a machine whose bandwidths could not be measured at all.
         """
 
         # First thing, before anything in this constructor touches the device. The allocator reads
@@ -260,6 +275,13 @@ class RocketModel:
             raise ValueError(f"kv_cache must be one of {', '.join(KV_CHOICES)}, not {kv_cache!r}")
         self.kv_cache_setting = kv_cache
         self.kv_cache_choice = None
+        if speculative not in SPEC_CHOICES:
+            raise ValueError(
+                f"speculative must be one of {', '.join(SPEC_CHOICES)}, not {speculative!r}")
+        self.speculative_setting = speculative
+        self.draft_path = draft_model
+        self.draft = None
+        self.spec = None
         self._layer_bytes = {}
 
         # Staging buffers are sized from the machine, not from a constant. Probing is cached by
@@ -301,6 +323,10 @@ class RocketModel:
         self._load_resident_modules()
         self._install_streaming_hooks()
         self._build_cache()
+        # Last, because the draft takes device memory away from the cache that was just sized, and
+        # the budget has to be told so the cache gives those bytes back rather than discovering
+        # them missing on the first token.
+        self._setup_speculation()
 
     # ---- customization hooks for subclasses -------------------------------------------------
 
@@ -1084,6 +1110,10 @@ class RocketModel:
         """Settle the KV cache now that both the weights and the budget have been measured."""
         weight_bytes = sum(self._layer_packed_bytes(idx) for idx in self._streamed_indices)
         weight_bytes += sum(self._unit_byte_counts.values())
+        # Kept because speculation needs the same pair of numbers: whether the weights are resident
+        # decides both what the context should cost and whether amortizing a pass buys anything.
+        self._weight_bytes = weight_bytes
+        self._device_budget = device_bytes
         headroom = self._knob("kv_fit_headroom_percent", 15) / 100.0
         self.kv_cache_choice, reason = resolve_kv_cache(
             self.kv_cache_setting, weight_bytes=weight_bytes, device_bytes=device_bytes,
@@ -1098,6 +1128,103 @@ class RocketModel:
         """A fresh cache for one generation, or None to let transformers use its own."""
         return build_kv_cache(self.kv_cache_choice, self.kv_cache_config,
                               device=self.running_device, compute_dtype=self.running_dtype)
+
+    # ---- speculative decoding ----------------------------------------------------------------
+
+    def _setup_speculation(self):
+        """Load the draft, tell the budget it took memory, and build the decoder.
+
+        Ordered that way on purpose. The draft is resident by definition, so its bytes come out of
+        the same pool the weight cache was just sized against; registering them republishes the
+        budget at once and the cache shrinks to fit alongside it. Discovering the shortfall later,
+        through an ordinary sample, would mean a generation starting with the card over-committed.
+        """
+        enabled, reason = resolve_speculation(
+            self.speculative_setting, self.draft_path, self.profile,
+            weight_bytes=getattr(self, "_weight_bytes", None),
+            device_bytes=getattr(self, "_device_budget", None))
+        if not enabled:
+            announce_speculation(False, reason)
+            if self.draft_path:
+                print(f"speculation: off -- {reason}")
+            return
+
+        self.draft = DraftModel.load(self.draft_path, target_config=self.config,
+                                     target_tokenizer=self.tokenizer, device=self.running_device,
+                                     dtype=self.running_dtype, hf_token=self.hf_token,
+                                     trust_remote_code=self.trust_remote_code)
+        draft_bytes = self.draft.device_bytes()
+        self.budget.register_external("draft_model", draft_bytes)
+
+        ceiling = lookahead_ceiling(self.profile)
+        self.spec = SpeculativeDecoder(
+            self.model, self.draft, lookahead=ceiling, max_lookahead=ceiling,
+            new_cache=self._new_spec_cache,
+            eos_token_id=getattr(self.generation_config, "eos_token_id", None))
+        announce_speculation(True, reason, self.draft.name, ceiling)
+        print(f"speculation: on, draft {self.draft.name} resident "
+              f"({draft_bytes / 1024 ** 3:.2f}GB), up to {ceiling} tokens per pass -- {reason}")
+
+    def _new_spec_cache(self):
+        """A verification cache. Never None: the decoder has to be able to crop it."""
+        from transformers.cache_utils import DynamicCache
+
+        return self._new_kv_cache() or DynamicCache()
+
+    def _speculative_call(self, args, kwargs):
+        """The arguments for a speculative run, or None when this call is not one it can serve.
+
+        Speculation replaces transformers' generation loop, so anything that loop does which this
+        one does not has to fall back rather than be silently ignored. Returning None is that
+        fallback, and the list below is deliberately conservative: an unsupported option produces
+        the stock path and the right answer, never a quietly different generation.
+        """
+        if self.spec is None:
+            return None
+        input_ids = kwargs.get("input_ids", kwargs.get("inputs"))
+        if input_ids is None and args:
+            input_ids = args[0]
+        if not isinstance(input_ids, torch.Tensor) or input_ids.dim() != 2:
+            return None
+        if input_ids.shape[0] != 1:
+            return None
+
+        config = self.model.generation_config
+        unsupported = {
+            "num_beams": (kwargs.get("num_beams") or getattr(config, "num_beams", 1) or 1) > 1,
+            "num_return_sequences": (kwargs.get("num_return_sequences")
+                                     or getattr(config, "num_return_sequences", 1) or 1) > 1,
+            "penalties": any(kwargs.get(name) is not None for name in
+                             ("repetition_penalty", "no_repeat_ngram_size", "bad_words_ids",
+                              "logits_processor", "stopping_criteria", "assistant_model",
+                              "prefix_allowed_tokens_fn", "constraints", "force_words_ids")),
+            "past_key_values": kwargs.get("past_key_values") is not None,
+        }
+        blocked = [name for name, hit in unsupported.items() if hit]
+        if blocked:
+            caps.announce_once(
+                "spec-fallback",
+                f"this generate() call uses {', '.join(blocked)}, which the speculative loop does "
+                f"not implement, so it runs on the ordinary generation path. The output is the "
+                f"same as it would be without a draft model.", logging.INFO)
+            return None
+
+        max_new = kwargs.get("max_new_tokens")
+        if max_new is None:
+            max_length = kwargs.get("max_length") or getattr(config, "max_length", None)
+            max_new = (max_length - input_ids.shape[1]) if max_length else None
+        if max_new is None:
+            max_new = getattr(config, "max_new_tokens", None)
+        if not max_new or int(max_new) <= 0:
+            return None
+
+        sampling = SamplingParams.from_generation(
+            config, do_sample=kwargs.get("do_sample"), temperature=kwargs.get("temperature"),
+            top_k=kwargs.get("top_k"), top_p=kwargs.get("top_p"))
+        return input_ids, int(max_new), sampling
+
+    def speculation_report(self):
+        return self.spec.stats.to_dict() if self.spec is not None else None
 
     def _budget_changed(self, old_bytes, new_bytes, sample):
         """The published budget moved, so re-size the cache and re-rank what it keeps.
@@ -1362,6 +1489,14 @@ class RocketModel:
 
     def close(self):
         """Shut the model down for good: stop the prefetch worker and release everything."""
+        draft = getattr(self, "draft", None)
+        if draft is not None:
+            # Withdraw the claim before dropping the weights, so the budget's last reading is taken
+            # with the memory genuinely back rather than still attributed to something gone.
+            self.budget.register_external("draft_model", 0)
+            draft.reset()
+            self.draft = None
+            self.spec = None
         cache = getattr(self, "cache", None)
         if cache is not None:
             cache.close()
@@ -1383,6 +1518,17 @@ class RocketModel:
     # ---- delegation to the underlying transformers model ------------------------------------
 
     def generate(self, *args, **kwargs):
+        # Speculation replaces the generation loop rather than sitting inside it, so it is decided
+        # before anything else is set up. A call it cannot serve exactly falls through to the stock
+        # path; see _speculative_call for what that means and why the list is conservative.
+        speculative = self._speculative_call(args, kwargs)
+        if speculative is not None:
+            input_ids, max_new, sampling = speculative
+            try:
+                return self.spec.generate(input_ids, max_new, sampling)
+            finally:
+                self._end_generation()
+
         # A quantized context has to be handed in, because transformers builds its own DynamicCache
         # otherwise and nothing here would ever see it. A caller who passed one keeps it: an
         # explicit cache is an instruction, not a suggestion. At fp16 this adds nothing at all --

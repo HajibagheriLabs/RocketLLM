@@ -473,21 +473,31 @@ def resident_bytes(model):
 # ---------------------------------------------------------------------------------------------
 
 def make_phase_marker(meters):
-    """A logits processor that timestamps every generation step, separating prefill from decode.
+    """Timestamps every generation step, separating prefill from decode.
 
     transformers calls the logits processors once per generated token, so the first call lands at
     the end of prefill and each later one at the end of a decode step. Riding on the callback beats
     running generation twice or reaching into the generation loop. Subclassing the real base class
     keeps it acceptable to generate()'s processor-list validation.
+
+    Speculation does not go through that loop -- one verification pass emits several tokens and
+    calls no logits processor at all -- so the mark also carries how many tokens it accounts for,
+    and the decoder calls it directly. Without that count a speculative run would report passes per
+    second under a heading that says tokens per second.
     """
     from transformers import LogitsProcessor
 
     class PhaseMarker(LogitsProcessor):
         def __init__(self):
             self.marks = []
+            self.tokens = 0
+
+        def mark(self, tokens=1):
+            self.tokens += int(tokens)
+            self.marks.append((time.perf_counter(), meters.snapshot(), self.tokens))
 
         def __call__(self, input_ids, scores):
-            self.marks.append((time.perf_counter(), meters.snapshot()))
+            self.mark(1)
             return scores
 
     return PhaseMarker()
@@ -508,7 +518,8 @@ def load_model(args, device):
     print(f"streaming class: {class_name}")
     return model_cls(args.model, device=str(device), prefetching=not args.no_prefetch,
                      vram_reserve=args.vram_reserve, host_cache_gb=args.host_cache_gb,
-                     expert_residency="off" if args.no_expert_residency else "auto")
+                     expert_residency="off" if args.no_expert_residency else "auto",
+                     draft_model=args.draft_model, speculative=args.speculative)
 
 
 def run(args, device):
@@ -544,20 +555,28 @@ def run(args, device):
 
         device_sync(device)
         started = time.perf_counter()
-        output = model.generate(tokens,
-                                max_new_tokens=args.max_new_tokens,
-                                do_sample=False,
-                                use_cache=True,
-                                logits_processor=LogitsProcessorList([marker]),
-                                return_dict_in_generate=True)
+        if getattr(model, "spec", None) is not None:
+            # The speculative loop is not transformers' loop, so it takes neither a logits
+            # processor nor return_dict_in_generate. It marks its own passes instead, which is the
+            # same signal from the only place that has it.
+            model.spec.on_pass = marker.mark
+            sequences = model.generate(tokens, max_new_tokens=args.max_new_tokens, do_sample=False,
+                                       use_cache=True)
+        else:
+            sequences = model.generate(tokens,
+                                       max_new_tokens=args.max_new_tokens,
+                                       do_sample=False,
+                                       use_cache=True,
+                                       logits_processor=LogitsProcessorList([marker]),
+                                       return_dict_in_generate=True).sequences
         device_sync(device)
         wall_seconds = time.perf_counter() - started
 
         physical_after = physical_read_bytes()
         totals = meters.snapshot()
         peak_device = peak_device_bytes(device)
-        text = model.tokenizer.decode(output.sequences[0])
-        new_tokens = int(output.sequences.shape[-1]) - prompt_tokens
+        text = model.tokenizer.decode(sequences[0])
+        new_tokens = int(sequences.shape[-1]) - prompt_tokens
     finally:
         instrumentation.remove()
 
@@ -632,6 +651,27 @@ def expert_cache(model):
     return reporter() if callable(reporter) else None
 
 
+def speculation(model):
+    """What speculation did, or why it was not doing anything.
+
+    Reported even when it is off, and with the draft's resident bytes alongside the acceptance
+    rate, because the two halves of the trade have to be read together: the draft buys tokens per
+    pass and pays for them in residency the weight cache would otherwise have had. A run that shows
+    a healthy acceptance rate and a collapsed cache hit rate has lost.
+    """
+    decoder = getattr(model, "spec", None)
+    if decoder is None:
+        return {"enabled": False}
+    stats = decoder.stats.to_dict()
+    stats.update(enabled=True,
+                 draft=model.draft.name,
+                 draft_resident_bytes=model.draft.device_bytes(),
+                 draft_forwards=model.draft.forwards,
+                 lookahead_ceiling=decoder.max_lookahead,
+                 lookahead_final=decoder.lookahead)
+    return stats
+
+
 def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt_tokens,
                  new_tokens, wall_seconds, build_seconds, peak_device,
                  physical_before, physical_after, text, model, hardware):
@@ -647,7 +687,8 @@ def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt
 
     if len(marks) >= 2:
         decode_seconds = marks[-1][0] - marks[0][0]
-        decode_steps = len(marks) - 1
+        # Tokens rather than marks: a speculative pass is one mark and several tokens.
+        decode_steps = marks[-1][2] - marks[0][2]
         prefill_seconds = wall_seconds - decode_seconds
     else:
         # A single generated token gives no decode interval to measure.
@@ -674,6 +715,7 @@ def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt
             "prefetching": not args.no_prefetch,
             "sync_phases": not args.no_sync_phases,
             "dtype": str(model.running_dtype),
+            "draft_model": args.draft_model,
             "output_preview": text[:200],
         },
         "throughput": {
@@ -706,6 +748,7 @@ def build_record(args, device, meters, marker, totals, device_tier_bytes, prompt
         },
         "cache_hit_rate": cache_hit_rate(model),
         "expert_cache": expert_cache(model),
+        "speculation": speculation(model),
         # The critical path: these four are sequential and sum toward wall time. The worker-thread
         # read time is reported alongside them but deliberately kept out of the sum, because with
         # prefetching on it runs underneath compute and adding it would double-count.
@@ -872,6 +915,32 @@ def print_report(record):
               f"(uniform would be {experts['uniform_share']:.1%})")
         print(f"    {_skew_verdict(experts)}")
 
+    spec = record.get("speculation") or {}
+    if spec.get("enabled"):
+        print()
+        print("  SPECULATION")
+        print(f"    draft     {spec['draft']} resident "
+              f"({human_bytes(spec['draft_resident_bytes'])}), "
+              f"{spec['draft_forwards']} draft forwards")
+        print(f"    accepted  {spec['acceptance_rate']:.0%} of {spec['proposed']} proposals "
+              f"(mean lookahead {spec['mean_lookahead']:.1f}, ceiling "
+              f"{spec['lookahead_ceiling']})")
+        print(f"    yield     {spec['tokens_per_pass']:.2f} tokens per verification pass "
+              f"({spec['emitted']} tokens in {spec['passes']} passes)")
+        # The number that decides whether any of this was worth it. One token per pass is what
+        # ordinary decoding produces, so at 1.0 speculation bought the draft's memory and its
+        # forwards and returned nothing for them.
+        verdict = ("BELOW plain decoding -- the draft cost passes and residency for nothing"
+                   if spec['tokens_per_pass'] <= 1.0 else
+                   f"{spec['tokens_per_pass']:.2f}x the passes plain decoding would have needed")
+        print(f"    verdict   {verdict}")
+        print(f"    draft time {fmt(spec['draft_seconds'], 's')} against "
+              f"{fmt(spec['target_seconds'], 's')} of verification passes")
+    elif record.get("run", {}).get("draft_model"):
+        print()
+        print("  SPECULATION")
+        print("    off for this run; the draft model was configured but not enabled")
+
     print()
     print("  PEAK MEMORY")
     print(f"    device    {human_bytes(record['memory']['peak_device_bytes'])}")
@@ -910,6 +979,12 @@ COMPARED_METRICS = [
     ("expert_cache.hit_rate", "expert hit rate", "ratio", True),
     ("expert_cache.distinct_per_visit", "experts per layer visit", "rate", False),
     ("expert_cache.gini", "routing skew (gini)", "ratio", True),
+    # Absent unless speculation ran. Comparing a speculative run against a plain one is how the
+    # whole trade is read: tokens per pass on one side, cache hit rate and peak memory on the
+    # other, because the draft's residency comes out of the weight cache.
+    ("speculation.acceptance_rate", "draft acceptance rate", "ratio", True),
+    ("speculation.tokens_per_pass", "tokens per pass", "rate", True),
+    ("speculation.draft_resident_bytes", "draft resident bytes", "bytes", False),
 ]
 
 
@@ -1020,6 +1095,14 @@ def main():
                         help="disable the prefetch worker so phase times stop overlapping")
     parser.add_argument("--no-sync-phases", action="store_true",
                         help="skip device synchronization; truer wall time, vaguer phase split")
+    parser.add_argument("--draft-model", default=None,
+                        help="a small model sharing this one's tokenizer, kept resident to propose "
+                             "tokens that one streaming pass then verifies. Compare a run with it "
+                             "against one without: the draft buys tokens per pass and pays for "
+                             "them in the residency the weight cache loses")
+    parser.add_argument("--speculative", default="auto", choices=("auto", "on", "off"),
+                        help="auto takes the profile's measured recommendation, which on a machine "
+                             "where the model already fits is no")
     parser.add_argument("--reprofile", action="store_true",
                         help="re-measure the hardware profile instead of using the cached one")
     args = parser.parse_args()
