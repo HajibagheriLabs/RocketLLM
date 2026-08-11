@@ -61,7 +61,8 @@ pip install "rocketllm[quant]"
 ```
 
 `quant` pulls in the readers for bitsandbytes-prequantized and compressed-tensors checkpoints; `mlx`
-pulls in the Apple Silicon backend. Neither is required for a base install.
+pulls in the Apple Silicon backend; `server` pulls in FastAPI, uvicorn and pydantic for
+`rocketllm serve`. None is required for a base install.
 
 ## Quickstart
 
@@ -88,6 +89,47 @@ Kimi K3) have dedicated subclasses that only override module naming. On first us
 split into per-layer shards next to the model cache; subsequent runs reuse them.
 
 More examples, including Llama 3.1 405B and the Apple Silicon path, are in [`examples/`](examples/).
+
+## OpenAI-compatible server
+
+```bash
+pip install "rocketllm[server]"
+rocketllm serve --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --port 8000
+```
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+       "messages": [{"role": "user", "content": "Name three primary colours."}],
+       "max_tokens": 40}'
+```
+
+Add `"stream": true` for server-sent events, terminated by `data: [DONE]`. Any OpenAI client works
+by pointing its base URL at `http://127.0.0.1:8000/v1`.
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /v1/chat/completions` | Chat, streaming or not. Renders the model's own chat template. |
+| `POST /v1/completions` | Raw-prompt completion, streaming or not. |
+| `GET /v1/models` | The loaded model, plus its context length, device, dtype and KV cache mode. |
+| `GET /health` | Hardware profile, cache statistics, queue depth. Paste this into bug reports. |
+
+Sampling: `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, `seed`, `repetition_penalty`.
+`presence_penalty` and `frequency_penalty` are accepted for client compatibility but not applied,
+because transformers has no equivalent with the same meaning — the server says so once rather than
+pretending they took effect.
+
+**One request at a time.** There is one model instance streaming one set of weights, so concurrent
+requests queue rather than batch; each is told its position in the `x-rocketllm-queue-position`
+response header. Continuous batching is deliberately out of scope: two sequences sharing this engine
+would evict each other's layers from the weight cache and both run slower than either alone. A client
+that hangs up has its generation cancelled, so an abandoned request does not hold the worker.
+
+`rocketllm serve` takes the same tuning overrides as the Python API — `--vram-reserve`,
+`--host-cache-gb`, `--io-workers`, `--window-max`, `--pin-policy`, `--expert-residency`,
+`--kv-cache`, `--draft-model`, `--speculative` — and every one of them defaults to what
+`rocketllm profile` measured on your machine. Run `rocketllm serve --help` for the full list.
 
 ## Supported quantization formats
 
@@ -130,7 +172,7 @@ single box.
 - Coalesced storage reads into pooled host buffers, with a dedicated copy stream where one exists.
 - int4 KV cache.
 - Speculative decoding.
-- OpenAI-compatible server with prefix caching and tool calls.
+- Tool calling and prefix-KV reuse for the server.
 - A portability matrix covering the four device tiers.
 
 ## Credits

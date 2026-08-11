@@ -542,6 +542,82 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIn("crop", str(caught.exception))
 
 
+class _RecordingStreamer:
+    """transformers' streamer protocol, remembering everything it was handed."""
+
+    def __init__(self):
+        self.puts = []
+        self.ended = 0
+
+    def put(self, value):
+        self.puts.append(value.tolist() if hasattr(value, "tolist") else list(value))
+
+    def end(self):
+        self.ended += 1
+
+
+class TestStreaming(unittest.TestCase):
+    """A streamer has to work here as well as on the ordinary path.
+
+    This loop REPLACES transformers' generation loop rather than sitting inside it, so a streamer
+    passed to generate() used to be accepted and then never called -- and a caller waiting for its
+    first token would wait for the whole generation, or for ever. The server streams every reply, so
+    this is not a corner case: it is what happens on every request once a draft model is loaded.
+    """
+
+    PROMPT = torch.tensor([[1, 7, 13, 21, 34]])
+    NEW = 12
+
+    def decoder(self, target, draft_model, **kwargs):
+        return SpeculativeDecoder(target, DraftModel(draft_model), lookahead=4, max_lookahead=4,
+                                  **kwargs)
+
+    def stream(self, decoder, **kwargs):
+        streamer = _RecordingStreamer()
+        got = decoder.generate(self.PROMPT, self.NEW, SamplingParams(do_sample=False),
+                               streamer=streamer, **kwargs)
+        return got, streamer
+
+    def test_the_streamed_tokens_are_exactly_the_generated_ones(self):
+        target, draft = tiny_model(0), tiny_model(1)
+        got, streamer = self.stream(self.decoder(target, draft))
+
+        self.assertEqual(streamer.puts[0], self.PROMPT.tolist(),
+                         "the prompt is handed to the streamer first, as transformers does")
+        streamed = [token for batch in streamer.puts[1:] for token in batch]
+        self.assertEqual(streamed, got[0].tolist()[self.PROMPT.shape[1]:])
+        self.assertEqual(streamer.ended, 1)
+
+    def test_a_pass_streams_every_token_it_accepted_not_just_one(self):
+        """The saving is that one pass yields several tokens; the streamer must see all of them."""
+        target = tiny_model(0)
+        _, streamer = self.stream(self.decoder(target, target))
+        self.assertTrue(any(len(batch) > 1 for batch in streamer.puts[1:]),
+                        "a perfectly accepted pass streamed its tokens one at a time")
+
+    def test_tokens_past_the_end_of_sequence_are_never_streamed(self):
+        """A pass can produce tokens after the eos one, and those are dropped from the result. If
+        they were streamed first, a client would have printed text the final answer does not
+        contain -- and it cannot take it back."""
+        target, draft = tiny_model(0), tiny_model(1)
+        reference = self.decoder(target, draft).generate(
+            self.PROMPT, self.NEW, SamplingParams(do_sample=False))[0].tolist()
+        stop = reference[self.PROMPT.shape[1] + 2]
+
+        got, streamer = self.stream(self.decoder(target, draft, eos_token_id=stop))
+        streamed = [token for batch in streamer.puts[1:] for token in batch]
+        self.assertEqual(streamed, got[0].tolist()[self.PROMPT.shape[1]:])
+        self.assertEqual(streamed[-1], stop)
+        self.assertEqual(streamer.ended, 1)
+
+    def test_generating_without_a_streamer_is_unchanged(self):
+        target, draft = tiny_model(0), tiny_model(1)
+        with_none = self.decoder(target, draft).generate(self.PROMPT, self.NEW,
+                                                         SamplingParams(do_sample=False))
+        got, _ = self.stream(self.decoder(target, draft))
+        self.assertEqual(got.tolist(), with_none.tolist())
+
+
 class TestWithTheQuantizedContext(unittest.TestCase):
     """Speculation and the int4 KV cache are independent features that have to compose.
 

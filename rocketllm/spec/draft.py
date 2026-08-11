@@ -483,8 +483,15 @@ class SpeculativeDecoder:
         self.lookahead = max(1, min(self.max_lookahead, int(round(expected))))
         return self.lookahead
 
-    def generate(self, input_ids, max_new_tokens, sampling=None, generator=None):
-        """Generate up to `max_new_tokens`, returning the whole sequence including the prompt."""
+    def generate(self, input_ids, max_new_tokens, sampling=None, generator=None, streamer=None):
+        """Generate up to `max_new_tokens`, returning the whole sequence including the prompt.
+
+        `streamer` follows transformers' streamer protocol exactly -- the prompt first, then each
+        pass's tokens, then ``end()`` -- so a caller cannot tell which loop produced them. That
+        matters because this loop REPLACES transformers' generation loop rather than sitting inside
+        it: a streamer handed to generate() would otherwise be accepted and silently never called,
+        and the caller would wait forever for a first token.
+        """
         sampling = sampling or SamplingParams()
         if input_ids.shape[0] != 1:
             raise ValueError("speculative decoding runs one sequence at a time; batch outside it, "
@@ -496,6 +503,9 @@ class SpeculativeDecoder:
                             f"to come back out of the cache. Speculation needs a cache that "
                             f"implements crop().")
         self.draft.reset()
+
+        if streamer is not None:
+            streamer.put(input_ids)
 
         sequence = input_ids
         prompt_length = sequence.shape[1]
@@ -531,6 +541,14 @@ class SpeculativeDecoder:
             self.stats.accepted += accepted
 
             new_tokens = (proposals[:accepted] + [corrected])[:max_new_tokens - emitted]
+            # Where this pass ends, if it does. Taken BEFORE anything is streamed, because a pass
+            # can produce tokens after the end-of-sequence one and those are dropped from the
+            # returned sequence -- streaming them first would show a client text that the final
+            # answer does not contain.
+            ends_at = next((i for i, t in enumerate(new_tokens) if t in self.eos_token_id),
+                           None) if self.eos_token_id else None
+            if streamer is not None:
+                streamer.put(new_tokens if ends_at is None else new_tokens[:ends_at + 1])
             sequence = torch.cat(
                 [sequence, torch.tensor([new_tokens], dtype=sequence.dtype,
                                         device=sequence.device)], dim=1)
@@ -548,13 +566,15 @@ class SpeculativeDecoder:
             draft_cached = min(draft_cached, cached)
             self.draft.crop(draft_cached)
 
-            if self.eos_token_id:
-                stop = next((i for i, t in enumerate(new_tokens) if t in self.eos_token_id), None)
-                if stop is not None:
-                    keep = prompt_length + emitted - len(new_tokens) + stop + 1
-                    return sequence[:, :keep]
+            if ends_at is not None:
+                keep = prompt_length + emitted - len(new_tokens) + ends_at + 1
+                if streamer is not None:
+                    streamer.end()
+                return sequence[:, :keep]
             self.adapt()
 
+        if streamer is not None:
+            streamer.end()
         return sequence
 
 

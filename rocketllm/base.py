@@ -1261,7 +1261,11 @@ class RocketModel:
         sampling = SamplingParams.from_generation(
             config, do_sample=kwargs.get("do_sample"), temperature=kwargs.get("temperature"),
             top_k=kwargs.get("top_k"), top_p=kwargs.get("top_p"))
-        return input_ids, int(max_new), sampling
+        # The streamer travels with the call rather than being listed as unsupported above. It has
+        # to: a streamed request is exactly the kind of long generation speculation is worth having
+        # for, so falling back to the stock loop whenever a caller wants tokens as they arrive would
+        # disable the feature for the server outright.
+        return input_ids, int(max_new), sampling, kwargs.get("streamer")
 
     def speculation_report(self):
         return self.spec.stats.to_dict() if self.spec is not None else None
@@ -1563,9 +1567,9 @@ class RocketModel:
         # path; see _speculative_call for what that means and why the list is conservative.
         speculative = self._speculative_call(args, kwargs)
         if speculative is not None:
-            input_ids, max_new, sampling = speculative
+            input_ids, max_new, sampling, streamer = speculative
             try:
-                return self.spec.generate(input_ids, max_new, sampling)
+                return self.spec.generate(input_ids, max_new, sampling, streamer=streamer)
             finally:
                 self._end_generation()
 

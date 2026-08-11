@@ -47,10 +47,23 @@ mlx = [
     "mlx",
     "psutil",
 ]
+# `rocketllm serve` only. Someone who calls generate() from Python should not be made to install a
+# web framework for it, so these are not base dependencies.
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.5",
+]
+# httpx drives the server tests through the ASGI transport, with no socket and no accelerator.
 dev = [
     "pytest",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.5",
+    "httpx>=0.24",
 ]
 
+# One console script with subcommands: `rocketllm profile` and `rocketllm serve`.
 [project.scripts]
 rocketllm = "rocketllm.cli:main"
 
