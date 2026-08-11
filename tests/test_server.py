@@ -26,10 +26,12 @@ import torch
 
 from rocketllm.server.app import (QUEUE_POSITION_HEADER, GenerationEngine, RequestQueue,
                                   StreamDecoder, _Sink, create_app)
-from rocketllm.server.protocol import (FINISH_LENGTH, FINISH_STOP, ChatCompletionChunk,
+from rocketllm.server.protocol import (FINISH_LENGTH, FINISH_STOP, FINISH_TOOL_CALLS,
+                                       ChatCompletionChunk,
                                        ChatCompletionChunkChoice, ChatCompletionRequest,
                                        CompletionRequest, DeltaMessage, RequestError,
                                        SamplingSettings, sse)
+from rocketllm.server.toolcalls import resolve_tools
 
 PAD_ID = 0
 EOS_ID = 1
@@ -144,8 +146,12 @@ class FakeModel:
                 self.concurrent -= 1
 
 
-def build(script="Hello there, world", eos=True, **kwargs):
+def build(script="Hello there, world", eos=True, template=None, **kwargs):
     tokenizer = FakeTokenizer()
+    if template is not None:
+        # Shadows the class attribute. The engine picks its tool-call parser off this at
+        # construction, so it has to be in place before the engine exists.
+        tokenizer.chat_template = template
     ids = tokenizer.tokens(script) if isinstance(script, str) else list(script)
     if eos:
         ids = ids + [EOS_ID]
@@ -406,12 +412,13 @@ class ServerTestCase(unittest.IsolatedAsyncioTestCase):
     """One app, one queue, one stand-in model, torn down per test."""
 
     script = "Hello there, world"
+    template = None
     model_kwargs = {}
 
     async def asyncSetUp(self):
         import httpx
 
-        self.model, self.engine = build(self.script, **self.model_kwargs)
+        self.model, self.engine = build(self.script, template=self.template, **self.model_kwargs)
         self.queue = RequestQueue()
         self.app = create_app(self.engine, queue=self.queue)
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app),
@@ -579,6 +586,133 @@ class TestLegacyCompletions(ServerTestCase):
         self.assertEqual(body["usage"]["prompt_tokens"], 3)
 
 
+#: A tool call as a Hermes/Qwen model emits one. The engine picks its parser off the template, so
+#: the template below only has to contain the marker for the right one to be chosen.
+HERMES_TEMPLATE = '{% for m in messages %}{{ m.role }}{% endfor %}<tool_call></tool_call>'
+HERMES_CALL = ('<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris", '
+               '"unit": "celsius"}}\n</tool_call>')
+WEATHER_TOOL = {"type": "function", "function": {
+    "name": "get_weather", "description": "Current weather for a city",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
+
+
+class TestToolCallsOverHTTP(ServerTestCase):
+    """The whole path, as an agentic client sees it."""
+
+    script = HERMES_CALL
+    template = HERMES_TEMPLATE
+
+    async def chat(self, **body):
+        payload = {"model": "fake-model", "max_tokens": 64, "tools": [WEATHER_TOOL],
+                   "messages": [{"role": "user", "content": "weather in Paris?"}]}
+        payload.update(body)
+        return await self.client.post("/v1/chat/completions", json=payload)
+
+    async def test_the_parser_is_chosen_from_the_template(self):
+        self.assertEqual(self.engine.tool_parser.family, "hermes")
+
+    async def test_a_call_comes_back_in_the_openai_shape(self):
+        body = (await self.chat()).json()
+        choice = body["choices"][0]
+        calls = choice["message"]["tool_calls"]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["type"], "function")
+        self.assertTrue(calls[0]["id"])
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Paris", "unit": "celsius"})
+
+    async def test_finish_reason_is_tool_calls(self):
+        """An agentic loop branches on this. Reporting "stop" leaves the client treating a call as
+        a final answer and the conversation simply ends."""
+        body = (await self.chat()).json()
+        self.assertEqual(body["choices"][0]["finish_reason"], FINISH_TOOL_CALLS)
+
+    async def test_content_is_null_when_the_model_only_called_a_tool(self):
+        """What OpenAI sends. A client testing `if message.content` would otherwise append an empty
+        assistant turn to the conversation it is building and send it back next request."""
+        self.assertIsNone((await self.chat()).json()["choices"][0]["message"]["content"])
+
+    async def test_none_of_the_raw_syntax_leaks_into_the_content(self):
+        text = json.dumps((await self.chat()).json())
+        for marker in ("<tool_call>", "</tool_call>"):
+            self.assertNotIn(marker, text)
+
+    async def test_the_stream_assembles_to_the_same_call(self):
+        """The property the design rests on, checked through HTTP rather than in the parser."""
+        whole = (await self.chat()).json()["choices"][0]["message"]["tool_calls"]
+        streamed = await self.chat(stream=True)
+        chunks = [json.loads(frame) for frame in self.events(streamed)[:-1]]
+
+        assembled = {}
+        order = []
+        for chunk in chunks:
+            for delta in (chunk["choices"][0]["delta"].get("tool_calls") or []):
+                index = delta["index"]
+                if index not in assembled:
+                    assembled[index] = {"id": delta.get("id"),
+                                        "name": delta["function"].get("name"), "arguments": ""}
+                    order.append(index)
+                assembled[index]["arguments"] += delta["function"].get("arguments", "")
+
+        self.assertEqual(len(order), 1)
+        built = assembled[order[0]]
+        self.assertEqual(built["name"], whole[0]["function"]["name"])
+        self.assertEqual(json.loads(built["arguments"]),
+                         json.loads(whole[0]["function"]["arguments"]))
+
+    async def test_the_streamed_id_is_sent_once_and_never_changes(self):
+        streamed = await self.chat(stream=True)
+        chunks = [json.loads(frame) for frame in self.events(streamed)[:-1]]
+        ids = [delta["id"] for chunk in chunks
+               for delta in (chunk["choices"][0]["delta"].get("tool_calls") or [])
+               if "id" in delta]
+        self.assertEqual(len(ids), 1, "the id was re-sent, which splits the call for a client")
+        self.assertTrue(ids[0])
+
+    async def test_the_stream_ends_with_the_tool_calls_finish_reason_then_done(self):
+        streamed = await self.chat(stream=True)
+        frames = self.events(streamed)
+        self.assertEqual(frames[-1], "[DONE]")
+        self.assertEqual(json.loads(frames[-2])["choices"][0]["finish_reason"], FINISH_TOOL_CALLS)
+
+    async def test_the_tool_definitions_reach_the_prompt(self):
+        """Rendered through the chat template's own tool support, which is the only shape the model
+        was trained to read them in."""
+        with_tools = (await self.chat()).json()["usage"]["prompt_tokens"]
+        without = (await self.chat(tools=None)).json()["usage"]["prompt_tokens"]
+        self.assertGreater(with_tools, without)
+
+    async def test_a_request_with_no_tools_gets_the_raw_text_back_as_content(self):
+        """A model that writes <tool_call> in an ordinary answer is quoting, not calling. Parsing
+        it would silently delete the text."""
+        body = (await self.chat(tools=None)).json()
+        self.assertIn("<tool_call>", body["choices"][0]["message"]["content"])
+        self.assertIsNone(body["choices"][0]["message"]["tool_calls"])
+        self.assertEqual(body["choices"][0]["finish_reason"], FINISH_STOP)
+
+    async def test_tool_choice_none_answers_in_prose(self):
+        body = (await self.chat(tool_choice="none")).json()
+        self.assertIsNone(body["choices"][0]["message"]["tool_calls"])
+        self.assertEqual(body["choices"][0]["finish_reason"], FINISH_STOP)
+
+
+class TestATruncatedToolCall(ServerTestCase):
+    script = HERMES_CALL
+    template = HERMES_TEMPLATE
+    model_kwargs = {"eos": False}
+
+    async def test_running_out_of_room_reports_length_not_tool_calls(self):
+        """The arguments of a call cut off mid-write are not valid JSON. Announcing it as a tool
+        call hands the client something it cannot parse and no reason why; "length" is both true
+        and a signal an agentic loop already handles."""
+        response = await self.client.post("/v1/chat/completions", json={
+            "model": "fake-model", "max_tokens": 4, "tools": [WEATHER_TOOL],
+            "messages": [{"role": "user", "content": "weather?"}]})
+        self.assertEqual(response.json()["choices"][0]["finish_reason"], FINISH_LENGTH)
+
+
 class TestNamingTheModel(unittest.TestCase):
     """What clients echo and humans read in a bug report."""
 
@@ -617,7 +751,8 @@ class TestTheChatTemplateEncoding(unittest.TestCase):
 
         engine = GenerationEngine(FakeModel(tokenizer))
         request = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}])
-        self.assertEqual(engine._encode_chat(request).tolist(), expected.tolist())
+        encoded = engine._encode_chat(request, resolve_tools(request))
+        self.assertEqual(encoded.tolist(), expected.tolist())
 
 
 class TestMetadataEndpoints(ServerTestCase):

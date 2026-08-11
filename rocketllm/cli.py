@@ -154,6 +154,10 @@ def _add_serve_parser(subparsers):
                              "tokens for speculative decoding. Nothing happens without one")
     tuning.add_argument("--speculative", choices=["auto", "on", "off"], default="auto",
                         help="'auto' follows the profile's measured recommendation (default: auto)")
+    tuning.add_argument("--tool-parser", default=None,
+                        help="force the tool-call syntax to read out of replies. Default: detected "
+                             "from what the model's own chat template emits, which is right for "
+                             "any checkpoint whose template renders tool calls")
 
     parser.set_defaults(handler=_run_serve, prefetching=True)
     return parser
@@ -198,10 +202,11 @@ def _run_serve(args):
     # The id a client sees defaults to what the user asked for, not to where the weights landed:
     # a downloaded checkpoint lives under a commit hash, and answering requests as that helps no one.
     engine = GenerationEngine(model, model_id=args.served_model_name or args.model,
-                              max_tokens=args.max_tokens)
+                              max_tokens=args.max_tokens, tool_parser=args.tool_parser)
     app = create_app(engine)
     print(f"serving {engine.model_id} on http://{args.host}:{args.port}  "
-          f"(context {engine.context_length} tokens, one request at a time)")
+          f"(context {engine.context_length} tokens, one request at a time, "
+          f"tool calls parsed as {engine.tool_parser.family})")
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     finally:

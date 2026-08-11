@@ -12,6 +12,7 @@ _INSTALL_HINT = (
 try:
     from .protocol import (FINISH_LENGTH, FINISH_STOP, FINISH_TOOL_CALLS, ChatCompletionRequest,
                            CompletionRequest, RequestError, SamplingSettings)
+    from .toolcalls import FAMILIES, ToolCall, ToolCallStream, select_parser
     from .app import GenerationEngine, RequestQueue, create_app, serve
 except ImportError as exc:  # pragma: no cover - exercised only without the extra installed
     raise ImportError(f"{_INSTALL_HINT}  (missing: {exc.name or exc})") from exc
@@ -19,6 +20,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 __all__ = [
     "ChatCompletionRequest",
     "CompletionRequest",
+    "FAMILIES",
     "FINISH_LENGTH",
     "FINISH_STOP",
     "FINISH_TOOL_CALLS",
@@ -26,6 +28,9 @@ __all__ = [
     "RequestError",
     "RequestQueue",
     "SamplingSettings",
+    "ToolCall",
+    "ToolCallStream",
     "create_app",
+    "select_parser",
     "serve",
 ]

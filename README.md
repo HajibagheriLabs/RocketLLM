@@ -126,6 +126,37 @@ response header. Continuous batching is deliberately out of scope: two sequences
 would evict each other's layers from the weight cache and both run slower than either alone. A client
 that hangs up has its generation cancelled, so an abandoned request does not hold the worker.
 
+### Tool calling
+
+Tool calls are returned in OpenAI's format, streaming and non-streaming, with `finish_reason` set to
+`tool_calls`. Send `tools` on the request and the definitions are rendered into the prompt through
+the model's own chat template; the reply is then read back with a parser chosen from what that
+template emits.
+
+| Family | Raw syntax it emits |
+| --- | --- |
+| `hermes` | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` — Hermes, Qwen, and the many fine-tunes on that template |
+| `mistral` | `[TOOL_CALLS] [{"name": …, "arguments": {…}}]` — one marker, a JSON array |
+| `llama` | `{"name": …, "parameters": {…}}`, optionally after `<|python_tag|>`, several separated by `;` |
+| `deepseek` | DeepSeek's full-width delimiters, with the function name outside the JSON |
+| `generic` | Fallback: a fenced or bare JSON object with a name — used when the template says nothing |
+
+Detection reads the chat template rather than the model's name, so a fine-tune that inherits its
+parent's template is recognised without being listed anywhere. `--tool-parser <family>` overrides it.
+`GET /health` reports the family in use, which is the first thing to check if tool calls come back as
+prose.
+
+Only a request that supplied `tools` is parsed for them — a model that writes `<tool_call>` in an
+ordinary answer is quoting, not calling. `tool_choice` accepts `none` (tools withheld entirely),
+`auto`, `required`, and a named function; the last two bias the prompt but are not enforced, because
+nothing here constrains decoding, and the server says so rather than implying a guarantee.
+
+Adding a family takes a subclass of `ToolCallParser` in
+[toolcalls.py](rocketllm/server/toolcalls.py) and a line in its `PARSERS` registry — set the start
+markers, say how the template is recognised, and return where each call's JSON begins. Reading the
+name and streaming the arguments is shared. The tests pick up a new family automatically once it has
+a captured sample in the corpus at the top of [tests/test_toolcalls.py](tests/test_toolcalls.py).
+
 `rocketllm serve` takes the same tuning overrides as the Python API — `--vram-reserve`,
 `--host-cache-gb`, `--io-workers`, `--window-max`, `--pin-policy`, `--expert-residency`,
 `--kv-cache`, `--draft-model`, `--speculative` — and every one of them defaults to what
@@ -172,7 +203,7 @@ single box.
 - Coalesced storage reads into pooled host buffers, with a dedicated copy stream where one exists.
 - int4 KV cache.
 - Speculative decoding.
-- Tool calling and prefix-KV reuse for the server.
+- Prefix-KV reuse for the server.
 - A portability matrix covering the four device tiers.
 
 ## Credits

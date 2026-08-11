@@ -36,6 +36,8 @@ from .protocol import (FINISH_LENGTH, FINISH_STOP, FINISH_TOOL_CALLS, SSE_DONE,
                        CompletionChunk, CompletionRequest, CompletionResponse, DeltaMessage,
                        ModelCard, ModelList, RequestError, ResponseMessage, SamplingSettings, Usage,
                        chat_id, completion_id, error_payload, sse)
+from .toolcalls import (ContentDelta, ToolCallDelta, ToolCallStream, ToolSetup, render_message,
+                        resolve_tools, select_parser)
 
 log = logging.getLogger("rocketllm.server")
 
@@ -71,6 +73,9 @@ class Completed:
     text: str
     prompt_tokens: int
     completion_tokens: int
+    #: Finished tool calls, for the non-streaming path. The streaming path has already sent these
+    #: as deltas; both come from the same parse, so they cannot disagree.
+    tool_calls: tuple = ()
 
 
 @dataclass
@@ -137,6 +142,15 @@ class StreamDecoder:
         self.emitted = len(self.text)
         return chunk
 
+    def stable_text(self):
+        """The decoded text without a trailing replacement character.
+
+        What the tool-call parser reads. It manages its own cursor over the whole text rather than
+        taking chunks, so it needs the part that will not change under it -- and a partial codepoint
+        at the tail is precisely the part that will.
+        """
+        return self.text.rstrip("�")
+
     def truncate(self, length):
         """Cut the text short, which is what a stop sequence does."""
         self.text = self.text[:length]
@@ -189,21 +203,30 @@ class _Sink:
     shorter than its end offset, so nothing at or past its start has been sent.
     """
 
-    def __init__(self, tokenizer, settings, emit, cancel):
+    def __init__(self, tokenizer, settings, emit, cancel, tools=None):
         self.decoder = StreamDecoder(
             tokenizer, hold_back=max((len(s) for s in settings.stop), default=0))
         self.stop = settings.stop
         self.max_new_tokens = settings.max_new_tokens
+        #: A ToolCallStream, or None when this request did not ask for tools. When it is set, it
+        #: owns content emission -- it is the only thing that knows which of the text is an answer
+        #: and which is a call the client must never see as prose.
+        self.tools = tools
         self._emit = emit
         self._cancel = cancel
         self.token_count = 0
         self.last_token = None
         self.stopped_on_sequence = False
         self._prompt_seen = False
+        self._finished = False
 
     @property
     def text(self):
-        return self.decoder.text
+        return self.tools.content if self.tools is not None else self.decoder.text
+
+    @property
+    def tool_calls(self):
+        return tuple(self.tools.calls) if self.tools is not None else ()
 
     def put(self, value):
         # generate() hands the streamer the prompt before the first generated token. It is input,
@@ -225,12 +248,34 @@ class _Sink:
         if at is not None:
             self.decoder.truncate(at)
             self.stopped_on_sequence = True
-            self._send(self.decoder.flush())
+            self.end()
             raise _StopGeneration()
-        self._send(self.decoder.take())
+        self._pump()
+
+    def _pump(self):
+        if self.tools is None:
+            self._send(self.decoder.take())
+            return
+        for event in self.tools.push(self.decoder.stable_text()):
+            self._forward(event)
 
     def end(self):
-        self._send(self.decoder.flush())
+        # Guarded because there are two ways here -- transformers' loop calls end() when it finishes,
+        # and a stop sequence flushes on its way out -- and flushing twice would replay the tail.
+        if self._finished:
+            return
+        self._finished = True
+        if self.tools is None:
+            self._send(self.decoder.flush())
+            return
+        for event in self.tools.finish(self.decoder.stable_text()):
+            self._forward(event)
+
+    def _forward(self, event):
+        if isinstance(event, ContentDelta):
+            self._send(event.text)
+        else:
+            self._emit(event)
 
     def _send(self, text):
         if text:
@@ -239,16 +284,22 @@ class _Sink:
     def finish_reason(self, eos_ids):
         """What actually ended this generation.
 
-        Order matters. A model that emits its end-of-sequence token on the very last token it was
-        allowed has stopped of its own accord, not been cut off, and reporting "length" there would
-        tell an agentic client to ask for a continuation of an answer that is already complete.
+        Order matters twice over. A model that emits its end-of-sequence token on the very last
+        token it was allowed has stopped of its own accord, not been cut off, and reporting "length"
+        there would tell an agentic client to ask for a continuation of an answer that is already
+        complete.
+
+        And "length" outranks "tool_calls". A call that was still being written when the budget ran
+        out has arguments that are not valid JSON, so announcing it as a tool call hands the client
+        something it cannot parse and no reason why. "length" is both the truth and the signal an
+        agentic loop already knows how to handle.
         """
-        if self.stopped_on_sequence:
-            return FINISH_STOP
-        if self.last_token is not None and self.last_token in eos_ids:
-            return FINISH_STOP
-        if self.token_count >= self.max_new_tokens:
+        ended_itself = (self.stopped_on_sequence
+                        or (self.last_token is not None and self.last_token in eos_ids))
+        if not ended_itself and self.token_count >= self.max_new_tokens:
             return FINISH_LENGTH
+        if self.tool_calls:
+            return FINISH_TOOL_CALLS
         return FINISH_STOP
 
 
@@ -422,9 +473,13 @@ class GenerationEngine:
     answer would be two threads inside it at once.
     """
 
-    def __init__(self, model, model_id=None, max_tokens=None):
+    def __init__(self, model, model_id=None, max_tokens=None, tool_parser=None):
         self.model = model
         self.tokenizer = model.tokenizer
+        #: Which raw tool-call syntax this model emits, read off its chat template rather than its
+        #: name. `tool_parser=` overrides it for a checkpoint whose template does not say.
+        self.tool_parser = select_parser(self.tokenizer, getattr(model, "config", None),
+                                         override=tool_parser)
         self.model_id = model_id or _default_model_id(model)
         #: An optional server-wide ceiling on a single reply, for a shared deployment. Without one
         #: the limit is the model's own context, which is the honest default.
@@ -432,15 +487,16 @@ class GenerationEngine:
         self.context_length = _context_length(model, self.tokenizer)
         self.eos_ids = _eos_ids(model, self.tokenizer)
         self.started_at = time.time()
+        self._tools_render_checked = False
 
     # -- prompts ----------------------------------------------------------------------------------
 
-    def _encode_chat(self, request):
-        messages = [_template_message(m) for m in request.messages]
+    def _encode_chat(self, request, setup):
+        messages = [render_message(m) for m in request.messages]
         template = getattr(self.tokenizer, "chat_template", None)
         if template:
             try:
-                return self._apply_template(messages, request)
+                return self._apply_template(messages, request, setup)
             except Exception as exc:  # noqa: BLE001 - a broken template must not be a 500
                 caps.announce_once(
                     "server-chat-template",
@@ -456,16 +512,18 @@ class GenerationEngine:
                 "exactly.", logging.WARNING)
         return self._encode_text(_plain_transcript(messages), add_special_tokens=True)
 
-    def _apply_template(self, messages, request):
+    def _apply_template(self, messages, request, setup):
         kwargs = dict(add_generation_prompt=request.add_generation_prompt,
                       tokenize=True, return_tensors="pt", return_dict=True)
         if request.continue_final_message:
             kwargs["add_generation_prompt"] = False
             kwargs["continue_final_message"] = True
-        # Tool definitions go through the template's own tool support where it has any. Parsing what
-        # comes back out is a separate problem and lives in toolcalls.py.
-        if request.tools:
-            kwargs["tools"] = request.tools
+        # Tool definitions go through the template's own tool support, which is the only rendering
+        # that matches what the model was trained on. Which tools that is, is tool_choice's business
+        # -- see resolve_tools.
+        if setup.tools:
+            kwargs["tools"] = setup.tools
+            self._check_template_renders_tools(messages, request, setup)
         encoded = self.tokenizer.apply_chat_template(messages, **kwargs)
         # return_dict=True gives a BatchEncoding, which is a UserDict -- a Mapping, but NOT a dict
         # subclass, so an isinstance(dict) test here silently returns the container itself and the
@@ -474,6 +532,33 @@ class GenerationEngine:
         if isinstance(encoded, Mapping):
             return encoded["input_ids"]
         return encoded
+
+    def _check_template_renders_tools(self, messages, request, setup):
+        """Say so, once, if this model's template quietly drops the tools it was handed.
+
+        Not every chat template has tool support, and Jinja ignores a variable it does not
+        reference rather than complaining about it. So a client can send perfectly good tool
+        definitions to a model that never sees them, get prose back, and have nothing anywhere to
+        explain why. Rendering it both ways once and comparing is the only reliable test -- there is
+        no flag on a template that declares this.
+        """
+        if self._tools_render_checked:
+            return
+        self._tools_render_checked = True
+        try:
+            probe = dict(add_generation_prompt=request.add_generation_prompt, tokenize=False)
+            with_tools = self.tokenizer.apply_chat_template(messages, tools=setup.tools, **probe)
+            without_tools = self.tokenizer.apply_chat_template(messages, **probe)
+        except Exception:  # noqa: BLE001 - a diagnostic must never be what fails a request
+            return
+        if with_tools == without_tools:
+            caps.announce_once(
+                "server-template-ignores-tools",
+                "this model's chat template has no tool support, so the tool definitions in this "
+                "request never reach the prompt and the model cannot know the tools exist. Replies "
+                "will be prose. Nothing here can fix that -- the template is part of the "
+                "checkpoint -- but a model trained for tool use will have one that renders them.",
+                logging.WARNING)
 
     def _encode_text(self, text, add_special_tokens=True):
         encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=add_special_tokens)
@@ -513,7 +598,15 @@ class GenerationEngine:
         return _Job(lambda job: self._run(job, request, chat=False), loop, label="completion")
 
     def _run(self, job, request, chat):
-        input_ids = self._encode_chat(request) if chat else self._encode_completion(request)
+        # Settled before the prompt is built, because it decides what goes INTO the prompt as well
+        # as what is read back out of the reply. /v1/completions has no tools field at all.
+        setup = resolve_tools(request) if chat else ToolSetup()
+        if setup.unenforced:
+            caps.announce_once(f"server-tool-choice-{setup.unenforced[:24]}", setup.unenforced,
+                               logging.INFO)
+
+        input_ids = (self._encode_chat(request, setup) if chat
+                     else self._encode_completion(request))
         prompt_tokens = int(input_ids.shape[-1])
         settings = SamplingSettings.from_request(request, self._token_budget(request, prompt_tokens))
         if settings.ignored:
@@ -524,12 +617,22 @@ class GenerationEngine:
                 f"repetition_penalty if you want the effect they are usually reached for.",
                 logging.INFO)
 
-        sink = _Sink(self.tokenizer, settings, job.emit, job.cancel)
+        # Only a request that offered tools gets its reply parsed for them. A model that writes
+        # <tool_call> in an ordinary answer is quoting, not calling, and swallowing that as a call
+        # would lose the text -- which is also what keeps the marker-less generic parser away from
+        # prose it has no business touching.
+        tools = None
+        if setup.parse:
+            tools = ToolCallStream(self.tool_parser,
+                                   hold=max((len(s) for s in settings.stop), default=0))
+
+        sink = _Sink(self.tokenizer, settings, job.emit, job.cancel, tools=tools)
         self._generate(input_ids, settings, sink)
         if job.cancel.is_set():
             raise _Cancelled()
         job.emit(Completed(finish_reason=sink.finish_reason(self.eos_ids), text=sink.text,
-                           prompt_tokens=prompt_tokens, completion_tokens=sink.token_count))
+                           prompt_tokens=prompt_tokens, completion_tokens=sink.token_count,
+                           tool_calls=sink.tool_calls))
 
     def _generate(self, input_ids, settings, sink):
         import torch
@@ -571,6 +674,7 @@ class GenerationEngine:
             "dtype": str(getattr(model, "running_dtype", "") or ""),
             "kv_cache": getattr(model, "kv_cache_choice", None),
             "speculation": bool(getattr(model, "spec", None)),
+            "tool_parser": self.tool_parser.family,
             "max_tokens_cap": self.max_tokens_cap,
         })
 
@@ -584,6 +688,9 @@ class GenerationEngine:
             "queue": queue.stats(),
             "generation": {
                 "context_length": self.context_length,
+                # First thing to check when tool calls come back as prose: the wrong family here
+                # means the reply was parsed for a syntax the model does not emit.
+                "tool_parser": self.tool_parser.family,
                 "kv_cache": getattr(model, "kv_cache_choice", None),
                 "pin_policy": getattr(model, "pin_policy", None),
                 "expert_residency": getattr(model, "expert_residency", None),
@@ -641,20 +748,18 @@ def _context_length(model, tokenizer):
     return _int_or_none(getattr(model, "max_seq_len", None)) or 2048
 
 
-def _template_message(message):
-    """One request message in the shape a chat template expects.
+def _assistant_message(completed):
+    """The reply, as OpenAI shapes it.
 
-    Content is flattened to a string. Multi-part content exists for images, which this server does
-    not stream weights for, and every text template accepts a plain string.
+    Content goes to null rather than "" when the model only called a tool. That is what OpenAI
+    sends, and clients branch on it: one that tests ``if message.content`` would otherwise print an
+    empty assistant turn into the conversation it is building, and then send that back next turn.
     """
-    rendered = {"role": message.role, "content": message.text()}
-    if message.name:
-        rendered["name"] = message.name
-    if message.tool_calls:
-        rendered["tool_calls"] = [call.model_dump() for call in message.tool_calls]
-    if message.tool_call_id:
-        rendered["tool_call_id"] = message.tool_call_id
-    return rendered
+    tool_calls = [call.to_payload() for call in completed.tool_calls] or None
+    content = completed.text
+    if tool_calls and not (content or "").strip():
+        content = None
+    return ResponseMessage(role="assistant", content=content, tool_calls=tool_calls)
 
 
 def _plain_transcript(messages):
@@ -815,7 +920,7 @@ def create_app(engine, queue=None, title="RocketLLM"):
                 media_type="text/event-stream", headers=_sse_headers(_headers(job)))
 
         completed = await _collect(request, job)
-        message = ResponseMessage(role="assistant", content=completed.text)
+        message = _assistant_message(completed)
         return JSONResponse(ChatCompletionResponse(
             id=response_id, created=created, model=engine.model_id,
             choices=[ChatCompletionChoice(index=0, message=message,
@@ -840,6 +945,12 @@ def create_app(engine, queue=None, title="RocketLLM"):
             async for event in job.events():
                 if isinstance(event, Delta):
                     yield sse(chunk(DeltaMessage(content=event.text)))
+                elif isinstance(event, ToolCallDelta):
+                    # One call per delta, carrying its index. The id and name ride the first delta
+                    # for an index and never change, because a client assembling arguments keys on
+                    # them -- a regenerated id splits one call into several, each holding a
+                    # fragment of the arguments and none of them callable.
+                    yield sse(chunk(DeltaMessage(tool_calls=[event.to_payload()])))
                 elif isinstance(event, Completed):
                     usage = Usage.of(event.prompt_tokens, event.completion_tokens)
                     yield sse(chunk(DeltaMessage(), finish_reason=event.finish_reason))
@@ -985,12 +1096,15 @@ def _package_version():
         return "0"
 
 
-def serve(model, host="127.0.0.1", port=8000, model_id=None, max_tokens=None, log_level="info"):
+def serve(model, host="127.0.0.1", port=8000, model_id=None, max_tokens=None, log_level="info",
+          tool_parser=None):
     """Load nothing, own nothing: run an app around a model somebody else built."""
     import uvicorn
 
-    engine = GenerationEngine(model, model_id=model_id, max_tokens=max_tokens)
+    engine = GenerationEngine(model, model_id=model_id, max_tokens=max_tokens,
+                              tool_parser=tool_parser)
     app = create_app(engine)
     print(f"serving {engine.model_id} on http://{host}:{port}  "
-          f"(context {engine.context_length} tokens, one request at a time)")
+          f"(context {engine.context_length} tokens, one request at a time, "
+          f"tool calls parsed as {engine.tool_parser.family})")
     uvicorn.run(app, host=host, port=port, log_level=log_level)
