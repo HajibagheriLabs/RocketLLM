@@ -522,6 +522,171 @@ def load_model(args, device):
                      draft_model=args.draft_model, speculative=args.speculative)
 
 
+# ---- the conversation benchmark ------------------------------------------------------------------
+
+#: Filler for the opening message, so the first prompt is long enough that prefill dominates the
+#: turn. What it says does not matter; how many tokens it is does.
+_FILLER = ("The engineer reviewed the streaming loader, the coalesced transfers, the tiered weight "
+           "cache and the expert residency policy, then wrote down what each one measured. ")
+_FOLLOW_UP = "Summarise the paragraph above in one sentence, then say what you would measure next."
+
+
+def _conversation_prompt(model, turns_so_far, opening):
+    """The prompt for the next turn, built the way a chat client builds one: everything again."""
+    messages = [{"role": "user", "content": opening}]
+    for reply in turns_so_far:
+        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "user", "content": _FOLLOW_UP})
+    tokenizer = model.tokenizer
+    if getattr(tokenizer, "chat_template", None):
+        try:
+            encoded = tokenizer.apply_chat_template(messages, add_generation_prompt=True,
+                                                    tokenize=True, return_tensors="pt",
+                                                    return_dict=True)
+            return encoded["input_ids"] if hasattr(encoded, "keys") else encoded
+        except Exception:  # noqa: BLE001 - a template that cannot render this is not the point
+            pass
+    text = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+    return tokenizer([text], return_tensors="pt")["input_ids"]
+
+
+def _one_turn(model, cache, input_ids, layers, device, new_tokens):
+    """One turn, measuring what the prefill actually cost."""
+    from rocketllm.server import prefix_cache as prefixes
+
+    session = prefixes.PrefixSession(cache, input_ids[0].tolist(),
+                                     config=getattr(model, "kv_cache_config", None),
+                                     layers=layers, device=device)
+
+    def new_cache():
+        from transformers.cache_utils import DynamicCache
+
+        built = model._new_kv_cache()
+        return built if built is not None else DynamicCache()
+
+    kv = session.begin(new_cache)
+    timing = {}
+
+    class Tap:
+        """The streamer, reduced to the two things this needs: when the first token landed, and
+        the ids, which the session keys its checkpoints by."""
+
+        def __init__(self):
+            self.prompt_seen = False
+
+        def put(self, value):
+            if not self.prompt_seen:
+                self.prompt_seen = True
+                return
+            if "first_token" not in timing:
+                timing["first_token"] = time.perf_counter()
+            session.observe_tokens(value.reshape(-1).tolist())
+
+        def end(self):
+            pass
+
+    device_sync(device)
+    started = time.perf_counter()
+    kwargs = dict(max_new_tokens=new_tokens, do_sample=False, use_cache=True, streamer=Tap(),
+                  attention_mask=torch.ones_like(input_ids))
+    if kv is not None:
+        kwargs["past_key_values"] = kv
+    sequences = model.generate(input_ids, **kwargs)
+    device_sync(device)
+    wall = time.perf_counter() - started
+
+    prefill = timing.get("first_token", time.perf_counter()) - started
+    session.finish(prefill_seconds=prefill)
+    reply = model.tokenizer.decode(sequences[0][input_ids.shape[-1]:], skip_special_tokens=True)
+    return {
+        "prompt_tokens": int(input_ids.shape[-1]),
+        "tokens_reused": session.restored,
+        "tokens_prefilled": session.prefilled,
+        "prefill_seconds": prefill,
+        "wall_seconds": wall,
+        "hit": session.match is not None,
+    }, reply
+
+
+def run_conversation(args, device):
+    """Replay a multi-turn conversation with the prefix cache on and off.
+
+    The measurement that matters is the prefill of each turn, because that is the whole of what
+    reuse can save: an agentic client resends everything it has, so on turn two onward the prefill
+    is re-doing work the previous turn already paid a full streaming pass for.
+    """
+    from rocketllm.server import prefix_cache as prefixes
+
+    model = load_model(args, device)
+    layers = int(getattr(model.config, "num_hidden_layers", 0) or 0)
+    opening = _FILLER * max(1, args.conversation_filler)
+    seed = prefixes.namespace_seed(args.model, getattr(model, "running_dtype", ""),
+                                   getattr(model, "kv_cache_choice", ""), layers)
+
+    warmup = _conversation_prompt(model, [], opening).to(device)
+    print(f"opening prompt is {int(warmup.shape[-1])} tokens")
+
+    runs = {}
+    for label, enabled in (("prefix cache OFF", False), ("prefix cache ON", True)):
+        # A throwaway generation before EACH mode, after the reset that precedes it. Without one,
+        # the second mode's first turn also pays to read every weight back off storage, and that
+        # one-off cost is an order of magnitude larger than the thing being compared -- measured at
+        # 1.13s against a 0.10s warm prefill, which read as a tenfold regression that was not there.
+        model.generate(warmup, max_new_tokens=2, do_sample=False, use_cache=True,
+                       attention_mask=torch.ones_like(warmup))
+        cache = prefixes.build(profile=getattr(model, "profile", None), seed=seed, enabled=enabled,
+                               spill_dir=None)
+        replies = []
+        turns = []
+        for _ in range(args.conversation):
+            input_ids = _conversation_prompt(model, replies, opening).to(device)
+            row, reply = _one_turn(model, cache, input_ids, layers, device,
+                                   args.conversation_tokens)
+            turns.append(row)
+            replies.append(reply)
+        runs[label] = {"turns": turns, "prefix_cache": cache.report()}
+        model.reset()
+
+    print()
+    print("=" * 78)
+    print(f"  {args.conversation}-TURN CONVERSATION  (prefill is what reuse can save)")
+    print("=" * 78)
+    for label, data in runs.items():
+        print(f"\n  {label}")
+        print(f"    {'turn':<6}{'prompt':>9}{'reused':>9}{'prefilled':>11}"
+              f"{'prefill':>11}{'wall':>10}")
+        for index, row in enumerate(data["turns"], start=1):
+            print(f"    {index:<6}{row['prompt_tokens']:>9}{row['tokens_reused']:>9}"
+                  f"{row['tokens_prefilled']:>11}{row['prefill_seconds']:>10.2f}s"
+                  f"{row['wall_seconds']:>9.2f}s")
+        report = data["prefix_cache"]
+        print(f"    hits {report['hits']}/{report['lookups']}, "
+              f"tokens skipped {report['tokens_skipped']}, "
+              f"tokens prefilled {report['tokens_prefilled']}, "
+              f"time saved vs a measured full prefill "
+              f"{report['seconds_saved_vs_measured_baseline']:.2f}s")
+
+    off = runs["prefix cache OFF"]["turns"]
+    on = runs["prefix cache ON"]["turns"]
+    print()
+    print("  PREFILL PER TURN, measured")
+    print(f"    {'turn':<6}{'off':>10}{'on':>10}{'change':>22}")
+    for index, (a, b) in enumerate(zip(off, on), start=1):
+        if a["prefill_seconds"] > 0:
+            pct = (b["prefill_seconds"] - a["prefill_seconds"]) / a["prefill_seconds"] * 100.0
+            change = f"{pct:+.1f}%  {'faster' if pct < -0.5 else 'slower' if pct > 0.5 else 'same'}"
+        else:
+            change = "n/a"
+        print(f"    {index:<6}{a['prefill_seconds']:>9.2f}s{b['prefill_seconds']:>9.2f}s"
+              f"{change:>22}")
+    total_off = sum(row["prefill_seconds"] for row in off)
+    total_on = sum(row["prefill_seconds"] for row in on)
+    print(f"    {'total':<6}{total_off:>9.2f}s{total_on:>9.2f}s"
+          f"{(total_on - total_off) / total_off * 100.0:>+21.1f}%" if total_off else "")
+    print("=" * 78)
+    return runs
+
+
 def run(args, device):
     from transformers import LogitsProcessorList
 
@@ -1105,6 +1270,15 @@ def main():
                              "where the model already fits is no")
     parser.add_argument("--reprofile", action="store_true",
                         help="re-measure the hardware profile instead of using the cached one")
+    parser.add_argument("--conversation", type=int, default=0, metavar="TURNS",
+                        help="instead of one generation, replay a multi-turn conversation with the "
+                             "prefix cache on and off, and report the prefill time of each turn")
+    parser.add_argument("--conversation-tokens", type=int, default=24,
+                        help="tokens generated per conversation turn (default: 24)")
+    parser.add_argument("--conversation-filler", type=int, default=50,
+                        help="how many times the opening paragraph is repeated, which is how the "
+                             "first prompt is made long enough for prefill to dominate. The "
+                             "default lands around 1500 tokens; raise it on a model with room")
     args = parser.parse_args()
 
     device = pick_device(args.device)
@@ -1114,6 +1288,10 @@ def main():
               "peak-device metrics will report as unavailable.")
 
     cap_vram(args.max_vram_gb)
+
+    if args.conversation:
+        run_conversation(args, device)
+        return
 
     record = run(args, device)
     print_report(record)

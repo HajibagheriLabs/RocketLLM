@@ -483,7 +483,8 @@ class SpeculativeDecoder:
         self.lookahead = max(1, min(self.max_lookahead, int(round(expected))))
         return self.lookahead
 
-    def generate(self, input_ids, max_new_tokens, sampling=None, generator=None, streamer=None):
+    def generate(self, input_ids, max_new_tokens, sampling=None, generator=None, streamer=None,
+                 past_key_values=None):
         """Generate up to `max_new_tokens`, returning the whole sequence including the prompt.
 
         `streamer` follows transformers' streamer protocol exactly -- the prompt first, then each
@@ -497,7 +498,10 @@ class SpeculativeDecoder:
             raise ValueError("speculative decoding runs one sequence at a time; batch outside it, "
                              "or turn speculation off for batched generation")
 
-        cache = self.new_cache() if self.new_cache is not None else _dynamic_cache()
+        if past_key_values is not None:
+            cache = past_key_values
+        else:
+            cache = self.new_cache() if self.new_cache is not None else _dynamic_cache()
         if not hasattr(cache, "crop"):
             raise TypeError(f"{type(cache).__name__} cannot be cropped, and a rejected proposal has "
                             f"to come back out of the cache. Speculation needs a cache that "
@@ -509,7 +513,16 @@ class SpeculativeDecoder:
 
         sequence = input_ids
         prompt_length = sequence.shape[1]
-        cached = 0            # positions the TARGET cache holds
+        # Positions the TARGET cache holds. Non-zero when a cache is handed in already holding a
+        # prefix somebody else paid to prefill -- which is what the server's prefix cache does, and
+        # without this the loop would re-send those positions and the model would attend to them
+        # twice. The DRAFT starts empty regardless: it is small enough that re-reading the prompt
+        # costs little, and it has no prefix cache of its own.
+        cached = int(cache.get_seq_length()) if past_key_values is not None else 0
+        if cached > prompt_length:
+            raise ValueError(
+                f"the cache handed in holds {cached} positions but the prompt is only "
+                f"{prompt_length}; it is not a prefix of this request")
         draft_cached = 0      # positions the DRAFT cache holds
         emitted = 0
 

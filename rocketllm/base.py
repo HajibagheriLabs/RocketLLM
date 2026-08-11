@@ -1238,7 +1238,6 @@ class RocketModel:
                              ("repetition_penalty", "no_repeat_ngram_size", "bad_words_ids",
                               "logits_processor", "stopping_criteria", "assistant_model",
                               "prefix_allowed_tokens_fn", "constraints", "force_words_ids")),
-            "past_key_values": kwargs.get("past_key_values") is not None,
         }
         blocked = [name for name, hit in unsupported.items() if hit]
         if blocked:
@@ -1261,11 +1260,15 @@ class RocketModel:
         sampling = SamplingParams.from_generation(
             config, do_sample=kwargs.get("do_sample"), temperature=kwargs.get("temperature"),
             top_k=kwargs.get("top_k"), top_p=kwargs.get("top_p"))
-        # The streamer travels with the call rather than being listed as unsupported above. It has
-        # to: a streamed request is exactly the kind of long generation speculation is worth having
-        # for, so falling back to the stock loop whenever a caller wants tokens as they arrive would
-        # disable the feature for the server outright.
-        return input_ids, int(max_new), sampling, kwargs.get("streamer")
+        # The streamer and an incoming cache both travel with the call rather than being listed as
+        # unsupported above. They have to: a streamed request against a reused prefix is exactly
+        # what an agentic conversation is, and refusing either would mean speculation never runs for
+        # the server at all -- silently, since the fallback produces the same tokens.
+        cache = kwargs.get("past_key_values")
+        if cache is not None and not hasattr(cache, "crop"):
+            # A rejected proposal has to come back out of the cache; without crop it cannot.
+            return None
+        return input_ids, int(max_new), sampling, kwargs.get("streamer"), cache
 
     def speculation_report(self):
         return self.spec.stats.to_dict() if self.spec is not None else None
@@ -1567,9 +1570,10 @@ class RocketModel:
         # path; see _speculative_call for what that means and why the list is conservative.
         speculative = self._speculative_call(args, kwargs)
         if speculative is not None:
-            input_ids, max_new, sampling, streamer = speculative
+            input_ids, max_new, sampling, streamer, cache = speculative
             try:
-                return self.spec.generate(input_ids, max_new, sampling, streamer=streamer)
+                return self.spec.generate(input_ids, max_new, sampling, streamer=streamer,
+                                          past_key_values=cache)
             finally:
                 self._end_generation()
 

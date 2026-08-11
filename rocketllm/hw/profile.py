@@ -103,6 +103,17 @@ class Policy:
     #: How much room beyond the weights must be free before an automatic KV choice keeps the context
     #: in full precision. Below this the device is the binding constraint and int4 buys context.
     kv_fit_headroom_fraction: float = 0.15
+    #: Share of the host remainder the server's prefix cache may hold. Well below the weight
+    #: cache's share: a missed prefix costs one prefill, a missed layer costs a read on every token,
+    #: so the weight cache is worth more of the same RAM.
+    prefix_cache_fraction: float = 0.15
+    #: Tokens per prefix hash block, and so the granularity a partial match can be reused at. Small
+    #: blocks match more finely and cost more hashes and more checkpoints; large ones waste up to a
+    #: block of re-prefill per turn. 256 is a block of re-prefill against thousands of tokens saved.
+    prefix_block_tokens: int = 256
+    #: How much more than the host budget may be spilled to storage. Storage is the tier a prefix
+    #: can afford to sit on: reloading one is a read, and the alternative is a full re-prefill.
+    prefix_spill_multiple: float = 4.0
     #: Router firings between rebuilds of the expert pin plan, as a share of the aging interval.
     #: The two describe one timescale: re-ranking experts far more often than the counts they are
     #: ranked by can move only pays for evictions and refetches that the next rebuild undoes.
@@ -118,6 +129,9 @@ _OVERRIDABLE = {
     "reserve_bytes": int,
     "host_cache_bytes": int,
     "staging_pool_bytes": int,
+    "prefix_cache_bytes": int,
+    "prefix_spill_bytes": int,
+    "prefix_block_tokens": int,
     "io_workers": int,
     "window_fraction": float,
     # An absolute band is the escape hatch for reproducing a suspected bad measurement; the ratio is
@@ -638,6 +652,7 @@ class HardwareProfile:
         self._derive_reserve(policy, chosen)
         self._derive_host_cache(policy, chosen)
         self._derive_staging_pool(policy, chosen)
+        self._derive_prefix_cache(policy, chosen)
         self._derive_io_workers(policy, chosen)
         self._derive_window(policy, chosen)
         self._derive_budget_hysteresis(policy, chosen)
@@ -726,6 +741,41 @@ class HardwareProfile:
                       "os_headroom_fraction": policy.os_headroom_fraction,
                       "os_headroom_bytes": headroom,
                       "staging_pool_fraction": policy.staging_pool_fraction,
+                  }, overrides)
+
+    def _derive_prefix_cache(self, policy, overrides):
+        """How much the server's prefix cache may hold, on the host and spilled to storage.
+
+        From the same measured base as the weight cache and the staging pool, and as its own share
+        so the three cannot silently compete for the same RAM. Zero is a valid answer on a loaded
+        machine and must work: it means every turn re-prefills, which is correct and slow.
+
+        The storage tier is a multiple of the host one rather than a share of the disk. What a
+        spilled prefix costs to recover is a read; what it saves is a full prefill, which on a
+        streaming machine is the single most expensive thing a request can do -- so it is worth
+        keeping far more of them than host RAM alone would allow.
+        """
+        total = self.host_total_bytes or 0
+        available = self.host_available_bytes or 0
+        headroom = int(total * policy.os_headroom_fraction)
+        value = max(0, int((available - headroom) * policy.prefix_cache_fraction))
+        self._set("prefix_cache_bytes", value,
+                  "max(0, (host_available - host_total * os_headroom_fraction) "
+                  "* prefix_cache_fraction)", {
+                      "host_total_bytes": total,
+                      "host_available_bytes": available,
+                      "os_headroom_fraction": policy.os_headroom_fraction,
+                      "os_headroom_bytes": headroom,
+                      "prefix_cache_fraction": policy.prefix_cache_fraction,
+                  }, overrides)
+        self._set("prefix_spill_bytes", int(value * policy.prefix_spill_multiple),
+                  "prefix_cache_bytes * prefix_spill_multiple", {
+                      "prefix_cache_bytes": value,
+                      "prefix_spill_multiple": policy.prefix_spill_multiple,
+                  }, overrides)
+        self._set("prefix_block_tokens", int(policy.prefix_block_tokens),
+                  "policy constant: the granularity a partial prefix match is reusable at", {
+                      "prefix_block_tokens": policy.prefix_block_tokens,
                   }, overrides)
 
     def _derive_io_workers(self, policy, overrides):

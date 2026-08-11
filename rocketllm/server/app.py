@@ -38,6 +38,7 @@ from .protocol import (FINISH_LENGTH, FINISH_STOP, FINISH_TOOL_CALLS, SSE_DONE,
                        chat_id, completion_id, error_payload, sse)
 from .toolcalls import (ContentDelta, ToolCallDelta, ToolCallStream, ToolSetup, render_message,
                         resolve_tools, select_parser)
+from . import prefix_cache as prefixes
 
 log = logging.getLogger("rocketllm.server")
 
@@ -219,6 +220,11 @@ class _Sink:
         self.stopped_on_sequence = False
         self._prompt_seen = False
         self._finished = False
+        #: When the first generated token appeared. Everything before it is prefill, so this is
+        #: what makes the prefill cost a measurement rather than an estimate.
+        self.first_token_at = None
+        #: Optional PrefixSession, told about each token so it can key a checkpoint by them.
+        self.prefix = None
 
     @property
     def text(self):
@@ -240,8 +246,14 @@ class _Sink:
         ids = _as_ids(value)
         if not ids:
             return
+        if self.first_token_at is None:
+            self.first_token_at = time.perf_counter()
         self.token_count += len(ids)
         self.last_token = ids[-1]
+        if self.prefix is not None:
+            # Before the text is decoded, because the prefix cache keys checkpoints by token ids
+            # and the next forward may reach a length whose key needs this one.
+            self.prefix.observe_tokens(ids)
         self.decoder.push(ids)
 
         at = _first_stop(self.decoder.text, self.stop)
@@ -473,7 +485,8 @@ class GenerationEngine:
     answer would be two threads inside it at once.
     """
 
-    def __init__(self, model, model_id=None, max_tokens=None, tool_parser=None):
+    def __init__(self, model, model_id=None, max_tokens=None, tool_parser=None,
+                 prefix_cache="auto", prefix_cache_bytes=None):
         self.model = model
         self.tokenizer = model.tokenizer
         #: Which raw tool-call syntax this model emits, read off its chat template rather than its
@@ -488,6 +501,33 @@ class GenerationEngine:
         self.eos_ids = _eos_ids(model, self.tokenizer)
         self.started_at = time.time()
         self._tools_render_checked = False
+
+        self.layer_count = _layer_count(model)
+        # Seeded with everything that changes what a token's KV actually is. Two models sharing a
+        # spill directory would otherwise restore each other's caches -- same tokens, entirely
+        # different numbers, and no error anywhere.
+        seed = prefixes.namespace_seed(
+            self.model_id, getattr(model, "running_dtype", ""),
+            getattr(model, "kv_cache_choice", ""), self.layer_count,
+            prefixes.FORMAT_VERSION)
+        wanted, reason = prefixes.resolve(
+            prefix_cache if isinstance(prefix_cache, str) else
+            (prefixes.PREFIX_ON if prefix_cache else prefixes.PREFIX_OFF),
+            weight_bytes=getattr(model, "_weight_bytes", None),
+            device_bytes=getattr(model, "_device_budget", None))
+        self.prefixes = prefixes.build(
+            profile=getattr(model, "profile", None), seed=seed,
+            enabled=wanted and self.layer_count > 0, capacity_bytes=prefix_cache_bytes)
+        if self.prefixes.enabled:
+            print(f"prefix cache: on -- {reason}. "
+                  f"{self.prefixes.capacity_bytes / 1024 ** 3:.1f}GB host, "
+                  f"{self.prefixes.spill_bytes / 1024 ** 3:.1f}GB spill, "
+                  f"{self.prefixes.block_size}-token blocks")
+        else:
+            if wanted:
+                reason = ("the profile left it no host budget, or the model's layer count could "
+                          "not be read, so nothing could be checkpointed")
+            print(f"prefix cache: off -- {reason}")
 
     # -- prompts ----------------------------------------------------------------------------------
 
@@ -627,14 +667,44 @@ class GenerationEngine:
                                    hold=max((len(s) for s in settings.stop), default=0))
 
         sink = _Sink(self.tokenizer, settings, job.emit, job.cancel, tools=tools)
-        self._generate(input_ids, settings, sink)
+        session = prefixes.PrefixSession(
+            self.prefixes, input_ids[0].tolist(), config=getattr(self.model, "kv_cache_config",
+                                                                 None),
+            layers=self.layer_count, device=getattr(self.model, "device", None))
+        sink.prefix = session
+
+        started = time.perf_counter()
+        self._generate(input_ids, settings, sink, session)
+        prefill_seconds = ((sink.first_token_at - started)
+                           if sink.first_token_at is not None else None)
+        session.finish(prefill_seconds=prefill_seconds)
+        self._log_prefix(job, session, prefill_seconds)
+
         if job.cancel.is_set():
             raise _Cancelled()
         job.emit(Completed(finish_reason=sink.finish_reason(self.eos_ids), text=sink.text,
                            prompt_tokens=prompt_tokens, completion_tokens=sink.token_count,
                            tool_calls=sink.tool_calls))
 
-    def _generate(self, input_ids, settings, sink):
+    def _log_prefix(self, job, session, prefill_seconds):
+        if not self.prefixes.enabled:
+            return
+        summary = session.summary()
+        measured = f"{prefill_seconds * 1000:.0f}ms" if prefill_seconds is not None else "unknown"
+        if summary["hit"]:
+            log.info(
+                "request %s: prefix %s hit, %d of %d prompt tokens reused, %d prefilled in %s"
+                "%s",
+                job.id, summary["tier"], summary["tokens_reused"], summary["prompt_tokens"],
+                summary["tokens_prefilled"], measured,
+                "" if summary["seconds_saved"] is None else
+                f" ({summary['seconds_saved']:.2f}s faster than a measured full prefill of this "
+                f"size)")
+        else:
+            log.info("request %s: prefix miss, %d prompt tokens prefilled in %s",
+                     job.id, summary["prompt_tokens"], measured)
+
+    def _generate(self, input_ids, settings, sink, session=None):
         import torch
 
         if settings.seed is not None:
@@ -657,12 +727,34 @@ class GenerationEngine:
         if device is not None:
             input_ids = input_ids.to(device)
         attention_mask = torch.ones_like(input_ids)
+
+        if session is not None and self.prefixes.enabled:
+            # Handing generate() a pre-filled cache with the FULL input_ids is how transformers is
+            # meant to be told a prefix is already done: it takes the cache's length as the start
+            # of cache_position and forwards only the tokens past it.
+            cache = session.begin(self._new_cache)
+            if cache is not None:
+                kwargs["past_key_values"] = cache
         try:
             self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         except _StopGeneration:
             # A stop sequence completed. The reply is finished and correct; only the loop had to be
             # interrupted, because neither generation loop knows about server-side stop sequences.
             pass
+
+    def _new_cache(self):
+        """A fresh cache for a request the prefix cache could not serve.
+
+        Falls back to a DynamicCache when the model's own choice is full precision, because that
+        path normally lets transformers build its own and there would be nothing to checkpoint.
+        """
+        build = getattr(self.model, "_new_kv_cache", None)
+        cache = build() if callable(build) else None
+        if cache is not None:
+            return cache
+        from transformers.cache_utils import DynamicCache
+
+        return DynamicCache()
 
     # -- introspection ----------------------------------------------------------------------------
 
@@ -675,6 +767,7 @@ class GenerationEngine:
             "kv_cache": getattr(model, "kv_cache_choice", None),
             "speculation": bool(getattr(model, "spec", None)),
             "tool_parser": self.tool_parser.family,
+            "prefix_cache": self.prefixes.enabled,
             "max_tokens_cap": self.max_tokens_cap,
         })
 
@@ -699,6 +792,7 @@ class GenerationEngine:
             "hardware": _hardware_summary(model),
             "cache": _cache_summary(model),
             "budget": _budget_summary(model),
+            "prefix_cache": self.prefixes.report(),
         }
         for name, source in (("speculation", "speculation_report"), ("experts", "expert_report")):
             reporter = getattr(model, source, None)
@@ -730,6 +824,24 @@ def _default_model_id(model):
         if part.startswith("models--"):
             return part[len("models--"):].replace("--", "/")
     return parts[-1] if parts else "rocketllm"
+
+
+def _layer_count(model):
+    """How many decoder layers the KV cache will have.
+
+    The prefix cache needs it to know which `update` call ends a step: that is the only moment
+    every layer is consistent at the new length, and so the only moment a snapshot is exact.
+    """
+    config = getattr(model, "config", None)
+    for source in (config, getattr(config, "text_config", None)):
+        found = _int_or_none(getattr(source, "num_hidden_layers", None))
+        if found:
+            return found
+    layers = getattr(model, "layers", None)
+    if layers:
+        # RocketModel's list is embed + decoder layers + norm + lm_head.
+        return max(0, len(layers) - 3)
+    return 0
 
 
 def _context_length(model, tokenizer):

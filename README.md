@@ -157,9 +157,35 @@ markers, say how the template is recognised, and return where each call's JSON b
 name and streaming the arguments is shared. The tests pick up a new family automatically once it has
 a captured sample in the corpus at the top of [tests/test_toolcalls.py](tests/test_toolcalls.py).
 
+### Prefix caching
+
+An agentic client resends the whole conversation every turn, so turn three's prompt is turn two's
+prompt plus everything since. The server hashes the token sequence in blocks, stores checkpoints of
+the KV cache against those hashes, and on a hit restores one and prefills only the tail. It handles
+both cache layouts, including the int4 one — a checkpoint is captured while the cache is at exactly
+that length, never reconstructed by truncating a longer one, because the boundary between quantized
+blocks and the fp16 residual window is a function of the length and getting it wrong produces
+slightly wrong output rather than an error.
+
+**It is off by default unless the weights fit resident, and that is not conservatism.** A prefill is
+one streaming pass: every weight crosses the link once whether the prompt is forty tokens or four
+thousand. Where the model does not fit, that pass is the cost and skipping prompt tokens does not
+skip it — measured on an RTX 3090 with the weight cache squeezed to 1GB, three turns of an
+1800-token conversation ran **8.6% slower** in prefill with reuse on, having genuinely reused 3741
+of 5634 prompt tokens. Where the weights are resident the pass is free and prefill is compute, and
+the same conversation ran **14–18% faster** per reused turn. `--prefix-cache auto` follows that
+measurement; `on` and `off` force it.
+
+```bash
+python tests/bench_streaming.py --model <model> --conversation 3
+```
+
+replays a multi-turn conversation with reuse on and off and prints the measured prefill time of
+each turn.
+
 `rocketllm serve` takes the same tuning overrides as the Python API — `--vram-reserve`,
 `--host-cache-gb`, `--io-workers`, `--window-max`, `--pin-policy`, `--expert-residency`,
-`--kv-cache`, `--draft-model`, `--speculative` — and every one of them defaults to what
+`--kv-cache`, `--draft-model`, `--speculative`, `--prefix-cache` — and every one defaults to what
 `rocketllm profile` measured on your machine. Run `rocketllm serve --help` for the full list.
 
 ## Supported quantization formats
@@ -203,7 +229,6 @@ single box.
 - Coalesced storage reads into pooled host buffers, with a dedicated copy stream where one exists.
 - int4 KV cache.
 - Speculative decoding.
-- Prefix-KV reuse for the server.
 - A portability matrix covering the four device tiers.
 
 ## Credits

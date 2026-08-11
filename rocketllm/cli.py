@@ -154,6 +154,15 @@ def _add_serve_parser(subparsers):
                              "tokens for speculative decoding. Nothing happens without one")
     tuning.add_argument("--speculative", choices=["auto", "on", "off"], default="auto",
                         help="'auto' follows the profile's measured recommendation (default: auto)")
+    tuning.add_argument("--prefix-cache", choices=["auto", "on", "off"], default="auto",
+                        help="reuse the KV cache of a prefix already seen instead of re-prefilling "
+                             "the conversation every turn. 'auto' follows the measured "
+                             "recommendation: a prefill is one streaming pass, so reuse pays where "
+                             "the weights are resident and costs more than it saves where they are "
+                             "not (default: auto)")
+    tuning.add_argument("--prefix-cache-gb", type=float, default=None,
+                        help="gigabytes of host RAM the prefix cache may hold. Default: profile "
+                             "prefix_cache_bytes. Zero disables it")
     tuning.add_argument("--tool-parser", default=None,
                         help="force the tool-call syntax to read out of replies. Default: detected "
                              "from what the model's own chat template emits, which is right for "
@@ -201,8 +210,11 @@ def _run_serve(args):
 
     # The id a client sees defaults to what the user asked for, not to where the weights landed:
     # a downloaded checkpoint lives under a commit hash, and answering requests as that helps no one.
-    engine = GenerationEngine(model, model_id=args.served_model_name or args.model,
-                              max_tokens=args.max_tokens, tool_parser=args.tool_parser)
+    engine = GenerationEngine(
+        model, model_id=args.served_model_name or args.model, max_tokens=args.max_tokens,
+        tool_parser=args.tool_parser, prefix_cache=args.prefix_cache,
+        prefix_cache_bytes=(None if args.prefix_cache_gb is None
+                            else int(args.prefix_cache_gb * 1024 ** 3)))
     app = create_app(engine)
     print(f"serving {engine.model_id} on http://{args.host}:{args.port}  "
           f"(context {engine.context_length} tokens, one request at a time, "
