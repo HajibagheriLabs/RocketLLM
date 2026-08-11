@@ -17,6 +17,7 @@ from rocketllm.hw.caps import MemoryReport
 from rocketllm.memory.budget import AllocatorSetup, BudgetSample, VramBudget
 
 GB = 1024 ** 3
+MB = 1024 ** 2
 
 
 class FakeCaps:
@@ -54,12 +55,23 @@ class FakeDerivation:
 
 
 class FakeProfile:
-    def __init__(self, reserve=0, hysteresis_bytes=0, hysteresis_samples=1):
+    """A profile stub.
+
+    `hysteresis_bytes` is the absolute escape hatch and pins the band wherever it is given, which is
+    what most of these tests want because it makes the arithmetic hand-checkable. `hysteresis_ratio`
+    is what a real profile derives, and makes the band a share of the budget in play.
+    """
+
+    def __init__(self, reserve=0, hysteresis_bytes=None, hysteresis_samples=1,
+                 hysteresis_ratio=None):
         self.derived = {
             "reserve_bytes": FakeDerivation(reserve),
-            "budget_hysteresis_bytes": FakeDerivation(hysteresis_bytes),
             "budget_hysteresis_samples": FakeDerivation(hysteresis_samples),
         }
+        if hysteresis_bytes is not None:
+            self.derived["budget_hysteresis_bytes"] = FakeDerivation(hysteresis_bytes)
+        if hysteresis_ratio is not None:
+            self.derived["budget_hysteresis_ratio"] = FakeDerivation(hysteresis_ratio)
 
 
 def build(readings, profile=None, **kwargs):
@@ -310,6 +322,144 @@ class TestGenerationBoundary(unittest.TestCase):
                        on_change=lambda old, new, sample: seen.append((old, new)))
         budget.reset()
         self.assertEqual(seen, [(2 * GB, 12 * GB)])
+
+
+class TestTheBandScalesWithTheBudget(unittest.TestCase):
+    """REGRESSION TEST. A band sized off the whole card cannot move a constrained budget.
+
+    The failure this pins, measured on a 24GB card: the band came out at 1693MB, because it was
+    derived as a fraction of the *whole card* (and floored at the measured fragmentation ratio times
+    total memory). The budget the engine was actually working against, once the weights were
+    resident, was ~507MB. So the band was three times the budget it governed, and no change of any
+    kind could ever be published -- quantizing the KV cache genuinely freed 66MB and the pin plan
+    never heard about it.
+
+    The rule now is that the band is a share of the budget in play, so it means the same thing on a
+    4GB card and a 192GB one. Hysteresis is not weakened: what is asserted below is that ordinary
+    allocator noise is still rejected, and only a sustained, proportionally material move is
+    published.
+    """
+
+    #: What the Prompt 13 fixture actually recovered by quantizing its context.
+    KV_RECOVERED = 66 * MB
+    CONSTRAINED = 507 * MB
+
+    def test_the_old_whole_card_band_suppresses_a_real_kv_recovery(self):
+        """The bug, reproduced: a band sized off the card swallows the whole effect."""
+        readings = [steady(self.CONSTRAINED)] + [steady(self.CONSTRAINED + self.KV_RECOVERED)] * 6
+        budget = build(readings, profile=FakeProfile(hysteresis_bytes=1693 * MB,
+                                                     hysteresis_samples=3))
+        for _ in range(6):
+            budget.sample()
+        self.assertGreater(budget.current(), self.CONSTRAINED, "the memory really was recovered")
+        self.assertEqual(budget.target(), self.CONSTRAINED,
+                         "the published target moved, so this no longer reproduces the failure")
+        self.assertEqual(budget.changes, 0)
+
+    def test_a_proportional_band_publishes_the_same_recovery(self):
+        readings = [steady(self.CONSTRAINED)] + [steady(self.CONSTRAINED + self.KV_RECOVERED)] * 6
+        seen = []
+        budget = build(readings, profile=FakeProfile(hysteresis_ratio=0.065, hysteresis_samples=3),
+                       on_change=lambda old, new, sample: seen.append((old, new)))
+        for _ in range(6):
+            budget.sample()
+        self.assertEqual(budget.target(), self.CONSTRAINED + self.KV_RECOVERED)
+        self.assertEqual(len(seen), 1, "the move should be published exactly once")
+
+    def test_allocator_noise_is_still_rejected(self):
+        """The band exists to stop the cache reshuffling over jitter. It still must."""
+        noise = int(self.CONSTRAINED * 0.02)
+        readings = [steady(self.CONSTRAINED)]
+        for step in range(12):
+            readings.append(steady(self.CONSTRAINED + (noise if step % 2 else -noise)))
+        budget = build(readings, profile=FakeProfile(hysteresis_ratio=0.065, hysteresis_samples=3))
+        for _ in range(12):
+            budget.sample()
+        self.assertEqual(budget.target(), self.CONSTRAINED)
+        self.assertEqual(budget.changes, 0)
+
+    def test_the_band_means_the_same_thing_on_any_card(self):
+        """Scale-free by construction: the same relative move publishes at 1GB and at 100GB."""
+        for base in (1 * GB, 10 * GB, 100 * GB):
+            move = int(base * 0.10)
+            budget = build([steady(base)] + [steady(base + move)] * 6,
+                           profile=FakeProfile(hysteresis_ratio=0.065, hysteresis_samples=3))
+            for _ in range(6):
+                budget.sample()
+            with self.subTest(base_gb=base // GB):
+                self.assertEqual(budget.target(), base + move)
+
+    def test_a_move_smaller_than_the_share_is_not_published_however_long_it_lasts(self):
+        small = int(self.CONSTRAINED * 0.03)
+        budget = build([steady(self.CONSTRAINED)] + [steady(self.CONSTRAINED + small)] * 20,
+                       profile=FakeProfile(hysteresis_ratio=0.065, hysteresis_samples=3))
+        for _ in range(20):
+            budget.sample()
+        self.assertEqual(budget.target(), self.CONSTRAINED)
+
+    def test_the_band_shrinks_with_the_budget_it_governs(self):
+        """The point of the change: a smaller budget gets a proportionally smaller band."""
+        big = build([steady(20 * GB)], profile=FakeProfile(hysteresis_ratio=0.05))
+        small = build([steady(500 * MB)], profile=FakeProfile(hysteresis_ratio=0.05))
+        self.assertEqual(big.hysteresis_bytes, int(20 * GB * 0.05))
+        self.assertEqual(small.hysteresis_bytes, int(500 * MB * 0.05))
+        self.assertLess(small.hysteresis_bytes, big.hysteresis_bytes)
+
+    def test_an_absolute_band_still_overrides_the_share(self):
+        """The debugging escape hatch stays: an explicit byte count pins the band."""
+        budget = build([steady(8 * GB)], profile=FakeProfile(hysteresis_ratio=0.5),
+                       hysteresis_bytes=123 * MB)
+        self.assertEqual(budget.hysteresis_bytes, 123 * MB)
+
+
+class TestBothDirections(unittest.TestCase):
+    """Growth and recovery must both obey hysteresis, and both must eventually publish."""
+
+    BASE = 800 * MB
+
+    def profile(self):
+        return FakeProfile(hysteresis_ratio=0.06, hysteresis_samples=3)
+
+    def test_a_growing_context_eventually_lowers_the_target(self):
+        grown = self.BASE - 200 * MB
+        seen = []
+        budget = build([steady(self.BASE)] + [steady(grown)] * 6, profile=self.profile(),
+                       on_change=lambda old, new, sample: seen.append((old, new)))
+        for _ in range(6):
+            budget.sample()
+        self.assertEqual(budget.target(), grown)
+        self.assertEqual(seen, [(self.BASE, grown)])
+
+    def test_a_shrinking_context_eventually_raises_the_target(self):
+        freed = self.BASE + 200 * MB
+        seen = []
+        budget = build([steady(self.BASE)] + [steady(freed)] * 6, profile=self.profile(),
+                       on_change=lambda old, new, sample: seen.append((old, new)))
+        for _ in range(6):
+            budget.sample()
+        self.assertEqual(budget.target(), freed)
+        self.assertEqual(seen, [(self.BASE, freed)])
+
+    def test_neither_direction_publishes_before_the_move_has_persisted(self):
+        for delta in (+200 * MB, -200 * MB):
+            budget = build([steady(self.BASE)] + [steady(self.BASE + delta)] * 6,
+                           profile=self.profile())
+            budget.sample()
+            budget.sample()
+            with self.subTest(delta_mb=delta // MB):
+                self.assertEqual(budget.target(), self.BASE,
+                                 "published before the streak was satisfied")
+
+    def test_token_by_token_growth_does_not_republish_every_sample(self):
+        """The reason hysteresis exists: a KV cache growing steadily must not thrash the cache."""
+        readings = [steady(self.BASE - step * MB) for step in range(200)]
+        budget = build(readings, profile=self.profile())
+        for _ in range(199):
+            budget.sample()
+        self.assertLess(budget.changes, 8,
+                        f"{budget.changes} republishes over 200 samples of steady growth is "
+                        f"thrashing, which is what the band exists to prevent")
+        self.assertGreater(budget.changes, 0, "the target has to follow a sustained trend at all")
 
 
 class TestNoKvEstimator(unittest.TestCase):

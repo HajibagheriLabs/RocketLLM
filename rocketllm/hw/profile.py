@@ -36,7 +36,12 @@ from . import caps
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+#: Bumped whenever the derived set changes shape, because a cached profile is replayed verbatim and
+#: a stale one would keep supplying a knob that no longer means what it did. Version 2 replaced the
+#: absolute budget_hysteresis_bytes with budget_hysteresis_ratio; a cache still carrying the old key
+#: would pin the band to a byte count measured against the whole card, which is the bug that change
+#: exists to fix.
+SCHEMA_VERSION = 2
 
 # Dimensionless policy factors. Not hardware facts -- design choices, gathered here so they are
 # visible and overridable rather than sprinkled through the engine as literals.
@@ -66,9 +71,9 @@ class Policy:
     #: Expressed in bytes/s; roughly where spinning rust and degraded links live.
     slow_storage_bytes_per_s: float = 150e6
     #: How far a measured device budget must sit from the published one before the move is treated
-    #: as real rather than as allocator churn. A share of usable device memory, and only a floor:
-    #: the measured fragmentation is used instead wherever it is larger, because that is the actual
-    #: size of the noise this exists to reject.
+    #: as real rather than as allocator churn -- as a share of the budget in play, so it means the
+    #: same thing on any card. Only a floor: the measured fragmentation ratio is used instead
+    #: wherever it is larger, because that is the actual size of the noise this exists to reject.
     budget_hysteresis_fraction: float = 0.02
     #: Consecutive deviating samples required before the published budget moves. Sampling happens
     #: at every layer boundary, so this is cheap to satisfy for a real shift and hard to satisfy
@@ -108,7 +113,10 @@ _OVERRIDABLE = {
     "staging_pool_bytes": int,
     "io_workers": int,
     "window_fraction": float,
+    # An absolute band is the escape hatch for reproducing a suspected bad measurement; the ratio is
+    # what is normally derived, because a band has to scale with the budget it governs.
     "budget_hysteresis_bytes": int,
+    "budget_hysteresis_ratio": float,
     "budget_hysteresis_samples": int,
     "pin_replan_bytes": int,
     "expert_aging_interval": int,
@@ -761,21 +769,28 @@ class HardwareProfile:
         reading it will take back a sample later, which costs a whole streaming pass to learn
         nothing. So the threshold is floored at the fragmentation actually measured on this machine
         -- the size of the noise itself -- and never at a round number chosen elsewhere.
+
+        What is derived is a SHARE, not a byte count, and that distinction is the whole of this
+        function. A byte count has to be sized against something, and the only thing a probe knows
+        about is the whole card -- but the budget it governs is whatever is left once a model is
+        resident, which can be a small fraction of it. Sized off the card, the band was measured at
+        1693MB while the live budget was 507MB: three times the quantity it was damping, so no
+        change of any size could ever be published and the pin plan never moved. As a share it means
+        the same thing on a 4GB card and a 192GB one, which is the property this actually needs.
+
+        The share is the larger of a policy floor and the measured fragmentation ratio, which is a
+        ratio already -- applying it to the memory in play is what it was always describing.
         """
-        total = self.device_total_bytes or 0
         usable = self.derived["usable_device_bytes"].value
         frag = self.allocator.get("fragmentation_ratio")
-        churn = int(total * (frag or 0.0))
-        floor = int(usable * policy.budget_hysteresis_fraction)
-        self._set("budget_hysteresis_bytes", max(floor, churn),
-                  "max(usable_device * budget_hysteresis_fraction, "
-                  "total_device * measured_fragmentation_ratio)", {
+        ratio = max(float(policy.budget_hysteresis_fraction), float(frag or 0.0))
+        self._set("budget_hysteresis_ratio", ratio,
+                  "max(budget_hysteresis_fraction, measured_fragmentation_ratio), applied to the "
+                  "live budget rather than to the card", {
                       "usable_device_bytes": usable,
-                      "total_device_bytes": total,
                       "budget_hysteresis_fraction": policy.budget_hysteresis_fraction,
                       "measured_fragmentation_ratio": frag,
-                      "fraction_floor_bytes": floor,
-                      "measured_churn_bytes": churn,
+                      "band_at_full_usable_bytes": int(usable * ratio),
                   }, overrides)
         self._set("budget_hysteresis_samples", int(policy.budget_hysteresis_samples),
                   "policy: consecutive deviating samples before the published budget moves",

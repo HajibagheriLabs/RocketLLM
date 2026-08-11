@@ -162,7 +162,7 @@ class VramBudget:
 
     def __init__(self, device=None, device_caps=None, profile=None, reserve_bytes=None,
                  hysteresis_bytes=None, hysteresis_samples=None, history=512, on_change=None,
-                 configure_allocator_env=True, probe_allocator=True):
+                 configure_allocator_env=True, probe_allocator=True, hysteresis_ratio=None):
         self.caps = device_caps if device_caps is not None else get_caps(device, announce=False)
         self.device = self.caps.device
         self.profile = profile
@@ -174,7 +174,21 @@ class VramBudget:
                           AllocatorSetup("not_applicable", "allocator configuration was declined"))
 
         self.reserve_bytes = self._resolve("reserve_bytes", reserve_bytes, 0)
-        self.hysteresis_bytes = max(0, self._resolve("budget_hysteresis_bytes", hysteresis_bytes, 0))
+        # The band is a SHARE of the budget in play, not a fixed number of bytes. A fixed one has to
+        # be sized against something, and the only thing available at probe time is the whole card
+        # -- which is the wrong scale as soon as the budget is constrained. Measured on a 24GB card:
+        # a band of 1693MB governing a budget of 507MB, so nothing could ever be published and a
+        # real 66MB recovery never reached the pin plan. A share means the same thing at 4GB and at
+        # 192GB, which is the property this needs and a byte count cannot have.
+        #
+        # An absolute value still wins where one is given, because that is the debugging override
+        # for reproducing a suspected bad measurement.
+        self._fixed_band = self._optional("budget_hysteresis_bytes", hysteresis_bytes)
+        if self._fixed_band is not None:
+            self._fixed_band = max(0, int(self._fixed_band))
+        self.hysteresis_ratio = max(0.0, float(
+            self._optional("budget_hysteresis_ratio", hysteresis_ratio) or 0.0))
+        self._target = 0
         self.hysteresis_samples = max(1, self._resolve("budget_hysteresis_samples",
                                                        hysteresis_samples, 1))
 
@@ -214,6 +228,62 @@ class VramBudget:
             f"to {fallback}. It will still track free memory, but without the machine's own "
             f"measurements behind it.", logging.INFO)
         return fallback
+
+    def _optional(self, knob, override):
+        """A knob that may legitimately be absent, with no complaint when it is.
+
+        Separate from :meth:`_resolve` because a missing `reserve` is a degradation worth announcing
+        and a missing absolute hysteresis band is not -- the band is normally a share, and only some
+        configurations pin it to a byte count.
+        """
+        if override is not None:
+            return override
+        if self.profile is not None:
+            derivation = self.profile.derived.get(knob)
+            if derivation is not None:
+                return derivation.value
+        return None
+
+    # -- the band ----------------------------------------------------------------------------------
+
+    def scale(self):
+        """The size of the pool this budget governs: the largest usable figure seen recently.
+
+        Choosing this basis took two wrong answers first, and both are worth recording.
+
+        The instantaneous usable figure is wrong because the cache this budget sizes expands until
+        free memory is gone. Usable therefore tends toward zero during a healthy run, and a band
+        proportional to it tends to zero with it, which leaves every allocator jog publishing -- the
+        opposite of hysteresis.
+
+        Usable plus what the process has allocated is wrong because it counts allocations that have
+        nothing to do with this budget: any other tensor the process is holding inflates the band,
+        and the band then suppresses exactly the changes it exists to let through.
+
+        The high-water mark over the retained history has neither problem. It is the largest budget
+        this run has actually been given, it is composed only of readings already taken, and because
+        the history is bounded it decays: a card that really has permanently lost memory to another
+        process stops being measured against the pool it used to have.
+        """
+        seen = max((reading.usable for reading in self.history), default=0) if self.history else 0
+        return max(seen, self._target)
+
+    def band_for(self):
+        """How far a reading must sit from the published target before the move is treated as real.
+
+        Proportional to the pool in play, so it carries the same meaning on a 4GB card and a 192GB
+        one. The share comes from the profile, where it is the larger of a policy floor and the
+        allocator fragmentation actually measured on this machine -- the size of the noise being
+        rejected. An absolute band, where one was given, wins over all of it.
+        """
+        if self._fixed_band is not None:
+            return self._fixed_band
+        return int(self.scale() * self.hysteresis_ratio)
+
+    @property
+    def hysteresis_bytes(self):
+        """The band as it currently stands, for reporting."""
+        return self.band_for()
 
     # -- measurement -----------------------------------------------------------------------------
 
@@ -267,8 +337,11 @@ class VramBudget:
             previous = self._target
             deviation = reading.usable - previous
             sign = (deviation > 0) - (deviation < 0)
+            # Measured against the band for the budget being operated on, not a fixed number of
+            # bytes, so the same relative move is judged the same way at any scale.
+            band = self.band_for()
 
-            if abs(deviation) <= self.hysteresis_bytes:
+            if abs(deviation) <= band:
                 # Inside the noise band. Not a move, and it breaks any run that was building.
                 self._streak = 0
                 self._streak_sign = 0
@@ -356,6 +429,8 @@ class VramBudget:
             "device": str(self.device),
             "reserve_bytes": self.reserve_bytes,
             "hysteresis_bytes": self.hysteresis_bytes,
+            "hysteresis_ratio": self.hysteresis_ratio,
+            "hysteresis_scale_bytes": self.scale(),
             "hysteresis_samples": self.hysteresis_samples,
             "target_bytes": self._target,
             "samples": len(readings),

@@ -376,5 +376,149 @@ class TestFreedMemoryReachesThePinBudget(unittest.TestCase):
         self.assertEqual(harness._pin_budget, 0)
 
 
+class TestTheWholeChainFromKvToPinnedBytes(unittest.TestCase):
+    """KV footprint -> measured memory -> published target -> pin budget -> pinned weight bytes.
+
+    The integration this exists for, driven through the real VramBudget and the engine's own
+    on_change callback rather than by calling the pieces directly. Three quantities are deliberately
+    kept apart, because conflating them is how the Prompt 13 result looked like a success when it
+    was not:
+
+      * what the machine currently measures as free   -- VramBudget.current()
+      * what placement is allowed to size against     -- VramBudget.target()
+      * what is actually held resident                -- the pinned packed bytes
+
+    Memory being recovered moves the first immediately. Only a sustained, proportionally material
+    move reaches the second, and only then does the third change. A test that stopped at the first
+    would have passed against the broken build.
+    """
+
+    MB = 1024 * 1024
+    CANDIDATES = 8
+    CANDIDATE_BYTES = 10 * 1024 * 1024
+    #: What the fp16 context leaves free, and what quantizing it gives back.
+    FP16_FREE = 30 * 1024 * 1024
+    RECOVERED = 40 * 1024 * 1024
+
+    def harness(self, readings, ratio=0.10, samples=3):
+        from tests.test_vram_budget import FakeCaps, FakeProfile
+        from rocketllm.base import RocketModel
+        from rocketllm.memory import CLASS_ALWAYS, PinCandidate
+        from rocketllm.memory.budget import VramBudget
+        from rocketllm.memory.cache import TieredWeightCache
+
+        candidate_bytes = self.CANDIDATE_BYTES
+
+        class Harness(RocketModel):
+            def __init__(self):
+                pass
+
+            def _pin_candidates(self):
+                return [PinCandidate(key=(i, "dense"), packed_bytes=candidate_bytes,
+                                     priority=CLASS_ALWAYS, accesses_per_token=1.0)
+                        for i in range(8)]
+
+        model = Harness()
+        model.cache = TieredWeightCache(fetch=lambda key: f"payload:{key}",
+                                        sizer=lambda key: candidate_bytes,
+                                        device_bytes=0, host_bytes=0, window=1)
+        model.pin_policy = "auto"
+        model._pin_budget = 0
+        model._window_share = 0.5
+        model.budget = VramBudget(device_caps=FakeCaps(readings),
+                                  profile=FakeProfile(hysteresis_ratio=ratio,
+                                                      hysteresis_samples=samples),
+                                  configure_allocator_env=False,
+                                  on_change=model._budget_changed)
+        return model
+
+    def pinned_bytes(self, model):
+        return len(model.cache.pinned) * self.CANDIDATE_BYTES
+
+    def test_recovered_kv_memory_becomes_pinned_weight_bytes(self):
+        from tests.test_vram_budget import steady
+
+        fp16, int4 = self.FP16_FREE, self.FP16_FREE + self.RECOVERED
+        model = self.harness([steady(fp16)] + [steady(int4)] * 6)
+
+        # 2. the starting point, established from the fp16 footprint.
+        model._budget_changed(0, model.budget.target(), model.budget.history[-1])
+        start_target = model.budget.target()
+        start_pin_budget = model._pin_budget
+        start_pinned = self.pinned_bytes(model)
+        self.assertEqual(start_target, fp16)
+        self.assertGreater(start_pinned, 0, "nothing was resident to begin with")
+
+        # 3-5. the context is quantized: the machine measures the recovery immediately.
+        model.budget.sample()
+        self.assertEqual(model.budget.current(), int4, "the memory was not actually recovered")
+        self.assertEqual(model.budget.target(), start_target,
+                         "published before the move had persisted")
+
+        # 6-7. and after the streak, the published target follows and the callback fires.
+        model.budget.sample()
+        model.budget.sample()
+        self.assertEqual(model.budget.target(), int4)
+        self.assertEqual(model.budget.changes, 1)
+
+        # 8-9. which reaches the pin budget, and puts more weight bytes resident.
+        self.assertGreater(model._pin_budget, start_pin_budget)
+        self.assertGreater(self.pinned_bytes(model), start_pinned)
+        self.assertLessEqual(self.pinned_bytes(model), model._pin_budget,
+                             "placement pinned more than the budget allows")
+
+    def test_a_growing_context_takes_the_residency_back(self):
+        """The same chain in reverse, which is what stops a long generation over-committing."""
+        from tests.test_vram_budget import steady
+
+        roomy, tight = 120 * self.MB, 30 * self.MB
+        model = self.harness([steady(roomy)] + [steady(tight)] * 6)
+        model._budget_changed(0, model.budget.target(), model.budget.history[-1])
+        start_pinned = self.pinned_bytes(model)
+
+        for _ in range(4):
+            model.budget.sample()
+
+        self.assertEqual(model.budget.target(), tight)
+        self.assertLess(self.pinned_bytes(model), start_pinned,
+                        "residency did not shrink when the context grew into it")
+
+    def test_a_recovery_too_small_to_matter_leaves_residency_alone(self):
+        """Hysteresis still governs: a move inside the band must not reshuffle the cache."""
+        from tests.test_vram_budget import steady
+
+        base = 100 * self.MB
+        model = self.harness([steady(base)] + [steady(base + 2 * self.MB)] * 8)
+        model._budget_changed(0, model.budget.target(), model.budget.history[-1])
+        before = self.pinned_bytes(model)
+
+        for _ in range(8):
+            model.budget.sample()
+
+        self.assertEqual(model.budget.changes, 0)
+        self.assertEqual(self.pinned_bytes(model), before)
+
+    def test_a_zero_pin_budget_stays_pure_streaming(self):
+        """The degradation rule: no room to pin is a supported configuration, not an error."""
+        from tests.test_vram_budget import steady
+
+        model = self.harness([steady(0)] * 4)
+        model._budget_changed(0, 0, model.budget.history[-1])
+        self.assertEqual(model._pin_budget, 0)
+        self.assertEqual(self.pinned_bytes(model), 0)
+        for _ in range(3):
+            model.budget.sample()
+        self.assertEqual(self.pinned_bytes(model), 0)
+
+    def test_everything_fits_pins_everything_and_no_more(self):
+        from tests.test_vram_budget import steady
+
+        whole = self.CANDIDATES * self.CANDIDATE_BYTES * 4
+        model = self.harness([steady(whole)] * 4)
+        model._budget_changed(0, model.budget.target(), model.budget.history[-1])
+        self.assertEqual(self.pinned_bytes(model), self.CANDIDATES * self.CANDIDATE_BYTES,
+                         "a budget that holds the whole model should pin all of it, and stop there")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
