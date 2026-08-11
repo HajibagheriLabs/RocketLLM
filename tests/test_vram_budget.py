@@ -49,6 +49,35 @@ class FakeCaps:
                             note="free + (reserved - allocated) - reserve")
 
 
+class FakeMachine:
+    """A card whose free memory actually responds to what the cache is holding.
+
+    :class:`FakeCaps` serves a fixed script, which is right for pinning the arithmetic and wrong for
+    exercising the feedback loop: giving a weight up really does hand its bytes back, so a script
+    that ignores the holdings turns a fixed point into a downward spiral and tests a machine that
+    does not exist. Here the script says what everything OTHER than the weight cache is using -- a
+    context, activations, another process -- and free memory follows from that and the holdings.
+    """
+
+    backend = "cuda"
+
+    def __init__(self, total, others, holdings, device="cuda:0"):
+        self.device = torch.device(device)
+        self.total = total
+        #: Bytes used by everything that is not the weight cache, one entry per reading.
+        self.others = list(others)
+        self.holdings = holdings
+        self.calls = 0
+
+    def memory(self, reserve_bytes=0):
+        self.calls += 1
+        other = self.others[min(self.calls - 1, len(self.others) - 1)]
+        free = max(0, self.total - other - self.holdings())
+        return MemoryReport(total=self.total, free=free, reserved=0, allocated=0,
+                            budget=max(0, free - reserve_bytes), estimated=False,
+                            note="free follows the holdings, as a real card's does")
+
+
 class FakeDerivation:
     def __init__(self, value):
         self.value = value
@@ -460,6 +489,156 @@ class TestBothDirections(unittest.TestCase):
                         f"{budget.changes} republishes over 200 samples of steady growth is "
                         f"thrashing, which is what the band exists to prevent")
         self.assertGreater(budget.changes, 0, "the target has to follow a sustained trend at all")
+
+
+class TestTheCapacityIsNotARatchet(unittest.TestCase):
+    """REGRESSION TEST. Memory freed while the machine is inside its reserve must be reclaimable.
+
+    Measured on a 24GB card, with the weight cache holding 674MB, a reserve of 1614MB derived from
+    this machine's own allocator behaviour, and 526MB released part-way through a generation:
+
+        free 1023MB + 38MB held by the allocator  ->  headroom = -553MB
+        free 1549MB + 37MB held by the allocator  ->  headroom =  -28MB
+
+    Both readings sit inside the reserve, so both floored to a budget of zero, and the capacity --
+    computed by the caller as that floored budget plus what the cache already held -- came out at
+    674MB before and 674MB after. Half a gigabyte came back and nothing downstream could see it.
+
+    Worse than invisible: in that state the capacity IS the holdings, so the cache could only
+    ratchet downwards. Every eviction permanently lowered its own ceiling and nothing could ever
+    raise it again for the rest of the generation.
+
+    Folding the holdings in before the floor rather than after it turns the same two readings into
+    121MB and 646MB. The recovery is the difference, and the first number is somewhere for the cache
+    to shrink to while the machine is genuinely over-committed.
+    """
+
+    RESERVE = 1614 * MB
+    HOLDINGS = 674 * MB
+    #: (free, blocks the allocator is holding but not using), before and after the release.
+    TIGHT = (1023 * MB, 38 * MB)
+    RECOVERED = (1549 * MB, 37 * MB)
+
+    def readings(self, *states):
+        return [(free, held, 0, False) for free, held in states]
+
+    def profile(self, **kwargs):
+        kwargs.setdefault("hysteresis_ratio", 0.065)
+        kwargs.setdefault("hysteresis_samples", 3)
+        return FakeProfile(reserve=self.RESERVE, **kwargs)
+
+    def budget(self, *states, holdings=None, **kwargs):
+        if holdings is not None:
+            kwargs["reclaimable"] = holdings if callable(holdings) else (lambda: holdings)
+        return build(self.readings(*states), profile=self.profile(), **kwargs)
+
+    @staticmethod
+    def old_capacity(reading):
+        """What the arithmetic used to compute: floor the headroom, then add the holdings on top."""
+        return max(0, reading.headroom) + reading.reclaimable
+
+    def test_the_old_floor_made_a_real_recovery_invisible(self):
+        """The bug, reproduced from its own components rather than from a description of it."""
+        budget = self.budget(self.TIGHT, self.RECOVERED, holdings=self.HOLDINGS)
+        before = budget.history[-1]
+        after = budget.sample()
+
+        self.assertGreater(after.headroom, before.headroom, "the memory really was released")
+        self.assertEqual(self.old_capacity(before), self.HOLDINGS,
+                         "under the floor the capacity was just whatever the cache held")
+        self.assertEqual(self.old_capacity(after), self.old_capacity(before),
+                         "the old arithmetic moved, so this no longer reproduces the ratchet")
+
+    def test_memory_released_inside_the_reserve_now_reaches_the_budget(self):
+        budget = self.budget(self.TIGHT, self.RECOVERED, holdings=self.HOLDINGS)
+        before = budget.history[-1]
+        after = budget.sample()
+
+        self.assertEqual(after.usable - before.usable, after.headroom - before.headroom,
+                         "the recovery did not arrive intact")
+        self.assertGreater(after.usable, before.usable)
+
+    def test_a_recovery_inside_the_reserve_is_published_once_it_has_persisted(self):
+        seen = []
+        budget = self.budget(self.TIGHT, *([self.RECOVERED] * 6), holdings=self.HOLDINGS,
+                             on_change=lambda old, new, sample: seen.append((old, new)))
+        start = budget.target()
+        for _ in range(6):
+            budget.sample()
+        self.assertGreater(budget.target(), start)
+        self.assertEqual(len(seen), 1, "the move should be published exactly once")
+
+    def test_a_cache_inside_the_reserve_is_asked_to_give_the_shortfall_back(self):
+        """The other half of the same defect: a floor cannot say how far over-committed you are."""
+        budget = self.budget(self.TIGHT, holdings=self.HOLDINGS)
+        reading = budget.history[-1]
+        self.assertLess(reading.headroom, 0, "this scenario is meant to be inside the reserve")
+        self.assertEqual(reading.usable, self.HOLDINGS + reading.headroom)
+        self.assertLess(reading.usable, self.HOLDINGS,
+                        "an over-committed cache was not asked to shrink")
+
+    def test_evicting_does_not_lower_the_ceiling_that_asked_for_the_eviction(self):
+        """The property that makes this a fixed point rather than a downward spiral.
+
+        Bytes the cache gives up land in the allocator's free pool, so the holdings fall and the
+        headroom rises by the same amount. The capacity must therefore not move at all -- otherwise
+        every eviction would justify the next one.
+        """
+        evicted = 200 * MB
+        free, held = self.TIGHT
+        holdings = [self.HOLDINGS]
+        budget = build(self.readings(self.TIGHT, (free, held + evicted)),
+                       profile=self.profile(), reclaimable=lambda: holdings[0])
+        before = budget.current()
+
+        holdings[0] -= evicted
+        self.assertEqual(budget.sample().usable, before,
+                         "the cache lowered its own ceiling by obeying it")
+
+    def test_a_budget_with_nothing_to_reclaim_is_exactly_what_it_always_was(self):
+        """No owner, no change: every existing caller and every backend keeps its arithmetic."""
+        for free, held in (self.TIGHT, self.RECOVERED, (8 * GB, 0)):
+            plain = build(self.readings((free, held)), profile=self.profile())
+            with self.subTest(free_mb=free // MB):
+                self.assertEqual(plain.current(), max(0, free + held - self.RESERVE))
+                self.assertEqual(plain.history[-1].reclaimable, 0)
+
+    def test_an_owner_that_cannot_answer_is_counted_as_zero_rather_than_failing_the_sample(self):
+        def explode():
+            raise RuntimeError("the cache is mid-teardown")
+
+        budget = self.budget(self.RECOVERED, holdings=explode)
+        free, held = self.RECOVERED
+        self.assertEqual(budget.current(), max(0, free + held - self.RESERVE))
+
+    def test_the_band_does_not_collapse_when_the_cache_has_filled_the_card(self):
+        """Why the holdings belong inside `usable` and not in the caller's arithmetic.
+
+        A cache that has taken every byte it was allowed leaves free memory sitting at the reserve,
+        so the headroom is zero. If the budget it published were that figure, the band would be a
+        share of nothing, and the cache would start reshuffling on allocator noise at exactly the
+        point residency is worth the most.
+        """
+        budget = self.budget(*([(self.RESERVE, 0)] * 8), holdings=self.HOLDINGS)
+        self.assertEqual(budget.history[-1].headroom, 0, "this is the filled-card case")
+        for _ in range(8):
+            budget.sample()
+        self.assertGreater(budget.hysteresis_bytes, 0, "the band collapsed with free memory")
+        self.assertEqual(budget.changes, 0, "a steady machine republished anyway")
+
+    def test_the_reconstructed_headroom_matches_what_the_backend_floored(self):
+        """The signed figure is recomposed from the report's own components, not read off its
+        already-floored budget. A backend that ever computes its budget differently shows up here.
+        """
+        from rocketllm.hw.caps import get_caps
+
+        caps = get_caps(torch.device("cpu"), announce=False)
+        for reserve in (0, 4 * GB, 1024 * GB):
+            report = caps.memory(reserve)
+            held = (0 if report.reserved is None or report.allocated is None
+                    else max(0, report.reserved - report.allocated))
+            with self.subTest(reserve_gb=reserve // GB):
+                self.assertEqual(report.budget, max(0, int(report.free) + held - reserve))
 
 
 class TestNoKvEstimator(unittest.TestCase):

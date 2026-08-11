@@ -17,6 +17,14 @@ adds back what the caching allocator is sitting on -- see the comment there, it 
 looks wrong and is not. The second is hysteresis: the raw reading jitters by the allocator's own
 churn, and a cache that acted on every jog would evict and refetch a layer to learn nothing, at the
 cost of a full streaming pass. So the published target only moves after the deviation persists.
+
+What this publishes is what the OWNER may hold, not what the driver calls free, and the difference
+matters once the machine is inside its reserve. Free memory alone floors at zero there, and a floor
+destroys the sign: it cannot say how far over-committed the owner is, so nothing gives memory back,
+and it reads every subsequent recovery as zero-to-zero, so nothing takes memory either. The cache
+ends up frozen at whatever it happened to hold when the machine first went under, for the rest of
+the generation. So the owner's own holdings are folded in BEFORE the floor -- see `reclaimable` --
+and the floor is applied once, at the end, where it means "there is nothing left to keep".
 """
 import dataclasses
 import logging
@@ -141,7 +149,12 @@ class BudgetSample:
     #: Held-but-free allocator blocks: reserved - allocated.
     held: int
     reserve: int
-    #: free + held - reserve, floored at zero. What the cache may hold.
+    #: Bytes the owner already holds and could give back. Zero unless it said.
+    reclaimable: int
+    #: free + held - reserve, SIGNED. Negative means the machine is inside its reserve, and by how
+    #: much -- which is the amount the owner is being asked to hand back.
+    headroom: int
+    #: max(0, headroom + reclaimable). What the owner may hold.
     usable: int
     #: True when the backend could not report the components and this is a conservative guess.
     estimated: bool
@@ -162,10 +175,15 @@ class VramBudget:
 
     def __init__(self, device=None, device_caps=None, profile=None, reserve_bytes=None,
                  hysteresis_bytes=None, hysteresis_samples=None, history=512, on_change=None,
-                 configure_allocator_env=True, probe_allocator=True, hysteresis_ratio=None):
+                 configure_allocator_env=True, probe_allocator=True, hysteresis_ratio=None,
+                 reclaimable=None):
         self.caps = device_caps if device_caps is not None else get_caps(device, announce=False)
         self.device = self.caps.device
         self.profile = profile
+
+        #: Optional callable returning the bytes the owner already holds on the device. Settable
+        #: after construction, because the budget is usually built before the thing it sizes.
+        self.reclaimable = reclaimable
 
         # Set before the first allocation, which is why it happens in the constructor: by the time
         # anything asks for a budget the context usually exists, and then it is too late.
@@ -244,6 +262,20 @@ class VramBudget:
                 return derivation.value
         return None
 
+    def _reclaimable(self):
+        """Bytes the owner already holds, or zero when nobody said.
+
+        This is a measurement like any other here, so it may not be the thing that fails a sample:
+        the owner is arbitrary caller code and may be mid-teardown when a sample lands.
+        """
+        if self.reclaimable is None:
+            return 0
+        try:
+            return max(0, int(self.reclaimable()))
+        except Exception:  # noqa: BLE001 - a budget that cannot measure still has to publish
+            log.debug("the reclaimable callable raised; counting it as zero", exc_info=True)
+            return 0
+
     # -- the band ----------------------------------------------------------------------------------
 
     def scale(self):
@@ -264,6 +296,11 @@ class VramBudget:
         this run has actually been given, it is composed only of readings already taken, and because
         the history is bounded it decays: a card that really has permanently lost memory to another
         process stops being measured against the pool it used to have.
+
+        The first of those objections is also why the owner's holdings belong inside `usable`
+        rather than being added by the caller afterwards. A cache that has filled the card would
+        otherwise drive every reading to zero, take the band with it, and start publishing on noise
+        at exactly the moment residency is worth the most.
         """
         seen = max((reading.usable for reading in self.history), default=0) if self.history else 0
         return max(seen, self._target)
@@ -292,7 +329,7 @@ class VramBudget:
 
         The arithmetic is:
 
-            free_from_driver + (memory_reserved() - memory_allocated()) - reserve
+            free_from_driver + (memory_reserved() - memory_allocated()) - reserve + reclaimable
 
         The middle term is the part that looks like a mistake and is not. DO NOT "SIMPLIFY" IT AWAY.
         torch's caching allocator does not hand memory back to the driver when a tensor is freed --
@@ -302,6 +339,13 @@ class VramBudget:
         are not: this process can allocate into them immediately. `memory_reserved - memory_allocated`
         is exactly that pool, and adding it back is the difference between a cache that fills the
         card and one that gives up with gigabytes going spare.
+
+        The last term is what the owner already holds. Those bytes are not free -- they are
+        allocated, by the owner, for exactly the purpose being sized -- so they belong in the answer
+        to "how much may you hold", and they have to be added before the floor rather than after it.
+        Added after, as this used to do, the floor flattens the whole region below the reserve to
+        zero and the answer degenerates to "however much you are already holding": the owner can
+        then only ever ratchet downwards, and memory freed while it is down there is invisible.
 
         Backends that cannot report the components fall back to a conservative reading -- what the
         backend calls free, with nothing added back -- and say so, once, rather than pretending to
@@ -320,10 +364,19 @@ class VramBudget:
                 f"reserve, with no allowance for blocks the allocator is holding. It will "
                 f"under-claim rather than over-claim.", logging.INFO)
 
+        # Recomposed from the components rather than read off `report.budget`, which every backend
+        # has already floored. The floor is the thing being avoided here, and the components it was
+        # computed from are all on the report, so this loses nothing: report.budget is exactly
+        # max(0, headroom) on every backend, and there is a test that says so.
+        headroom = (int(report.budget) if report.free is None
+                    else int(report.free) + held - self.reserve_bytes)
+        reclaimable = self._reclaimable()
+
         return BudgetSample(
             at=time.monotonic(), free=report.free, reserved=report.reserved,
             allocated=report.allocated, held=held, reserve=self.reserve_bytes,
-            usable=max(0, int(report.budget)), estimated=bool(report.estimated),
+            reclaimable=reclaimable, headroom=headroom,
+            usable=max(0, headroom + reclaimable), estimated=bool(report.estimated),
             target=getattr(self, "_target", 0))
 
     def sample(self):
@@ -424,10 +477,13 @@ class VramBudget:
     def summary(self):
         readings = list(self.history or ())
         usable = [r.usable for r in readings]
+        latest = readings[-1] if readings else None
         return {
             "backend": self.caps.backend,
             "device": str(self.device),
             "reserve_bytes": self.reserve_bytes,
+            "reclaimable_bytes": latest.reclaimable if latest is not None else 0,
+            "headroom_bytes": latest.headroom if latest is not None else 0,
             "hysteresis_bytes": self.hysteresis_bytes,
             "hysteresis_ratio": self.hysteresis_ratio,
             "hysteresis_scale_bytes": self.scale(),

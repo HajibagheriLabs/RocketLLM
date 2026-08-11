@@ -1047,7 +1047,7 @@ class RocketModel:
         live = self.budget.measure()
         if not live.estimated:
             window_share = (window_budget / device_bytes) if device_bytes else 0.0
-            device_bytes = self._capacity_for(live.usable)
+            device_bytes = live.usable
             window_budget = int(device_bytes * window_share)
         pinned = self._plan_pins(device_bytes, window_budget, largest)
 
@@ -1068,6 +1068,10 @@ class RocketModel:
         # The window is a share of the budget, so when the budget moves the window has to move with
         # it. Kept as the ratio rather than the bytes for exactly that reason.
         self._window_share = (window_budget / device_bytes) if device_bytes else 0.0
+        # What the budget publishes is what the CACHE may hold, so it has to count what the cache
+        # is already holding as its own. Wired here rather than at construction because the budget
+        # has to exist first: it is what sized the cache.
+        self.budget.reclaimable = self._cache_holdings
         self.budget.on_change = self._budget_changed
 
         self._resolve_kv_cache(device_bytes)
@@ -1096,13 +1100,19 @@ class RocketModel:
                               device=self.running_device, compute_dtype=self.running_dtype)
 
     def _budget_changed(self, old_bytes, new_bytes, sample):
-        """Free device memory moved, so re-size the cache and re-rank what it keeps.
+        """The published budget moved, so re-size the cache and re-rank what it keeps.
 
         This is the path a dropped KV cache travels down. At the end of a generation the context is
         released, the budget jumps by its whole size, and without this nothing would notice: the
         cache would go on sizing itself against whatever was free while the longest context of the
         run was still resident. The window keeps its share and the rest goes to pinning, so the
         memory a shorter context frees turns directly into resident weights.
+
+        The new plan is adopted BEFORE the cache is resized, and the order is load-bearing when the
+        budget has shrunk. Pinned entries are never evicted, so resizing first would ask the cache
+        to fit inside a smaller capacity while still holding every pin the larger one paid for, and
+        it would quietly fail to get there. Unpinning first is what lets the eviction actually free
+        the memory the new budget says is no longer ours.
         """
         cache = getattr(self, "cache", None)
         if cache is None:
@@ -1113,25 +1123,24 @@ class RocketModel:
             # deliberately does not treat as a device pool. Following it would silently replace a
             # derived budget with an unrelated number. Track, do not act.
             return
-        capacity = self._capacity_for(new_bytes)
-        cache.resize_device(capacity)
+        capacity = max(0, int(new_bytes))
         window_budget = int(capacity * self._window_share)
         self._pin_budget = pin_budget_from(capacity, window_budget)
         if self.pin_policy != "off":
             cache.apply_plan(plan_pins(self._pin_candidates(), self._pin_budget))
+        cache.resize_device(capacity)
 
-    def _capacity_for(self, free_bytes):
-        """What the cache may hold, given how many bytes are free right now.
+    def _cache_holdings(self):
+        """Device bytes the weight cache is already holding, for the budget to count as its own.
 
-        The budget measures what is FREE, and what the cache is already holding is not free -- it is
-        allocated, by this cache, for exactly the purpose being sized. So the capacity is what it
-        holds plus what is still free. Setting the capacity to the free figure alone would tell a
-        cache holding a gigabyte of pinned weights that its budget is the few hundred megabytes left
-        over, and it would evict most of itself to get there, on every sample, for nothing.
+        Not free memory, and not something the budget could measure for itself: the driver reports
+        these bytes as in use, which they are, but they are in use by the very thing being sized and
+        it can hand them back. Sizing the cache to free memory alone would tell a cache holding a
+        gigabyte of pinned weights that its budget is the few hundred megabytes left over, and it
+        would evict most of itself to get there, on every sample, for nothing.
         """
         cache = getattr(self, "cache", None)
-        held = cache.device.bytes if cache is not None else 0
-        return max(0, int(free_bytes) + int(held))
+        return cache.device.bytes if cache is not None else 0
 
     def _plan_pins(self, device_bytes, window_budget, largest):
         """Which modules to keep resident for the whole run.

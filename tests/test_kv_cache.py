@@ -356,17 +356,27 @@ class TestFreedMemoryReachesThePinBudget(unittest.TestCase):
         self.assertGreater(harness._pin_budget, 0)
 
     def test_the_capacity_counts_what_the_cache_already_holds(self):
-        """The budget measures what is FREE, and what the cache holds is not free.
+        """The driver measures what is FREE, and what the cache holds is not free.
 
         Sizing the cache to the free figure alone would tell a cache holding a gigabyte that its
-        budget is the few hundred megabytes left over, and it would evict most of itself to fit.
+        budget is the few hundred megabytes left over, and it would evict most of itself to fit. The
+        engine hands the budget its holdings for exactly that reason; what is checked here is that
+        the wiring reaches the published number.
         """
+        from tests.test_vram_budget import FakeCaps, FakeProfile, steady
+        from rocketllm.memory.budget import VramBudget
+
         harness = self.build(capacity=100 * 1024 * 1024)
         harness.cache.acquire((0, "dense"))
         harness.cache.release((0, "dense"))
         held = harness.cache.device.bytes
         self.assertGreater(held, 0)
-        self.assertEqual(harness._capacity_for(50 * 1024 * 1024), 50 * 1024 * 1024 + held)
+
+        free = 50 * 1024 * 1024
+        budget = VramBudget(device_caps=FakeCaps([steady(free)]), profile=FakeProfile(),
+                            configure_allocator_env=False,
+                            reclaimable=harness._cache_holdings)
+        self.assertEqual(budget.current(), free + held)
 
     def test_a_reading_the_backend_could_not_verify_is_not_acted_on(self):
         """CPU reports host RAM as free memory; following it would replace a derived budget."""
@@ -400,7 +410,7 @@ class TestTheWholeChainFromKvToPinnedBytes(unittest.TestCase):
     FP16_FREE = 30 * 1024 * 1024
     RECOVERED = 40 * 1024 * 1024
 
-    def harness(self, readings, ratio=0.10, samples=3):
+    def harness(self, readings, ratio=0.10, samples=3, reserve=0, resident=0, caps=None):
         from tests.test_vram_budget import FakeCaps, FakeProfile
         from rocketllm.base import RocketModel
         from rocketllm.memory import CLASS_ALWAYS, PinCandidate
@@ -421,14 +431,18 @@ class TestTheWholeChainFromKvToPinnedBytes(unittest.TestCase):
         model = Harness()
         model.cache = TieredWeightCache(fetch=lambda key: f"payload:{key}",
                                         sizer=lambda key: candidate_bytes,
-                                        device_bytes=0, host_bytes=0, window=1)
+                                        device_bytes=resident, host_bytes=0, window=8)
         model.pin_policy = "auto"
         model._pin_budget = 0
         model._window_share = 0.5
-        model.budget = VramBudget(device_caps=FakeCaps(readings),
-                                  profile=FakeProfile(hysteresis_ratio=ratio,
+        for index in range(resident // candidate_bytes):
+            model.cache.acquire((index, "dense"))
+            model.cache.release((index, "dense"))
+        model.budget = VramBudget(device_caps=caps(model) if caps else FakeCaps(readings),
+                                  profile=FakeProfile(reserve=reserve, hysteresis_ratio=ratio,
                                                       hysteresis_samples=samples),
                                   configure_allocator_env=False,
+                                  reclaimable=model._cache_holdings,
                                   on_change=model._budget_changed)
         return model
 
@@ -509,6 +523,60 @@ class TestTheWholeChainFromKvToPinnedBytes(unittest.TestCase):
         for _ in range(3):
             model.budget.sample()
         self.assertEqual(self.pinned_bytes(model), 0)
+
+    def test_a_recovery_inside_the_reserve_still_reaches_resident_weights(self):
+        """The region the chain used to be frozen in: the machine under its own reserve.
+
+        Free memory alone floors at zero there, so the capacity degenerated to whatever the cache
+        happened to be holding and no recovery of any size could move it. Driven through the real
+        budget on a card whose free memory responds to eviction, with the engine supplying its
+        holdings exactly as the engine wires them.
+        """
+        from tests.test_vram_budget import FakeMachine
+
+        resident = self.CANDIDATES * self.CANDIDATE_BYTES         # 80MB of weights are resident
+        card, reserve = 400 * self.MB, 300 * self.MB              # so free starts 40MB under
+        context = [60 * self.MB] + [20 * self.MB] * 8             # and the context then gives 40 back
+        model = self.harness([], reserve=reserve, resident=resident,
+                             caps=lambda m: FakeMachine(card, context, m._cache_holdings))
+
+        self.assertEqual(model.cache.device.bytes, resident, "nothing was resident to begin with")
+        self.assertLess(model.budget.history[-1].headroom, 0, "meant to start inside the reserve")
+
+        model._budget_changed(0, model.budget.target(), model.budget.history[-1])
+        start_pinned = self.pinned_bytes(model)
+        self.assertGreater(start_pinned, 0)
+        self.assertLessEqual(model.cache.device.bytes, model.cache.device.capacity,
+                             "the cache was not asked to give the shortfall back")
+
+        for _ in range(4):
+            model.budget.sample()
+
+        self.assertEqual(model.budget.changes, 1, "the recovery inside the reserve was swallowed")
+        self.assertGreater(self.pinned_bytes(model), start_pinned,
+                           "the recovered memory did not become resident weights")
+        self.assertLessEqual(self.pinned_bytes(model), model._pin_budget)
+
+    def test_the_capacity_settles_instead_of_spiralling_when_the_cache_gives_memory_back(self):
+        """Eviction hands the bytes to the allocator, so the capacity must not fall in response.
+
+        If it did, obeying a shrunken budget would justify shrinking it again, and a cache under
+        memory pressure would unwind itself layer by layer instead of settling.
+        """
+        from tests.test_vram_budget import FakeMachine
+
+        resident = self.CANDIDATES * self.CANDIDATE_BYTES
+        model = self.harness([], reserve=300 * self.MB, resident=resident,
+                             caps=lambda m: FakeMachine(400 * self.MB, [60 * self.MB],
+                                                        m._cache_holdings))
+        model._budget_changed(0, model.budget.target(), model.budget.history[-1])
+        settled = model.cache.device.capacity
+        self.assertLess(settled, resident, "nothing was given back, so there is nothing to check")
+
+        for _ in range(10):
+            model.budget.sample()
+        self.assertEqual(model.cache.device.capacity, settled, "the capacity spiralled downwards")
+        self.assertEqual(model.budget.changes, 0)
 
     def test_everything_fits_pins_everything_and_no_more(self):
         from tests.test_vram_budget import steady
