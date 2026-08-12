@@ -42,6 +42,18 @@ Where a capability is absent, RocketLLM logs the fallback once — not once per 
 running. Notably, if bf16 is unavailable it falls back to fp16 with an explicit warning: fp16's range
 overflows on very deep models and can silently corrupt output.
 
+To see what your own machine decided, and what it will cost you:
+
+```bash
+rocketllm doctor --model /path/to/your/model
+```
+
+That prints the hardware profile, every capability decision and the fallback taken for each, which
+optional packages are missing and what their absence costs, the measured read bandwidth of the
+filesystem your weights are on, and a projected per-token cost. It is also what to paste into a bug
+report. [docs/HARDWARE.md](docs/HARDWARE.md) explains the tiers, the degradations, how to read that
+output, and how to contribute a benchmark result from your own hardware.
+
 ## Install
 
 ```bash

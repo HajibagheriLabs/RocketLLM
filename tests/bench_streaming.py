@@ -30,7 +30,6 @@ python tests/bench_streaming.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
 """
 import argparse
 import ctypes
-import hashlib
 import json
 import os
 import platform

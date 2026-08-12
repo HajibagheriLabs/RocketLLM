@@ -1,5 +1,4 @@
 
-from transformers import GenerationConfig
 
 
 from .base import RocketModel

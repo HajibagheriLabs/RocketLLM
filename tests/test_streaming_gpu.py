@@ -70,7 +70,7 @@ def run_rocketllm(args):
     sequences = out if isinstance(out, torch.Tensor) else out.sequences
     text = model.tokenizer.decode(sequences[0])
     peak = torch.cuda.max_memory_allocated() / 1e6
-    print(f"\n=== RocketLLM ===")
+    print("\n=== RocketLLM ===")
     print(f"output : {text!r}")
     print(f"peak VRAM: {peak:.1f} MB")
     print(f"time   : {elapsed:.1f}s ({args.max_new_tokens} new tokens)")
@@ -97,7 +97,7 @@ def run_reference(args):
     ids = tok([args.prompt], return_tensors="pt", return_attention_mask=False)["input_ids"].cuda()
     out = ref.generate(ids, max_new_tokens=args.max_new_tokens, do_sample=False)
     text = tok.decode(out[0])
-    print(f"\n=== Reference (full load) ===")
+    print("\n=== Reference (full load) ===")
     print(f"output : {text!r}")
     del ref
     torch.cuda.empty_cache()

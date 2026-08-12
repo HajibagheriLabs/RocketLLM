@@ -4,6 +4,11 @@
 every probed measurement and every derived knob next to the formula that produced it, which is
 usually enough to see why a number came out the way it did without anyone reading the source.
 
+``rocketllm doctor`` is what to ask a bug reporter for. It is the profile plus the things the
+profile alone does not answer: which capability gates said no and what was taken instead, which
+optional packages are missing and what each absence costs, how fast the weights' filesystem
+actually measured, and what a model of a given size would therefore cost per token on this machine.
+
 ``rocketllm serve`` runs the OpenAI-compatible server. Every tuning flag it takes defaults to None,
 meaning "use what the hardware profile measured on this machine" -- the flags exist to reproduce a
 problem or bisect a suspect measurement, not to configure a healthy run. There is no default that is
@@ -52,10 +57,12 @@ def _run_profile(args):
     return 0
 
 
-# ---- serve --------------------------------------------------------------------------------------
+# ---- shared argument parsing --------------------------------------------------------------------
 
 _SIZE_SUFFIXES = {"k": 1024, "kb": 1024, "m": 1024 ** 2, "mb": 1024 ** 2,
                   "g": 1024 ** 3, "gb": 1024 ** 3, "t": 1024 ** 4, "tb": 1024 ** 4}
+
+_COUNT_SUFFIXES = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}
 
 
 def size_bytes(text):
@@ -74,6 +81,19 @@ def size_bytes(text):
             f"{text!r} is not a byte size; write it as 2GB, 512MB or a plain number of bytes")
 
 
+def param_count(text):
+    """Parse a parameter count the way people write one: 70B, 8b, 1.5M, 405000000."""
+    raw = str(text).strip().lower()
+    scale = _COUNT_SUFFIXES.get(raw[-1:], 1)
+    if scale != 1:
+        raw = raw[:-1].strip()
+    try:
+        return int(float(raw) * scale)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a parameter count; write it as 70B, 8b or a plain number")
+
+
 def torch_dtype(name):
     if name in (None, "auto"):
         return None
@@ -84,6 +104,56 @@ def torch_dtype(name):
         raise argparse.ArgumentTypeError(f"{name!r} is not a torch dtype")
     return dtype
 
+
+# ---- doctor -------------------------------------------------------------------------------------
+
+def _add_doctor_parser(subparsers):
+    parser = subparsers.add_parser(
+        "doctor",
+        help="print everything a bug report needs: profile, capability decisions, optional "
+             "packages, storage bandwidth and a projected per-token cost",
+        description="Diagnose this machine. Run it and paste the output into an issue -- RocketLLM "
+                    "has no reference machine, so what it did on yours is the only way to tell a "
+                    "bug from a hardware limit.")
+    parser.add_argument("--model", default=None,
+                        help="a checkpoint to size the projection against, and the filesystem to "
+                             "measure storage on. The most useful thing to pass: the model's real "
+                             "on-disk size is what the engine actually has to move")
+    parser.add_argument("--weights-path", default=None,
+                        help="measure storage here instead of at --model, for when the weights are "
+                             "somewhere other than the model you are asking about")
+    parser.add_argument("--model-bytes", type=size_bytes, default=None,
+                        help="project for a model of this many bytes, e.g. 40GB, when the "
+                             "checkpoint is not on this machine")
+    parser.add_argument("--model-size", type=param_count, default=None, dest="params",
+                        help="project for a model of this many parameters, e.g. 70B. Combined with "
+                             "--weight-bits; less accurate than --model, which measures the file")
+    parser.add_argument("--weight-bits", type=int, default=None,
+                        help="bits per weight in the checkpoint --model-size describes "
+                             "(default: 16, i.e. an unquantized checkpoint)")
+    parser.add_argument("--device", default=None,
+                        help="diagnose this backend instead of the auto-selected one, e.g. cpu")
+    parser.add_argument("--reprofile", action="store_true",
+                        help="ignore any cached profile and measure this machine again")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the whole diagnosis as JSON instead of the readable report")
+    parser.add_argument("--storage-budget-seconds", type=float, default=3.0,
+                        help="time budget for the storage sweep (default: 3.0)")
+    parser.set_defaults(handler=_run_doctor)
+    return parser
+
+
+def _run_doctor(args):
+    from .hw import doctor
+
+    doctor.run(weights_path=args.weights_path, device=args.device, reprofile=args.reprofile,
+               model=args.model, model_bytes=args.model_bytes, params=args.params,
+               weight_bits=args.weight_bits, as_json=args.json,
+               storage_budget_seconds=args.storage_budget_seconds)
+    return 0
+
+
+# ---- serve --------------------------------------------------------------------------------------
 
 def _add_serve_parser(subparsers):
     parser = subparsers.add_parser(
@@ -232,6 +302,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="rocketllm", description=__doc__.splitlines()[0])
     subparsers = parser.add_subparsers(dest="command")
     _add_profile_parser(subparsers)
+    _add_doctor_parser(subparsers)
     _add_serve_parser(subparsers)
 
     args = parser.parse_args(argv)

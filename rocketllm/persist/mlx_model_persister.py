@@ -7,9 +7,7 @@ from .model_persister import ModelPersister
 from mlx.utils import tree_unflatten
 import torch
 
-import psutil
 import numpy as np
-from itertools import starmap
 
 
 

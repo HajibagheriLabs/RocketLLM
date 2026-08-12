@@ -23,9 +23,8 @@ paths and the dense one has no MoE test to fail.
 
 Everything here runs on CPU with no accelerator, no download and no optional package.
 """
-import tempfile
+import importlib
 import unittest
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -33,6 +32,22 @@ import torch.nn as nn
 from rocketllm.moe.detect import (LAYOUT_FUSED, LAYOUT_MODULE_LIST, detect_expert_layout,
                                   resolve_top_k, summarize)
 from rocketllm.moe.router import RouterSelection
+
+
+def requires_architecture(module_path, reason):
+    """Skip a case whose subject the installed transformers does not ship.
+
+    RocketLLM supports a range of transformers versions, and an architecture that exists in the
+    newest one is simply absent from the oldest. That is not a fallback to test for -- the detector
+    is structural and never names an architecture -- so the case is skipped where its subject does
+    not exist and runs everywhere it does. The synthetic layouts above cover the same contract on
+    every version.
+    """
+    try:
+        importlib.import_module(module_path)
+    except ImportError:
+        return unittest.skip(f"this transformers has no {reason}")
+    return lambda test: test
 
 
 def shapes_of(module, prefix):
@@ -370,6 +385,7 @@ class TestRealArchitectures(unittest.TestCase):
         self.assertFalse([k for k in layout.other_keys if "shared_expert" in k],
                          "a shared expert is its own entry, not part of the layer's stream")
 
+    @requires_architecture("transformers.models.llama4", "Llama 4 (added in transformers 4.51)")
     def test_llama4_is_fused(self):
         from transformers.models.llama4.configuration_llama4 import Llama4TextConfig
         from transformers.models.llama4.modeling_llama4 import Llama4ForCausalLM

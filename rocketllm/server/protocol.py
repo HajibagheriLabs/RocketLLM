@@ -23,7 +23,7 @@ user like the server is broken. Fields we DO understand are validated properly.
 import json
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field

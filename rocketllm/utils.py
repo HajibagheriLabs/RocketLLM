@@ -6,26 +6,19 @@ import shutil
 from tqdm import tqdm
 from pathlib import Path
 from glob import glob
-import time
 
-from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from collections import defaultdict
 from sys import platform
 
-is_on_mac_os = False
-
-if platform == "darwin":
-    is_on_mac_os = True
-
-
 import torch
-import torch.nn as nn
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 
 from .persist import ModelPersister
 
 import huggingface_hub
+
+is_on_mac_os = (platform == "darwin")
 
 
 class NotEnoughSpaceException(Exception):
@@ -69,7 +62,7 @@ def clean_memory(device=None):
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception as ex:
+    except Exception:
         # maybe platform
         pass
     # Routed through the device abstraction so this works on every backend, not just CUDA.
@@ -138,13 +131,16 @@ def check_space(checkpoint_path, layer_shards_saving_path=None, splitted_model_d
             total_saved_split_files_size_bytes += os.path.getsize(saved_split_file)
 
     # Shards are copied byte for byte, so the split costs exactly what the checkpoint costs.
-    total, used, free = shutil.disk_usage(checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path)
+    split_target = checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path
+    total, used, free = shutil.disk_usage(split_target)
 
     if free + total_saved_split_files_size_bytes < total_shard_files_size_bytes:
-        raise NotEnoughSpaceException(f"Not enough space. Free space under {checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path}:"  \
-                                      f" {free / 1024 / 1024 / 1024:.02f}GB. Model total size: {total_shard_files_size_bytes / 1024 / 1024 / 1024:.02f}GB. " \
-                                      f"existing space under {checkpoint_path if layer_shards_saving_path is None else layer_shards_saving_path} assuming can reuse: {total_saved_split_files_size_bytes/ 1024 / 1024 / 1024:.02f}GB. "
-                                      )
+        gb = 1024 ** 3
+        raise NotEnoughSpaceException(
+            f"Not enough space. Free space under {split_target}: {free / gb:.02f}GB. "
+            f"Model total size: {total_shard_files_size_bytes / gb:.02f}GB. "
+            f"existing space under {split_target} assuming can reuse: "
+            f"{total_saved_split_files_size_bytes / gb:.02f}GB. ")
 
 def remove_real_and_linked_file(to_delete):
     if (os.path.realpath(to_delete) != to_delete):
@@ -228,12 +224,16 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     if layer_names is None:
         n_layers = len(set([int(k.split('.')[2]) for k in index.keys() if 'model.layers' in k]))
     else:
-        n_layers = len(set([int(k[len(layer_names['layer_prefix']):].split('.')[1]) for k in index.keys() if layer_names['layer_prefix'] in k]))
+        prefix = layer_names['layer_prefix']
+        n_layers = len(set([int(k[len(prefix):].split('.')[1]) for k in index.keys() if prefix in k]))
 
     if layer_names is None:
-        layers = ['model.embed_tokens.'] + [f'model.layers.{i}.' for i in range(n_layers)] + ['model.norm.', 'lm_head.']
+        layers = (['model.embed_tokens.'] + [f'model.layers.{i}.' for i in range(n_layers)]
+                  + ['model.norm.', 'lm_head.'])
     else:
-        layers = [layer_names['embed']] + [f'{layer_names["layer_prefix"]}.{i}' for i in range(n_layers)] + [layer_names['norm'], layer_names['lm_head']]
+        layers = ([layer_names['embed']]
+                  + [f'{layer_names["layer_prefix"]}.{i}' for i in range(n_layers)]
+                  + [layer_names['norm'], layer_names['lm_head']])
 
         if 'rotary_pos_emb' in layer_names:
             layers = [layer_names['rotary_pos_emb']] + layers
@@ -241,12 +241,12 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         # e.g. a multimodal model's vision tower / projector, or extra top-level norms. They get
         # their own shard and are loaded once and kept resident.
         layers = layers + list(layer_names.get('resident', []))
-        layers = [l + "." for l in layers]
+        layers = [name + "." for name in layers]
 
     # Drop layers that have no weights in the checkpoint. This happens for tied embeddings,
     # where lm_head shares storage with embed_tokens and has no entry of its own. Without this we
     # would try to save an empty shard (which fails) and never detect the split as complete.
-    layers = [l for l in layers if any(k.startswith(l) for k in index.keys())]
+    layers = [name for name in layers if any(k.startswith(name) for k in index.keys())]
 
     # Split in ascending shard order. The loop below only ever walks the shard counter forward, so
     # a module whose weights sit in an earlier shard than its predecessor's would silently be saved
@@ -277,7 +277,7 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             print(f"saved layers already found in {saving_path}")
             return str(saving_path)
         else:
-            print(f"some layer splits found, some are not, re-save all layers in case there's some corruptions.")
+            print("some layer splits found, some are not, re-save all layers in case there's some corruptions.")
 
     # Some checkpoints are already sharded exactly one module per file (Kimi K3, for instance, ships
     # one ~17GB shard per decoder layer). Re-writing those into per-layer files would duplicate the
@@ -351,9 +351,11 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                     pass
             continue
 
-        # Optionnally load next shard
-        # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
-        shards = [int(v.split('-')[1]) for k, v in index.items() if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
+        # Optionnally load next shard.
+        # Checking whether after splitting from '-' a second element exists; otherwise this throws
+        # for single 'model.safetensor' files.
+        shards = [int(v.split('-')[1]) for k, v in index.items()
+                  if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
         if len(shards) > 0:
             # A layer can span several shards (especially fp8 checkpoints, where each weight has a
             # companion weight_scale_inv tensor). Load *every* shard up to the highest one this layer
@@ -412,9 +414,9 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         del layer_state_dict
         clean_memory()
 
-    # deleting single modelfile if only a single modelfile was existing in hf repo 
+    # deleting single modelfile if only a single modelfile was existing in hf repo
     # and deletion of single modelfile should happen in the end if delete_original=True
-    if delete_original and single_modelfile != None:
+    if delete_original and single_modelfile is not None:
         to_delete = checkpoint_path / single_modelfile
         print(f"deleting original file: {to_delete}")
         remove_real_and_linked_file(to_delete)
@@ -451,12 +453,13 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
         local_weight_files = ('pytorch_model.bin.index.json', 'model.safetensors.index.json',
                               'model.safetensors', 'pytorch_model.bin')
         if any(os.path.exists(Path(model_local_path_or_repo_id) / f) for f in local_weight_files):
-            print(f"found local checkpoint...")
-            return Path(model_local_path_or_repo_id), split_and_save_layers(model_local_path_or_repo_id, layer_shards_saving_path,
-                                                                            layer_names=layer_names, delete_original=delete_original)
+            print("found local checkpoint...")
+            return Path(model_local_path_or_repo_id), split_and_save_layers(
+                model_local_path_or_repo_id, layer_shards_saving_path,
+                layer_names=layer_names, delete_original=delete_original)
         else:
-            print(
-                f"Found local directory in {model_local_path_or_repo_id}, but didn't find downloaded model. Try using {model_local_path_or_repo_id} as a HF repo...")
+            print(f"Found local directory in {model_local_path_or_repo_id}, but didn't find a "
+                  f"downloaded model. Try using {model_local_path_or_repo_id} as a HF repo...")
 
     # it should be a repo id at this point...
     # First grab everything except the (potentially huge) weight files. For multi-shard models the
@@ -474,26 +477,9 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
             model_local_path_or_repo_id, token=hf_token,
             allow_patterns=['model.safetensors', 'pytorch_model.bin'])
 
-
-    # check if there's safetensors saved, if so, exclude torch saves
-    # delay download now...
-    '''
-    hf_cache_path = huggingface_hub.snapshot_download(model_local_path_or_repo_id, token=hf_token, allow_patterns="model.safetensors.index.json")
-    if len(glob(str(Path(hf_cache_path) / "model.safetensors.index.json"))) > 0:
-        # there's safe tensor version, exclude torch version
-        hf_cache_path = huggingface_hub.snapshot_download(model_local_path_or_repo_id, token=hf_token,
-                                                          ignore_patterns=['pytorch_model.bin.index.json', '*.bin'])
-
-    else:
-        hf_cache_path = huggingface_hub.snapshot_download(model_local_path_or_repo_id,
-                                                          token=hf_token)
-    '''
-
-    #assert os.path.exists(Path(hf_cache_path) / 'pytorch_model.bin.index.json') or \
-    #       os.path.exists(Path(hf_cache_path) / 'model.safetensors.index.json'), \
-    #       f"{hf_cache_path}/pytorch_model.bin.index.json or {hf_cache_path}/model.safetensors.index.json should exists."
-
     # if splitted_model subdir exists under cache use it, otherwise split and save
     return Path(hf_cache_path), split_and_save_layers(hf_cache_path, layer_shards_saving_path,
                                                       layer_names=layer_names,
-                                                      delete_original=delete_original, repo_id=model_local_path_or_repo_id, hf_token=hf_token)
+                                                      delete_original=delete_original,
+                                                      repo_id=model_local_path_or_repo_id,
+                                                      hf_token=hf_token)

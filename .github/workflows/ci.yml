@@ -1,0 +1,215 @@
+name: CI
+
+# Everything here runs on a plain CPU runner with no accelerator of any kind, and that is a
+# property the suite has to keep rather than an accident of what GitHub provides. RocketLLM has no
+# reference machine and its contributors have wildly different ones, so a test that can only pass on
+# the maintainer's hardware is a test that tells contributors nothing about their own.
+#
+# What the emulated-hardware tests give up in fidelity they buy back in reach: tests/test_portability.py
+# describes devices that hold the whole model, half of it, one layer of it and none of it, and
+# devices with no pinned memory, no copy streams, no fused kernels and no bf16 -- none of which the
+# runner has, and all of which somebody's machine is.
+
+on:
+  push:
+  pull_request:
+
+# A branch only needs its newest run. Superseding an in-flight one keeps the queue short for
+# everyone else, and nothing here has a side effect worth finishing for.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  # Nothing in the suite may reach the network. Every checkpoint it needs is built in a temporary
+  # directory from a config written on the spot, so an attempt to download one is a bug that would
+  # otherwise show up as an intermittent failure on somebody's slow connection.
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Ruff only. The gate is on things that are wrong -- unused imports, undefined names,
+      # comparisons that do not do what they read as -- and deliberately not on formatting, because
+      # a reformatting rule turns every future diff into noise for no defect caught.
+      - name: Install ruff
+        run: python -m pip install --upgrade ruff
+
+      - name: Lint
+        run: ruff check .
+
+  test:
+    name: py${{ matrix.python-version }} / transformers ${{ matrix.transformers }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      # One cell failing must not hide the others: the whole point of the matrix is to find out
+      # WHICH combination broke, and fail-fast throws that information away.
+      fail-fast: false
+      matrix:
+        # The floor of requires-python through to the newest interpreter, against both ends of the
+        # transformers range pyproject.toml declares. transformers renames things between these
+        # versions -- torch_dtype to dtype, relocated cache symbols -- and the engine supports both
+        # spellings, which is only true for as long as something checks it.
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        transformers: ["minimum", "latest"]
+        include:
+          # 3.13 is paired only with a current transformers: the minimum this project supports
+          # predates 3.13 and pinning it there would be testing pip's resolver, not RocketLLM.
+          - python-version: "3.13"
+            transformers: "latest"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The CPU wheel explicitly, and before anything else. PyPI's default torch on Linux is the
+      # CUDA build: gigabytes of kernels for a device this runner does not have, downloaded on every
+      # cell of the matrix. Installing it first also means the editable install below finds torch
+      # already satisfied and leaves it alone.
+      - name: Install PyTorch (CPU build)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install RocketLLM and its test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Pin transformers to the declared minimum
+        if: matrix.transformers == 'minimum'
+        run: python -m pip install "transformers==4.49.*"
+
+      - name: Report the environment under test
+        run: |
+          python -c "import sys, torch, transformers; print('python', sys.version)"
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+          python -c "import transformers; print('transformers', transformers.__version__)"
+
+      # The bulk of the suite. Each area below runs with every probe mocked, so what is being
+      # checked is the decision the engine makes on a machine, not the machine it happens to be on:
+      #
+      #   test_cache_policy.py     the FIFO-plus-pinning dense policy and the LFU expert policy
+      #   test_vram_budget.py      budget arithmetic, hysteresis, and the allocator accounting
+      #   test_hw_profile.py       every derived knob, over four mocked machines
+      #   test_hw_caps.py          capability gating, per mocked backend, with every fallback taken
+      #   test_quant_registry.py   the format-agnostic PackedWeight interface and format detection
+      #   test_moe_detect.py       structural expert-layout detection, module-list and fused
+      #   test_kv_cache.py         int4 KV quantize/dequantize round trips and the residual window
+      #   test_toolcalls.py        every family's raw tool-call syntax, streaming and buffered
+      #   test_server.py           the OpenAI-compatible schemas and the request path
+      #   test_doctor.py           the diagnosis a bug report is asked to paste
+      #   test_optional_imports.py the package importing with every optional dependency absent
+      - name: Unit suite (no accelerator)
+        run: |
+          pytest tests/ -q \
+            --ignore=tests/test_cpu_generation.py \
+            --ignore=tests/test_portability.py
+
+      # The correctness gate, in the form a runner without a GPU can answer: streamed generation
+      # against a full load of the same weights, token for token. A fast engine that produces the
+      # wrong tokens is worth nothing, so this is the one result that is never negotiable.
+      - name: End-to-end generation on the CPU backend
+        run: pytest tests/test_cpu_generation.py -q
+
+      # Devices this runner is not: one that holds the whole model, one that holds half, one with
+      # room for a single layer, one whose pin budget works out to zero, and devices missing pinned
+      # memory, copy streams, fused kernels and bf16.
+      - name: Portability matrix (emulated hardware)
+        run: pytest tests/test_portability.py -q
+
+      # The command a bug reporter is asked to run has to work on the machine they are reporting
+      # from, which is frequently one with no accelerator at all.
+      - name: rocketllm doctor
+        run: rocketllm doctor --device cpu --storage-budget-seconds 1 --model-size 70B --weight-bits 4
+
+  bare-install:
+    # The same import check the suite simulates, done for real: only the base dependencies are
+    # installed here, so nothing is being hidden by a meta-path hook and the absences are genuine.
+    # This is the install a first-time user gets, and `import rocketllm` ending in a traceback about
+    # a package they never asked for is the worst first impression this project can make.
+    name: bare install (no optional dependencies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install PyTorch (CPU build)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install RocketLLM with no extras at all
+        run: python -m pip install -e .
+
+      - name: Confirm nothing optional got pulled in
+        run: |
+          python - <<'PY'
+          import importlib.util, sys
+          optional = ["fastapi", "uvicorn", "pydantic", "bitsandbytes", "compressed_tensors",
+                      "triton", "mlx", "gptqmodel", "awq_ext", "exllamav2", "marlin_kernels",
+                      "hqq", "optimum"]
+          present = [name for name in optional if importlib.util.find_spec(name) is not None]
+          if present:
+              sys.exit(f"a base install pulled in optional packages, so this job proves nothing "
+                       f"about their absence: {present}")
+          print("no optional package is installed")
+          PY
+
+      - name: Import the package
+        run: |
+          python -c "import rocketllm; print('imported', rocketllm.AutoModel)" 2> import.log
+          cat import.log
+          if grep -q "Traceback" import.log; then
+            echo "::error::importing rocketllm printed a traceback on a base install"
+            exit 1
+          fi
+
+      - name: Commands that must work without any extra
+        run: |
+          rocketllm profile --device cpu --storage-budget-seconds 1 > /dev/null
+          rocketllm doctor --device cpu --storage-budget-seconds 1 > /dev/null
+
+      - name: Commands that must fail with a message rather than a traceback
+        run: |
+          set +e
+          rocketllm serve --model nonexistent > serve.log 2>&1
+          code=$?
+          set -e
+          cat serve.log
+          if [ "$code" -eq 0 ]; then
+            echo "::error::rocketllm serve succeeded without the server extra installed"
+            exit 1
+          fi
+          if grep -q "Traceback" serve.log; then
+            echo "::error::rocketllm serve printed a traceback instead of naming the extra"
+            exit 1
+          fi
+          grep -q "rocketllm\[server\]" serve.log || {
+            echo "::error::the message does not say what to install"
+            exit 1
+          }
+
+      - name: The optional-dependency suite, against real absences
+        run: |
+          python -m pip install pytest
+          pytest tests/test_optional_imports.py -q

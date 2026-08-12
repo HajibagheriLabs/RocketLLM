@@ -25,7 +25,7 @@ import unittest
 
 from rocketllm.memory import CLASS_ROUTED, CLASS_SHARED, TieredWeightCache, expert_kind
 from rocketllm.memory.placement import plan_pins
-from rocketllm.moe.expert_cache import (ExpertResidency, ExpertStats, _gini, is_shared,
+from rocketllm.moe.expert_cache import (ExpertResidency, _gini, is_shared,
                                         shared_kind)
 
 MB = 1024 * 1024

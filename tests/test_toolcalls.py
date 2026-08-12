@@ -21,8 +21,7 @@ import json
 import unittest
 
 from rocketllm.server.protocol import ChatMessage
-from rocketllm.server.toolcalls import (FAMILIES, ContentDelta, GenericParser, HermesParser,
-                                        PARSERS, ToolCallDelta, ToolCallStream, render_message,
+from rocketllm.server.toolcalls import (FAMILIES, ContentDelta, PARSERS, ToolCallDelta, ToolCallStream, render_message,
                                         resolve_tools, select_parser)
 
 # ---- captured raw output ---------------------------------------------------------------------

@@ -18,7 +18,7 @@ from safetensors.torch import save_file
 
 from rocketllm.hw.caps import CpuCaps
 from rocketllm.streaming.loader import ALIGNMENT, LayerLoader, torch_dtype_of
-from rocketllm.streaming.staging import BufferLease, HostStagingPool
+from rocketllm.streaming.staging import HostStagingPool
 from rocketllm.streaming.transfer import TransferHandle, WeightTransfer
 
 MB = 1024 ** 2

@@ -57,6 +57,7 @@ server = [
 # httpx drives the server tests through the ASGI transport, with no socket and no accelerator.
 dev = [
     "pytest",
+    "ruff",
     "fastapi>=0.110",
     "uvicorn>=0.27",
     "pydantic>=2.5",
@@ -77,3 +78,27 @@ include = ["rocketllm*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Lint is a gate on things that are wrong rather than a house style: unused imports, undefined
+# names, comparisons that do not do what they read as. Formatting opinions stay out of it, because
+# a reformatting rule turns every future diff into noise for no defect caught.
+[tool.ruff]
+line-length = 120
+# Notebooks are documentation that happens to be executable; they are written for readability in a
+# browser and linting them would only ever produce style complaints about example code.
+# tokenization_baichuan.py is vendored third-party source carrying its own copyright headers, which
+# Apache 2.0 4(c) requires us to keep verbatim -- it is not ours to restructure for a lint rule.
+extend-exclude = ["venv", "*.ipynb", "rocketllm/tokenization_baichuan.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# A package __init__ exists to re-export, and a re-export is an import that nothing in the file uses.
+"rocketllm/__init__.py" = ["F401"]
+"rocketllm/*/__init__.py" = ["F401"]
+# Scripts run from a checkout put the repo root on sys.path before importing the package, which by
+# construction is an import that cannot be at the top of the file.
+"tests/bench_streaming.py" = ["E402"]
+"tests/test_kimi_k3_split.py" = ["E402"]
+"tests/make_moe_fixture.py" = ["E402"]

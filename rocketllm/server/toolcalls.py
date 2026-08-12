@@ -30,7 +30,7 @@ Adding a family is a subclass and a registry entry -- see :class:`ToolCallParser
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 # ---- what comes out ----------------------------------------------------------------------------

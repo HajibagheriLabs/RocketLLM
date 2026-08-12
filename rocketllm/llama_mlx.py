@@ -1,21 +1,15 @@
 
-import argparse
-import json
-import time
 import gc
 from tqdm import tqdm
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from sentencepiece import SentencePieceProcessor
 from .persist import ModelPersister
 import psutil
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel, GenerationMixin, LlamaForCausalLM, GenerationConfig
-from .utils import clean_memory, load_layer, \
-    find_or_create_local_splitted_path, reject_compression_argument
+from transformers import AutoConfig, AutoTokenizer
+from .utils import find_or_create_local_splitted_path, reject_compression_argument
 
 
 
@@ -205,7 +199,8 @@ class RocketLlamaMlx:
         consumed = self.initial_available - available
         max_consumed = self.initial_available - self.least_available
 
-        print(f"[{msg}] - available mem: {available:.02f}mb, consumed: {consumed:.02f}mb, least available:{available:.02f}mb, max consumed: {max_consumed:.02f}mb")
+        print(f"[{msg}] - available mem: {available:.02f}mb, consumed: {consumed:.02f}mb, "
+              f"least available:{available:.02f}mb, max consumed: {max_consumed:.02f}mb")
 
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
@@ -265,7 +260,7 @@ class RocketLlamaMlx:
 
     def model_generate(self, x, temperature=0, max_new_tokens=None):
         cache = []
-        TEST_NO_LAYERED = True
+        persister = ModelPersister.get_model_persister()
 
         # Make an additive causal mask. We will need that to process the prompt.
         mask = nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1])
@@ -279,7 +274,7 @@ class RocketLlamaMlx:
         mask = mask.astype(self.tok_embeddings.weight.dtype)
 
         self.record_memory('before_loading_tok')
-        update_weights = ModelPersister.get_model_persister().load_model(self.layer_names_dict['embed'], self.checkpoint_path)
+        update_weights = persister.load_model(self.layer_names_dict['embed'], self.checkpoint_path)
 
         self.record_memory('after_loading_tok')
         self.tok_embeddings.update(update_weights['tok_embeddings'])
@@ -304,29 +299,29 @@ class RocketLlamaMlx:
 
         for il in tqdm(range(self.model_args.n_layers), desc='running layers'):
             self.record_memory(f'before layer {il}')
-            l = TransformerBlock(args=self.model_args)
-            l.update(
-                ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{il}',
-                                                                     self.checkpoint_path)['layers'][il]
+            block = TransformerBlock(args=self.model_args)
+            block.update(
+                persister.load_model(f'{self.layer_names_dict["layer_prefix"]}.{il}',
+                                     self.checkpoint_path)['layers'][il]
             )
 
-            x, c = l(x, mask=mask)
+            x, c = block(x, mask=mask)
             # force execution
             mx.eval(x)
             # We store the per layer cache in a simple python list
             cache.append(c)
 
             if not self.test_nonlayered:
-                del l
+                del block
                 gc.collect()
             else:
-                self.layers.append(l)
+                self.layers.append(block)
             self.record_memory(f'after layer {il}')
 
         self.record_memory('before_norm')
         self.norm = RMSNorm(self.model_args.dim, eps=self.model_args.norm_eps)
         self.norm.update(
-            ModelPersister.get_model_persister().load_model(self.layer_names_dict['norm'], self.checkpoint_path)['norm']
+            persister.load_model(self.layer_names_dict['norm'], self.checkpoint_path)['norm']
         )
         x = self.norm(x)
         # force execution
@@ -340,7 +335,7 @@ class RocketLlamaMlx:
         self.record_memory('before_lmhead')
         self.output = nn.Linear(self.model_args.dim, self.model_args.vocab_size, bias=False)
         self.output.update(
-            ModelPersister.get_model_persister().load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output']
+            persister.load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output']
         )
         y = self.output(x[:, -1])
         # force execution
@@ -375,7 +370,8 @@ class RocketLlamaMlx:
                 self.tok_embeddings = nn.Embedding(self.model_args.vocab_size, self.model_args.dim)
                 #w0 = self.tok_embeddings.weight[0][0]
                 self.tok_embeddings.update(
-                    ModelPersister.get_model_persister().load_model(self.layer_names_dict['embed'], self.checkpoint_path)['tok_embeddings'])
+                    persister.load_model(self.layer_names_dict['embed'],
+                                         self.checkpoint_path)['tok_embeddings'])
                 #w1 = self.tok_embeddings.weight[0][0]
 
                 #assert w0 != w1, f"weight should change after updates."
@@ -395,24 +391,27 @@ class RocketLlamaMlx:
                 # old cache the moment it is not needed anymore.
 
                 if not self.test_nonlayered:
-                    l = TransformerBlock(args=self.model_args)
-                    l.update(ModelPersister.get_model_persister().load_model(f'{self.layer_names_dict["layer_prefix"]}.{i}',
-                                                                             self.checkpoint_path)['layers'][i])
+                    block = TransformerBlock(args=self.model_args)
+                    block.update(
+                        persister.load_model(f'{self.layer_names_dict["layer_prefix"]}.{i}',
+                                             self.checkpoint_path)['layers'][i])
                 else:
-                    l = self.layers[i]
+                    block = self.layers[i]
 
-                x, cache[i] = l(x, mask=None, cache=cache[i])
+                x, cache[i] = block(x, mask=None, cache=cache[i])
                 # force execution
                 mx.eval(x)
                 if not self.test_nonlayered:
-                    del l
+                    del block
                     gc.collect()
                 self.record_memory(f'after layer {il}')
 
             self.record_memory('before_norm')
             if not self.test_nonlayered:
                 self.norm = RMSNorm(self.model_args.dim, eps=self.model_args.norm_eps)
-                self.norm.update(ModelPersister.get_model_persister().load_model(self.layer_names_dict['norm'], self.checkpoint_path)['norm'])
+                self.norm.update(
+                    persister.load_model(self.layer_names_dict['norm'],
+                                         self.checkpoint_path)['norm'])
             x = self.norm(x)
             # force execution
             mx.eval(x)
@@ -425,7 +424,9 @@ class RocketLlamaMlx:
 
             if not self.test_nonlayered:
                 self.output = nn.Linear(self.model_args.dim, self.model_args.vocab_size, bias=False)
-                self.output.update(ModelPersister.get_model_persister().load_model(self.layer_names_dict['lm_head'], self.checkpoint_path)['output'])
+                self.output.update(
+                    persister.load_model(self.layer_names_dict['lm_head'],
+                                         self.checkpoint_path)['output'])
             y = sample(self.output(x[:, -1]))
 
             # force execution

@@ -27,7 +27,9 @@ that the experts are loaded one at a time and never all resident together.
 
 Runs on CPU by default. Set ROCKETLLM_TEST_DEVICE to exercise an accelerator's transfer path.
 """
+import contextlib
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +44,12 @@ from rocketllm.base import RocketModel
 from rocketllm.memory import is_expert
 from rocketllm.moe.detect import LAYOUT_FUSED, LAYOUT_MODULE_LIST
 from rocketllm.moe.expert_cache import is_shared
+
+# The emulated-hardware helpers live with the portability matrix; residency is only observable on
+# a device with a budget, which the CPU backend legitimately does not have.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_portability import GB, EmulatedDevice, emulate  # noqa: E402
 
 PROMPT = torch.tensor([[1, 5, 9, 14, 3]])
 ONE_TOKEN = torch.tensor([[7]])
@@ -246,6 +254,25 @@ class StreamingCase(unittest.TestCase):
     def stream(self):
         return StreamedModel(str(self.root), device=DEVICE, dtype=torch.float32)
 
+    @contextlib.contextmanager
+    def stream_with_room(self):
+        """Stream on an emulated device with memory to spare, whatever this machine really has.
+
+        Residency is only observable on a device with a budget, and on the CPU backend the derived
+        budget is legitimately zero -- there is no separate device pool to hold anything in. A test
+        of what the cache KEEPS therefore has nothing to look at here and used to skip, which meant
+        the mixture's whole reason for having a residency policy went unchecked on every CI run.
+        Describing a roomier machine costs nothing and puts the assertion back.
+        """
+        device = EmulatedDevice("mixture residency", usable_bytes=1 * GB, window_fraction=0.25,
+                                host_cache_bytes=1 * GB)
+        with emulate(device):
+            model = self.stream()
+            try:
+                yield model
+            finally:
+                model.close()
+
     def assert_identical(self, model, ids, expected):
         with torch.no_grad():
             got = model(ids.to(DEVICE)).logits
@@ -315,20 +342,15 @@ class TestModuleListStreaming(StreamingCase):
         Without it a mixture re-reads every expert it touches on every token, which is worse than
         the whole-layer streaming it replaced, because that at least kept the layer resident.
         """
-        model = self.stream()
-        try:
+        with self.stream_with_room() as model:
             with torch.no_grad():
                 model(ONE_TOKEN.to(DEVICE))
-            if model.cache.device.capacity <= 0:
-                # Pure streaming: nothing is kept, by design, and re-reading is then correct.
-                self.skipTest("device budget computes to zero, so the cache keeps nothing")
+            self.assertGreater(model.cache.device.capacity, 0)
             before = model.cache.report()["fetches"]
             with torch.no_grad():
                 model(ONE_TOKEN.to(DEVICE))
             self.assertEqual(model.cache.report()["fetches"], before,
                              "the second token re-read weights the cache already held")
-        finally:
-            model.close()
 
     def test_reset_gives_the_experts_back(self):
         """Residency is bounded by the generation: reset() has to release experts like anything else."""
