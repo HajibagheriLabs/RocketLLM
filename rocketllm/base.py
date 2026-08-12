@@ -98,7 +98,7 @@ class RocketModel:
                                  'norm': 'model.norm',
                                  'lm_head': 'lm_head'}
 
-    def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
+    def __init__(self, model_local_path_or_repo_id, device=None, dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
                  vram_reserve=None, host_cache_gb=None, io_workers=None, window_max=None,
@@ -110,13 +110,18 @@ class RocketModel:
         model_local_path_or_repo_id : str or Path
             path to the local model checkpoint or huggingface repo id
         device : str, optional
-            device, by default "cuda:0"
+            backend to run on, e.g. "cuda:0", "mps", "cpu". Default: whatever this machine
+            actually has, queried at startup like every other hardware fact here. It used to
+            default to "cuda:0", which meant a machine without an NVIDIA card crashed in the
+            constructor rather than running slower on the backend it does have.
         dtype : torch.dtype, optional
             runtime dtype; defaults to the model's own config.torch_dtype (usually bfloat16 for
             modern models). float16 has too narrow a range for very deep models and overflows to
             inf/NaN, which silently corrupts the output, so we don't force it.
         max_seq_len : int, optional
-            max seq length, by default 512
+            sequence length the streaming engine is set up for, by default 512. A property of the
+            model and the workload rather than of the machine: how much context actually fits is
+            the KV cache's decision, made against the measured device budget.
         layer_shards_saving_path : str, optional
             optional path to save the splitted shards, by default next to the model cache
         profiling_mode : bool, optional
@@ -214,8 +219,11 @@ class RocketModel:
             hf_token=hf_token,
             delete_original=delete_original)
 
-        self.running_device = device
-        self.device = torch.device(self.running_device)
+        # Queried, not assumed. `device=None` means "the fastest backend this machine actually
+        # has", resolved the same way every other hardware fact here is, so constructing a model
+        # on a box with no accelerator is a slower run rather than a crash.
+        self.device = caps.resolve_device(device)
+        self.running_device = str(self.device)
 
         # Prefer transformers' native implementation; only trust the model's bundled remote code when
         # transformers doesn't recognize the architecture. Vendored remote code is frequently pinned

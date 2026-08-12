@@ -87,7 +87,7 @@ inputs = model.tokenizer(["The capital of France is"],
                          return_tensors="pt",
                          return_attention_mask=False)
 
-out = model.generate(inputs["input_ids"].cuda(),
+out = model.generate(inputs["input_ids"].to(model.device),
                      max_new_tokens=20,
                      use_cache=True,
                      return_dict_in_generate=True)
@@ -100,7 +100,89 @@ generic `RocketModel`; a handful of custom-architecture families (ChatGLM, QWen,
 Kimi K3) have dedicated subclasses that only override module naming. On first use the checkpoint is
 split into per-layer shards next to the model cache; subsequent runs reuse them.
 
+`model.device` is the backend RocketLLM resolved for itself — use it rather than `.cuda()`, so the
+same script runs on whatever the machine turns out to have.
+
 More examples, including Llama 3.1 405B and the Apple Silicon path, are in [`examples/`](examples/).
+
+## Configuration
+
+Every option below defaults to `None` or `"auto"`, and every one of those defaults means **the value
+`HardwareProfile` measured on this machine**. That is the setting you want. These exist to reproduce
+a problem or bisect a measurement you suspect, not to tune a healthy run — a number that is right on
+the box it was chosen on is wrong on the next one.
+
+Run `rocketllm profile` to see what each one currently derives to, and the formula and inputs that
+produced it. Anything you override is printed back marked `[OVERRIDDEN]`.
+
+### `AutoModel.from_pretrained(...)` / `RocketModel(...)`
+
+Model and checkpoint handling:
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `model_local_path_or_repo_id` | *required* | Local checkpoint path or Hugging Face repo id. |
+| `device` | **profile** — the fastest backend actually present | Backend to run on, e.g. `"cuda:0"`, `"mps"`, `"cpu"`. Queried, never assumed, so a machine with no accelerator runs slower rather than failing. |
+| `dtype` | **profile** — the checkpoint's own dtype, degraded to what the device supports | Compute dtype. A checkpoint asking for bf16 on a device without bf16 becomes fp16 with a loud warning rather than being honoured as written. |
+| `max_seq_len` | `512` | Sequence length the streaming engine is set up for. A model property, not a hardware one. |
+| `layer_shards_saving_path` | `None` — beside the model cache | Where the per-layer shards are written. |
+| `hf_token` | `None` | Hugging Face token, for gated repos. |
+| `delete_original` | `False` | Delete the downloaded checkpoint once it has been split. Saves disk on very large models. |
+| `prefetching` | `True` | Overlap the next layers' reads with the current layer's compute. |
+| `profiling_mode` | `False` | Record per-phase timings. |
+| `compression` | *removed* | Raises. RocketLLM imports pre-quantized checkpoints and does not quantize models itself; the error names the formats it reads. |
+
+Tuning overrides — every default is a measurement:
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `vram_reserve` | **profile** `reserve_bytes` | Device memory held back for activations, workspace and fragmentation. Derived from the allocator's *measured* fragmentation ratio and workspace high-water mark, not from a round number. |
+| `host_cache_gb` | **profile** `host_cache_bytes` | Host RAM the cache may hold as its middle tier. A share of *available* RAM after OS headroom. Zero is valid and means evictions drop straight to storage. |
+| `io_workers` | **profile** `io_workers` | Concurrent storage readers. The concurrency that was measured to saturate *this* machine's storage — one reader is latency-bound below a fast drive's rated bandwidth, too many thrash a slow one. |
+| `window_max` | **profile** `window_budget_bytes` ÷ largest layer | Hard cap on decoder layers held in the prefetch window. Floored at one, because a cache that cannot hold a single layer cannot run a forward pass. |
+| `pin_policy` | `"auto"` | `auto` fills the pin budget by bytes-saved-per-resident-byte; `off` pins nothing and streams everything. `off` is what a device with no spare memory gets anyway. |
+| `expert_residency` | `"auto"` | `auto` counts how often each MoE expert is routed to and keeps the popular ones resident; `off` disables it. Exists so the policy can be measured against its own absence. |
+| `kv_cache` | `"auto"` | `auto` keeps the context in the compute dtype when the weights fit resident with headroom, and quantizes to int4 when they do not — only in the second case is a byte of context a byte of weights re-read next token. `fp16` and `int4` force it; `hqq` and `quanto` delegate to transformers' own quantized caches. Independent of the weight format, always. |
+| `draft_model` | `None` | A small model sharing this one's tokenizer, kept resident to propose tokens for speculative decoding. Vocabulary and tokenizer are checked at load and a mismatch is refused, because it produces plausible wrong output rather than an error. Nothing happens without one. |
+| `speculative` | `"auto"` | `auto` follows the profile's measured recommendation: speculation pays when a streaming pass costs far more than device memory does, and costs residency when it does not. `on` and `off` force it. `auto` never enables it against the measurement, and never on a machine whose bandwidths could not be measured at all. |
+
+### `rocketllm serve`
+
+Takes every tuning override above as a flag, with the same profile-derived defaults, plus:
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--model` | *required* | Local path or repo id to serve. |
+| `--host` | `127.0.0.1` | Interface to bind. This machine only; pass `0.0.0.0` to accept connections from the network. |
+| `--port` | `8000` | Port to bind. |
+| `--served-model-name` | the model directory's name | The id reported by `/v1/models` and echoed in responses. A downloaded checkpoint lives under a commit hash, and answering as that helps no one. |
+| `--max-tokens` | `None` | Server-wide ceiling on one reply. Default: a request may use whatever is left of the context. |
+| `--max-seq-len` | `512` | Sequence length the engine is set up for. |
+| `--log-level` | `info` | uvicorn log level. |
+| `--device` `--dtype` | **profile** | As above. |
+| `--vram-reserve` `--host-cache-gb` `--io-workers` `--window-max` | **profile** | As above. `--vram-reserve` accepts `2GB`, `512MB` or a plain byte count. |
+| `--pin-policy` `--expert-residency` `--kv-cache` `--draft-model` `--speculative` | `auto` | As above. |
+| `--prefix-cache` | `"auto"` | Reuse the KV cache of a prefix already seen instead of re-prefilling every turn. `auto` follows the measured recommendation — see below, it is off unless the weights fit resident. |
+| `--prefix-cache-gb` | **profile** `prefix_cache_bytes` | Host RAM the prefix cache may hold. Zero disables it. |
+| `--tool-parser` | detected from the chat template | Force the tool-call syntax to read out of replies. |
+| `--no-prefetching` | prefetching on | Disable overlapping the next layers' reads with the current compute. |
+| `--layer-shards-path` `--delete-original` `--hf-token` | as above | As above. |
+
+Every knob also takes an environment variable, which is the easiest way to set one for a run you did
+not launch yourself:
+
+```bash
+ROCKETLLM_RESERVE_BYTES=2147483648 rocketllm serve --model ...
+ROCKETLLM_HOST_CACHE_BYTES=0       rocketllm serve --model ...   # no host tier at all
+ROCKETLLM_IO_WORKERS=1             rocketllm serve --model ...
+```
+
+One environment variable is not a RocketLLM knob but matters as much as any of them. Set it before
+the first CUDA allocation; `rocketllm doctor` warns when it is missing:
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
 
 ## OpenAI-compatible server
 
@@ -117,8 +199,41 @@ curl http://127.0.0.1:8000/v1/chat/completions \
        "max_tokens": 40}'
 ```
 
-Add `"stream": true` for server-sent events, terminated by `data: [DONE]`. Any OpenAI client works
-by pointing its base URL at `http://127.0.0.1:8000/v1`.
+Add `"stream": true` for server-sent events, terminated by `data: [DONE]`.
+
+### Pointing a client at it
+
+Any OpenAI-compatible client works by setting the base URL. There is no authentication, so the API
+key is ignored — pass any non-empty string, because most clients refuse to start without one.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-used")
+
+reply = client.chat.completions.create(
+    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",   # or whatever --served-model-name reports
+    messages=[{"role": "user", "content": "Name three primary colours."}],
+    max_tokens=40,
+)
+print(reply.choices[0].message.content)
+```
+
+The same two settings work anywhere the convention is followed:
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+export OPENAI_API_KEY=not-used
+```
+
+`GET /v1/models` reports the id to use. If you did not pass `--served-model-name`, that is the model
+directory's name rather than the repo id you typed.
+
+Two behaviours worth knowing before you wire up a client. Requests are served **one at a time**, so a
+client with a short timeout and several parallel calls will time out waiting in the queue rather than
+failing outright — each response carries its position in `x-rocketllm-queue-position`. And the first
+request after startup pays for the first streaming pass over the weights, which on a storage-bound
+machine can be much longer than every request after it.
 
 | Endpoint | What it does |
 | --- | --- |
@@ -195,10 +310,9 @@ python tests/bench_streaming.py --model <model> --conversation 3
 replays a multi-turn conversation with reuse on and off and prints the measured prefill time of
 each turn.
 
-`rocketllm serve` takes the same tuning overrides as the Python API — `--vram-reserve`,
-`--host-cache-gb`, `--io-workers`, `--window-max`, `--pin-policy`, `--expert-residency`,
-`--kv-cache`, `--draft-model`, `--speculative`, `--prefix-cache` — and every one defaults to what
-`rocketllm profile` measured on your machine. Run `rocketllm serve --help` for the full list.
+Every `rocketllm serve` flag is listed under [Configuration](#configuration) above, and every one
+defaults to what `rocketllm profile` measured on your machine. `rocketllm serve --help` prints the
+same list with the current defaults filled in.
 
 ## Supported quantization formats
 
@@ -219,29 +333,95 @@ layer runs. That choice is made by capability query, not by format name.
 KV cache quantization is independent of the weight format: int4, per-channel for K and per-token for
 V, with an fp16 residual window over the most recent tokens.
 
-## Benchmarks
+## Performance expectations
 
-The headline number for RocketLLM is **bytes read per token, broken down by memory tier** — tokens
-per second on its own says more about the machine than about the engine.
+**RocketLLM cannot tell you how fast it will be on your machine, and neither can anyone else's
+numbers.** What it can tell you is which regime you are in, which is the thing that actually decides
+the answer.
 
-Results differ by orders of magnitude across hardware, so this table is meant to be filled in by
-community submissions rather than by one machine. The benchmark harness that produces a row lands
-with the streaming rework; until then the table stays empty rather than carrying numbers from a
-single box.
+Time per token is approximately
 
-| GPU | VRAM | Host RAM | Weight storage | Model | Quant | Bytes/token (VRAM / host / storage) | tok/s |
+```
+sum over tiers of:  (bytes that tier has to serve) / (that tier's measured bandwidth)
+```
+
+with the tiers, fastest to slowest: VRAM → host RAM across the link → NVMe → SATA SSD → spinning
+disk. Every quantity in that formula is measured on your hardware, and the spread between machines is
+orders of magnitude rather than percentages.
+
+What decides the regime is **how much of the model fits where**:
+
+- **Fits resident.** The weights sit on the device and are read at device memory bandwidth, which is
+  hundreds of GB/s. You are compute- and bandwidth-bound, and RocketLLM is doing almost nothing —
+  this is the case where a normal loader would have worked too.
+- **Fits in host RAM but not VRAM.** Every weight crosses the link once per token, at single-digit to
+  low-double-digit GB/s. Slower, entirely usable.
+- **Exceeds VRAM and host RAM.** Every weight is read from storage on every token. This is what
+  RocketLLM exists for, and it is bounded by your disk. On a fast NVMe that is seconds per token for
+  a large model; on a rotational disk it is far worse and no tuning recovers it.
+
+Speculative decoding, prefix caching and expert residency all attack the same thing: fewer bytes
+moved, or the same bytes served from a faster tier, or one streaming pass amortized over more tokens.
+None of them changes the tier you are bound by.
+
+### Two example measurements
+
+Clearly labelled as **examples from one machine, not as a promise or a specification**. They exist to
+show the size of the gap between regimes, and both were measured with `tests/bench_streaming.py` on
+the *same card and the same model* — the only difference is how much of the model was allowed to stay
+resident. Your machine will produce different numbers.
+
+Hardware profile for both rows: NVIDIA GeForce RTX 3090, 24GB VRAM, CC 8.6, 15.9GB host RAM,
+measured 776 GB/s device memory, 10.5 GB/s pinned host→device, 894 MB/s storage read.
+Model: TinyLlama-1.1B-Chat-v1.0, bf16, 16 new tokens. Profile fingerprint `51d86a604e6f4a5e`.
+
+| Regime | Bytes/token (device / host / storage) | Device cache hit rate | Decode | Peak VRAM |
+| --- | --- | --- | --- | --- |
+| Weights fit resident (default) | 128 B / 131 MB / 131 MB | 94% | 20.7 tok/s | 2.1 GB |
+| Cache squeezed to nothing, no host tier | 128 B / 2.20 GB / 2.20 GB | 0% | 0.94 tok/s | 219 MB |
+
+The same card, the same weights, and a **22× difference** — produced entirely by whether the engine
+was allowed to keep the model resident. That ratio is the whole point of the tiered cache, and it is
+also why a tok/s figure quoted without its hardware profile and its residency is meaningless.
+
+The second row was forced with `--vram-reserve 24696061952 --host-cache-gb 0`, which is how to
+emulate a machine much smaller than the one you have. To see where *your* machine would land before
+downloading anything:
+
+```bash
+rocketllm doctor --model-size 70B --weight-bits 4
+```
+
+That prints the projected per-token cost from your measured bandwidths, broken down by tier, with any
+tier it could not measure reported as unavailable rather than guessed.
+
+## Community benchmarks
+
+The headline number is **bytes read per token, broken down by memory tier** — tokens per second on
+its own says more about the machine than about the engine, and two machines with identical tok/s can
+be in completely different regimes.
+
+This table is for results from hardware the author does not own, which is most hardware. A slow
+result is as useful as a fast one, and one where something degraded unexpectedly is the most useful
+of all. See [docs/HARDWARE.md](docs/HARDWARE.md#contributing-a-result-from-your-machine) for how to
+produce a row.
+
+| Hardware profile | VRAM | Host RAM | Weight storage | Model | Quant | Bytes/token (device / host / storage) | Decode tok/s |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| RTX 3090, CC 8.6, `51d86a604e6f4a5e` | 24 GB | 15.9 GB | NVMe, 894 MB/s measured | TinyLlama-1.1B | bf16 | 128 B / 131 MB / 131 MB | 20.7 |
 | _awaiting community submissions_ | | | | | | | |
 
-## Roadmap
+The "hardware profile" column is not optional: it is the fingerprint `rocketllm doctor` prints, plus
+enough of the machine to read the row. A number without the machine it came from cannot be compared
+to anything.
 
-- Runtime hardware profiling that derives every tuning knob, with manual overrides.
-- Tiered weight cache: statically pinned layer subset plus a FIFO prefetch window for dense layers,
-  LFU-with-aging residency for MoE experts.
-- Coalesced storage reads into pooled host buffers, with a dedicated copy stream where one exists.
-- int4 KV cache.
-- Speculative decoding.
-- A portability matrix covering the four device tiers.
+## Documentation
+
+| Document | What is in it |
+| --- | --- |
+| [docs/HARDWARE.md](docs/HARDWARE.md) | Support tiers, what degrades on what and what it costs, how to read `rocketllm doctor`, how to contribute a benchmark result, how to test hardware you do not own. |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the streaming engine works: the hook model, the hardware profile and how every knob derives from it, the tiered cache and why dense layers are deliberately not LRU, the MoE expert paths, and the quantization interface. Enough to add a new quantization backend or a new device backend. |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to run the suite, what a change has to prove before it lands, and what to put in a bug report. |
 
 ## Credits
 

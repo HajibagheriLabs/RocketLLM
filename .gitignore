@@ -14,7 +14,7 @@ dist/
 .venv/
 venv/
 
-# Local working notes, not part of the published project
+# Local working notes, not part of the published project.
 PLAYBOOK.md
 
 # Split layer shards and downloaded checkpoints

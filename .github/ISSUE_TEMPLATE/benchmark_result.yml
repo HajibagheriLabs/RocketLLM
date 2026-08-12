@@ -1,0 +1,60 @@
+name: Benchmark result
+description: Report measured numbers from your hardware for the community table.
+labels: ["benchmark"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Results from hardware the author does not own are the most valuable contribution available.
+        A slow result is as useful as a fast one, and one where something degraded unexpectedly is
+        the most useful of all.
+
+        The headline number is **bytes read per token, broken down by memory tier** — tokens per
+        second on its own says more about the machine than about the engine.
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: rocketllm doctor output
+      description: |
+        ```
+        rocketllm doctor --model /path/to/the/model/you/benchmarked
+        ```
+        A number without the machine it came from cannot be compared to anything, which is why this
+        is required rather than optional.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: result
+    attributes:
+      label: Benchmark record
+      description: |
+        The JSON the harness wrote, or its contents:
+
+        ```
+        python tests/bench_streaming.py --model <model> --json
+        ```
+      render: json
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model and quantization
+      placeholder: "Qwen2.5-72B-Instruct, AWQ 4-bit"
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything unusual about the machine
+      description: |
+        An external or network drive, a laptop that thermally throttles, a card shared with a
+        display, an unusual driver. Also say here if `rocketllm doctor` warned about something you
+        think is wrong — that is a bug report and it is welcome.
+    validations:
+      required: false

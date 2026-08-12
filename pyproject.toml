@@ -69,9 +69,9 @@ dev = [
 rocketllm = "rocketllm.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/hadihajibagheri/rocketllm"
-Source = "https://github.com/hadihajibagheri/rocketllm"
-Issues = "https://github.com/hadihajibagheri/rocketllm/issues"
+Homepage = "https://github.com/HajibagheriLabs/rocketllm"
+Source = "https://github.com/HajibagheriLabs/rocketllm"
+Issues = "https://github.com/HajibagheriLabs/rocketllm/issues"
 
 [tool.setuptools.packages.find]
 include = ["rocketllm*"]

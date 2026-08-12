@@ -1,0 +1,91 @@
+name: Bug report
+description: Something produced the wrong output, crashed, or was unexpectedly slow.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        RocketLLM has no reference machine, so almost every question about a bug is a question about
+        the hardware it happened on. The `rocketllm doctor` output below is the single most useful
+        thing in this form — without it, "it is slow" and "the output is wrong" cannot be told apart
+        from a hardware limit, and only one of those is actionable.
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: rocketllm doctor output
+      description: |
+        Run this and paste the WHOLE output. It is designed to be pasted whole.
+
+        ```
+        rocketllm doctor --model /path/to/the/model/you/were/running
+        ```
+
+        If the model is not on this machine, `rocketllm doctor` on its own still helps.
+        If RocketLLM will not start at all, say so here instead and paste the error.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: |
+        The exact command or script, including the model. A minimal case helps enormously, but a
+        long one is far better than none.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: What kind of problem is it?
+      options:
+        - Wrong or corrupted output
+        - Crash or exception
+        - Unexpectedly slow
+        - Runs out of memory
+        - Model or checkpoint format not loading
+        - Server / OpenAI API behaviour
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Console output
+      description: |
+        The traceback if there was one. Otherwise the lines RocketLLM printed at load — the
+        `cache:` line, the `kv cache:` line, and any warnings — which say what it decided to do.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: install
+    attributes:
+      label: How did you install it?
+      placeholder: "pip install rocketllm / pip install -e . from a checkout at commit <sha>"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I pasted the full `rocketllm doctor` output above, not a summary of it.
+          required: true
+        - label: I read the warnings in that output and none of them already explains this.
+          required: false

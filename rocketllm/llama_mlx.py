@@ -202,7 +202,11 @@ class RocketLlamaMlx:
         print(f"[{msg}] - available mem: {available:.02f}mb, consumed: {consumed:.02f}mb, "
               f"least available:{available:.02f}mb, max consumed: {max_consumed:.02f}mb")
 
-    def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
+    # `device` is accepted and ignored: MLX runs on Apple Silicon's unified memory and there is no
+    # other device to place anything on. It stays in the signature because AutoModel dispatches
+    # here with whatever the caller passed, and it defaults to None rather than to a CUDA device --
+    # a default naming hardware this class can never run on was only ever going to mislead.
+    def __init__(self, model_local_path_or_repo_id, device=None, dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, test_nonlayered=False, show_memory_util=False,
                  delete_original=False):

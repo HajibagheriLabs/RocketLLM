@@ -429,12 +429,20 @@ def fused_4bit_kernels(device):
 
 
 def python_and_torch_versions():
+    """Software versions, recorded without recording where the machine keeps its files.
+
+    This dict is embedded in every cached profile, every benchmark record and every
+    ``rocketllm doctor --json`` a user pastes into a public issue. The full interpreter path is a
+    home directory, a username and often a working directory, none of which helps anyone debug a
+    streaming engine -- the interpreter's *name* distinguishes a venv from a system python, which
+    is the only part that was ever diagnostic.
+    """
     return {
         "python": platform.python_version(),
         "torch": torch.__version__,
         "platform": platform.platform(),
         "machine": platform.machine(),
-        "executable": sys.executable,
+        "executable": os.path.basename(sys.executable),
     }
 
 

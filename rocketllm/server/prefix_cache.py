@@ -458,6 +458,11 @@ class PrefixCache:
     docstring for why that is right here and wrong for the layer cache.
     """
 
+    # `block_size` is a floor for direct construction; `build()` passes the profile's
+    # `prefix_block_tokens`. It is a granularity in tokens -- how finely a partial prefix match can
+    # be reused -- so it is a property of the conversation, not of the machine. The two byte
+    # budgets default to zero rather than to a size, because a capacity nobody measured is not a
+    # capacity: zero disables the cache, which is the correct behaviour when nothing sized it.
     def __init__(self, block_size=256, capacity_bytes=0, spill_bytes=0, spill_dir=None,
                  seed=b"", enabled=True):
         self.block_size = max(1, int(block_size))
@@ -856,7 +861,14 @@ PREFIX_OFF = "off"
 PREFIX_CHOICES = (PREFIX_AUTO, PREFIX_ON, PREFIX_OFF)
 
 
-def resolve(setting, weight_bytes=None, device_bytes=None, headroom=0.15):
+#: Free room beyond the weights, as a share, before the device stops being the binding constraint.
+#: A dimensionless policy factor rather than a measurement -- it says how much slack counts as
+#: "fits comfortably", which means the same thing on any device. The engine passes the profile's
+#: `kv_fit_headroom_percent`; this is the floor for a direct call.
+_DEFAULT_FIT_HEADROOM = 0.15
+
+
+def resolve(setting, weight_bytes=None, device_bytes=None, headroom=_DEFAULT_FIT_HEADROOM):
     """Whether reusing a prefix is worth what it costs on THIS machine. Returns (enabled, why).
 
     This is regime-dependent, and in the opposite direction to the obvious guess.

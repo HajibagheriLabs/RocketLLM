@@ -857,6 +857,11 @@ def _context_length(model, tokenizer):
     declared = _int_or_none(getattr(tokenizer, "model_max_length", None))
     if declared and declared < 1_000_000:
         return declared
+    # Last resort, and a property of transformer checkpoints rather than of any machine: 2048 is
+    # the smallest window in common use, so a model whose config states nothing is assumed to have
+    # the shortest one rather than a longer one it might not support. Nothing about the hardware
+    # enters here -- how much context actually fits is the KV cache's decision, made against the
+    # measured device budget.
     return _int_or_none(getattr(model, "max_seq_len", None)) or 2048
 
 

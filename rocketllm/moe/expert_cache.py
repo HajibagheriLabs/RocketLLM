@@ -76,6 +76,11 @@ class ExpertStats:
     it reports is wider than any single token's.
     """
 
+    # The literal is a floor for direct construction, not a tuning choice: the engine passes the
+    # profile's `expert_aging_interval`, and this value only applies when something builds an
+    # ExpertStats without a profile to hand (a test, or a caller reading the counts on their own).
+    # It describes how fast popularity should decay, which is a property of the routing rather than
+    # of any machine, so no hardware measurement feeds it.
     def __init__(self, aging_interval=4096):
         self.aging_interval = max(1, int(aging_interval))
         self._records = {}
@@ -209,6 +214,9 @@ class ExpertResidency:
     rebuilds the pin plan from those counts and hands the result back to the cache.
     """
 
+    # Both intervals are floors for direct construction; the engine supplies the profile's
+    # `expert_aging_interval` and `expert_replan_interval`. Neither is a hardware quantity -- they
+    # are timescales in units of router firings, and they mean the same thing on any device.
     def __init__(self, cache=None, aging_interval=4096, replan_interval=512, enabled=True):
         self.cache = cache
         self.stats = ExpertStats(aging_interval=aging_interval)

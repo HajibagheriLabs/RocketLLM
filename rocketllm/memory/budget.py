@@ -173,6 +173,9 @@ class VramBudget:
     has really changed, so a cache built against it is not asked to reorganise over noise.
     """
 
+    # `history` is the length of the sample ring kept for `trace()`, i.e. how far back a bug report
+    # can see. It bounds a deque of small records and nothing else -- no hardware quantity feeds it
+    # and none is derived from it.
     def __init__(self, device=None, device_caps=None, profile=None, reserve_bytes=None,
                  hysteresis_bytes=None, hysteresis_samples=None, history=512, on_change=None,
                  configure_allocator_env=True, probe_allocator=True, hysteresis_ratio=None,

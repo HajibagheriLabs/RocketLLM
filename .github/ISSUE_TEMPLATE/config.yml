@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Hardware support, degradations, and how to read rocketllm doctor
+    url: https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/HARDWARE.md
+    about: Support tiers, what degrades on what, and what each fallback costs. Check here first — a slow run on a rotational disk or an fp16 fallback on a card without bf16 is documented behaviour rather than a bug.
+  - name: How the engine works
+    url: https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/ARCHITECTURE.md
+    about: The streaming model, the cache policies and why they are what they are, and how to add a quantization or device backend.

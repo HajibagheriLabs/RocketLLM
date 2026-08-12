@@ -20,6 +20,7 @@ probe working and the import broken, which is exactly the shape of a package tha
 The list of packages comes from the doctor's own inventory, so a new optional dependency is covered
 here the moment it is documented there, and cannot be added to one without the other.
 """
+import json
 import subprocess
 import sys
 import textwrap
@@ -202,6 +203,120 @@ class TestTheMessagesAreMessages(OptionalImportCase):
         keys = out.split("JSON KEYS", 1)[1].split("\\n", 1)[0].split()
         for expected in ("capabilities", "packages", "profile", "quant_formats", "storage"):
             self.assertIn(expected, keys)
+
+
+class TestEachDegradationNamesItsPackage(OptionalImportCase):
+    """Not just "it did not crash": the message has to say which package is missing.
+
+    A fallback that happens silently is nearly as bad as a crash. Someone whose 4-bit checkpoint is
+    being expanded into scratch on every layer, or whose KV cache quietly stopped being the backend
+    they asked for, has no way to discover that from the output -- the run is simply slower or
+    different, and there is nothing to search for. So each path below is taken with its package
+    genuinely unimportable, and the text that comes out must name the package.
+    """
+
+    def test_a_delegated_kv_backend_falls_back_and_names_the_package(self):
+        result = run_without_optionals("""
+            import logging
+            logging.basicConfig(level=logging.INFO)
+            from rocketllm.quant.kv_cache import KVCacheConfig, build_kv_cache
+            from rocketllm.quant.kv_cache import QuantizedKVCache
+            for choice, package in (("hqq", "hqq"), ("quanto", "optimum-quanto")):
+                cache = build_kv_cache(choice, KVCacheConfig(), device="cpu")
+                assert isinstance(cache, QuantizedKVCache), (choice, type(cache))
+                print("FELL BACK", choice, package)
+        """)
+        combined = self.assert_clean(result, "a delegated KV cache backend")
+        for choice, package in (("hqq", "hqq"), ("quanto", "optimum-quanto")):
+            self.assertIn(f"FELL BACK {choice}", combined)
+            self.assertIn(package, combined,
+                          f"the {choice} fallback did not name the package that would restore it")
+
+    def test_a_packed_checkpoint_that_cannot_be_decoded_says_what_to_install(self):
+        """The one place in the package that refuses outright. Nothing else can decode the payload,
+        so there is no slower-but-correct path -- which makes the message the whole of the fix."""
+        result = run_without_optionals("""
+            import torch
+            from rocketllm.quant.safetensors_quant import CompressedTensorsBackend
+
+            # The decode path only engages for a checkpoint that actually declared itself
+            # quantized, so it needs a quantizer and a model to be reached at all. Neither is
+            # touched before the refusal, so stubs are enough to get there.
+            backend = CompressedTensorsBackend(config={"quant_method": "compressed-tensors"},
+                                               hf_quantizer=object(), model=object())
+            try:
+                backend.prepare_layer({"model.layers.0.mlp.up_proj.weight_packed":
+                                       torch.zeros(4, 4, dtype=torch.uint8)})
+            except ImportError as exc:
+                print("REFUSED:", exc)
+            else:
+                raise SystemExit("a packed payload was accepted without its decoder installed")
+        """)
+        combined = result.stdout + result.stderr
+        self.assertIn("REFUSED:", combined, combined)
+        self.assertIn("compressed-tensors", combined)
+        self.assertIn("pip install", combined,
+                      "refusing without saying what to type is a dead end")
+
+    def test_no_fused_kernel_says_so_once_and_names_the_path_taken(self):
+        result = run_without_optionals("""
+            import logging
+            logging.basicConfig(level=logging.INFO)
+            from rocketllm.hw import caps
+            device = caps.get_caps("cpu", announce=False)
+            plan = device.fused_4bit_plan()
+            print("PATH", plan.path)
+            print("REASON", plan.reason)
+            print("TRITON", caps.has_triton())
+        """)
+        combined = self.assert_clean(result, "the fused 4-bit decision")
+        self.assertIn("PATH dequant_to_scratch", combined)
+        self.assertIn("scratch", combined.split("REASON", 1)[1],
+                      "the reason has to say what happens instead, not only that something is off")
+        self.assertIn("TRITON False", combined)
+
+    def test_the_mlx_backend_is_not_required_to_import_the_package(self):
+        """Apple Silicon is the one platform where this used to be an unguarded import, so
+        `import rocketllm` on a Mac without the mlx extra ended in a traceback."""
+        result = run_without_optionals("""
+            import rocketllm.auto_model as auto
+            auto.is_on_mac_os = True          # pretend to be Apple Silicon, without mlx installed
+            import warnings
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try:
+                    auto.AutoModel.from_pretrained("definitely-not-a-real-model")
+                except Exception as exc:
+                    # It must fail on the missing MODEL, never on the missing backend.
+                    print("FAILED ON:", type(exc).__name__)
+            print("WARNED:", " | ".join(str(w.message) for w in caught))
+        """)
+        combined = result.stdout + result.stderr
+        self.assertNotIn("Traceback (most recent call last)", combined, combined)
+        warned = combined.split("WARNED:", 1)[1]
+        self.assertIn("mlx", warned,
+                      "falling back off the MLX path has to name the extra that restores it")
+        self.assertIn("rocketllm[mlx]", warned)
+
+    def test_every_inventory_package_is_reported_missing_with_its_cost(self):
+        """The doctor is where a user actually discovers all of this, so it is checked as a whole."""
+        result = run_without_optionals("""
+            import io, json
+            from rocketllm.hw import doctor
+            buffer = io.StringIO()
+            collected = doctor.run(device="cpu", storage_budget_seconds=0.2, out=buffer)
+            missing = [p for p in collected["packages"] if not p["present"]]
+            print(json.dumps([[p["module"], p["without"]] for p in missing]))
+        """)
+        combined = self.assert_clean(result, "the doctor's package inventory")
+        payload = json.loads(combined[combined.index("[["):combined.rindex("]]") + 2])
+        reported = {module: without for module, without in payload}
+        for package in OPTIONAL_PACKAGES:
+            with self.subTest(module=package.module):
+                self.assertIn(package.module, reported,
+                              "a package the engine can use but did not report missing is one "
+                              "nobody will think to install")
+                self.assertTrue(reported[package.module].strip())
 
 
 class TestTheInventoryIsHonest(unittest.TestCase):

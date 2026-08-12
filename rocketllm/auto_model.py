@@ -1,14 +1,9 @@
 import importlib
+import warnings
 from transformers import AutoConfig
 from sys import platform
 
-is_on_mac_os = False
-
-if platform == "darwin":
-    is_on_mac_os = True
-
-if is_on_mac_os:
-    from rocketllm import RocketLlamaMlx
+is_on_mac_os = (platform == "darwin")
 
 # Architectures that need a dedicated RocketLLM subclass because of a non-standard module layout
 # (custom remote-code models). Everything else uses the generic RocketModel, which streams any
@@ -53,7 +48,18 @@ class AutoModel:
     def from_pretrained(cls, pretrained_model_name_or_path, *inputs, **kwargs):
 
         if is_on_mac_os:
-            return RocketLlamaMlx(pretrained_model_name_or_path, *inputs, **kwargs)
+            # The MLX backend is an optional extra, so its absence is a fallback rather than a
+            # failure: without it Apple Silicon still runs through the generic streaming path on
+            # the MPS backend, which is slower and produces the same tokens.
+            try:
+                from .llama_mlx import RocketLlamaMlx
+            except ImportError as exc:
+                warnings.warn(
+                    f"rocketllm: the Apple Silicon MLX backend is unavailable ({exc}). Falling "
+                    f"back to the generic streaming path on the MPS backend, which is slower. "
+                    f"Install it with: pip install 'rocketllm[mlx]'")
+            else:
+                return RocketLlamaMlx(pretrained_model_name_or_path, *inputs, **kwargs)
 
         module, class_name = AutoModel.get_module_class(pretrained_model_name_or_path, *inputs, **kwargs)
         module = importlib.import_module(module)
