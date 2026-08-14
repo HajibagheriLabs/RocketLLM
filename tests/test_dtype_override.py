@@ -29,6 +29,19 @@ PROMPT = torch.tensor([[1, 5, 9, 14, 3]])
 DEVICE = os.environ.get("ROCKETLLM_TEST_DEVICE", "cpu")
 
 
+def _temporary_directory_ignoring_cleanup_errors():
+    """A TemporaryDirectory that survives a file it cannot unlink, on every supported Python.
+
+    ``ignore_cleanup_errors`` arrived in 3.10 and this project supports 3.9, where passing it is a
+    TypeError. On 3.9 the flag is simply absent and cleanup failures surface as they always did --
+    which is why the ignoring exists rather than being the default: see the caller.
+    """
+    try:
+        return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    except TypeError:
+        return tempfile.TemporaryDirectory()
+
+
 class StreamedModel(RocketModel):
     """RocketModel without the tokenizer, which these checkpoints have no reason to ship."""
 
@@ -105,7 +118,7 @@ class DtypeCase(unittest.TestCase):
         # safetensors memory-maps what it reads, and Windows will not unlink a mapped file, so the
         # reference model holding one can outlive the attempt to remove the directory. Ignoring that
         # keeps a temp-directory detail from failing a test that has already passed.
-        cls._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls._tmp = _temporary_directory_ignoring_cleanup_errors()
         cls.root = Path(cls._tmp.name) / "model"
         cls.root.mkdir(parents=True)
         build(cls.root, cls.saved_dtype)
@@ -117,7 +130,13 @@ class DtypeCase(unittest.TestCase):
         gc.collect()
         tmp = getattr(cls, "_tmp", None)
         if tmp is not None:
-            tmp.cleanup()
+            try:
+                tmp.cleanup()
+            except OSError:
+                # Python 3.9 has no ignore_cleanup_errors, so the same mapped-file case it exists
+                # for is caught here instead. A temp directory the OS is still holding open is not
+                # a result: the assertions have already run.
+                pass
 
     def stream(self, dtype=None):
         """`dtype=False` means "pass nothing", which is different from passing the same value."""

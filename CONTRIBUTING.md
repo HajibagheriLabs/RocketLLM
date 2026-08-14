@@ -68,6 +68,9 @@ benchmark without its machine cannot be compared to anything.
 
 - **Correctness first.** Streaming changes *where* a weight is when the matmul reads it, never what
   the model computes. Streamed output is compared to a full load and must be identical, not close.
+  The one documented exception is the fused MoE layout, which allocates the tensor it binds instead
+  of handing over the checkpoint's own, so its GEMM may re-associate a sum by a ULP; it is held to a
+  few-ULP tolerance *and* to predicting the same token. Everything else is bit-exact.
 - **It works on hardware you do not have.** If a change touches a capability gate, a memory budget or
   a cache policy, add a case to `tests/test_portability.py`. Describing a machine costs nothing;
   waiting for someone with that machine to report a bug costs a release.

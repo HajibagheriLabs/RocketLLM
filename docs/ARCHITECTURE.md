@@ -370,13 +370,29 @@ Nothing in `caps.py` raises because an optional accelerator feature is absent.
 | Every gate decides and every fallback works, per backend | `tests/test_hw_caps.py` |
 | Format sizing in packed bytes; `needs_scratch` follows the device | `tests/test_quant_registry.py` |
 | Expert layout detected structurally, ambiguity resolves to "not a mixture" | `tests/test_moe_detect.py` |
-| Streamed logits identical to a full load, dense and MoE | `tests/test_moe_streaming.py` |
+| Streamed logits identical to a full load, dense and MoE (bit-exact, except the fused layout — see below) | `tests/test_moe_streaming.py` |
 | Streamed generation identical to a full load, on CPU | `tests/test_cpu_generation.py` |
 | Correct output and designed degradation across emulated devices | `tests/test_portability.py` |
 | The package imports with every optional dependency absent | `tests/test_optional_imports.py` |
 
 The gate that outranks all of them is `tests/test_streaming_gpu.py --compare`, which must report
 `MATCH`. A fast engine that produces the wrong tokens is worth nothing.
+
+### The one place "identical" means "to a few ULP"
+
+Every layout that hands the matmul the checkpoint's own tensors is held to bit-exact equality with a
+full load. The **fused MoE layout is the exception**, and it follows from the optimisation rather
+than from a defect: reading only the routed rows means the tensor bound to the module is *allocated
+by the engine* — full width, routed rows filled, the rest zeroed — rather than being the parameter
+the reference model uses. The two hold the same numbers and agree in exact arithmetic, but they are
+different allocations, and a CPU GEMM may choose a different kernel, and therefore a different
+summation order, for one than for the other.
+
+That surfaces as a last-place difference around 6e-08 — one ULP of float32 — on some CPUs and not
+others, which is what a reduction-order difference looks like. A genuinely wrong expert would be
+wrong by the size of a weight, not by rounding, so `TestFusedStreaming` asserts a few-ULP tolerance
+*and* that the predicted token is unchanged. Do not widen that tolerance to make a failure go away:
+at 1e-6 it still rejects an expert perturbed by 1%.
 
 ## transformers compatibility
 
