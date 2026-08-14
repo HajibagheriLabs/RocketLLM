@@ -4,7 +4,7 @@
 # them through the extras (`.[quant]`, `.[mlx]`) so a base install stays hardware-neutral.
 tqdm
 torch>=2.4
-transformers>=4.49,<5.13
+transformers>=4.49,<5.0
 accelerate>=1.0
 safetensors
 huggingface-hub

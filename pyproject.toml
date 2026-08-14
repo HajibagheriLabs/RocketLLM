@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# 77 is the floor for PEP 639: the SPDX `license` expression and `license-files` below are only
+# understood from that release on. An older setuptools either drops them or errors on the unknown
+# key, so the published metadata would silently lose its licence.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]

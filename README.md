@@ -51,7 +51,7 @@ rocketllm doctor --model /path/to/your/model
 That prints the hardware profile, every capability decision and the fallback taken for each, which
 optional packages are missing and what their absence costs, the measured read bandwidth of the
 filesystem your weights are on, and a projected per-token cost. It is also what to paste into a bug
-report. [docs/HARDWARE.md](docs/HARDWARE.md) explains the tiers, the degradations, how to read that
+report. [docs/HARDWARE.md](https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/HARDWARE.md) explains the tiers, the degradations, how to read that
 output, and how to contribute a benchmark result from your own hardware.
 
 ## Install
@@ -79,7 +79,7 @@ pulls in the Apple Silicon backend; `server` pulls in FastAPI, uvicorn and pydan
 **Supported versions.** Python 3.9–3.13, PyTorch >= 2.4, and `transformers >= 4.49, < 5.0`. CI runs
 both ends of that transformers range on every supported Python. transformers 5 is not supported yet:
 it renamed the expert containers this engine streams, so mixture-of-experts models read the wrong
-modules against it — [tracked as a follow-up](docs/ARCHITECTURE.md#transformers-compatibility).
+modules against it — [tracked as a follow-up](https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/ARCHITECTURE.md#transformers-compatibility).
 
 ## Quickstart
 
@@ -108,7 +108,7 @@ split into per-layer shards next to the model cache; subsequent runs reuse them.
 `model.device` is the backend RocketLLM resolved for itself — use it rather than `.cuda()`, so the
 same script runs on whatever the machine turns out to have.
 
-More examples, including Llama 3.1 405B and the Apple Silicon path, are in [`examples/`](examples/).
+More examples, including Llama 3.1 405B and the Apple Silicon path, are in [`examples/`](https://github.com/HajibagheriLabs/rocketllm/tree/main/examples/).
 
 ## Configuration
 
@@ -284,10 +284,10 @@ ordinary answer is quoting, not calling. `tool_choice` accepts `none` (tools wit
 nothing here constrains decoding, and the server says so rather than implying a guarantee.
 
 Adding a family takes a subclass of `ToolCallParser` in
-[toolcalls.py](rocketllm/server/toolcalls.py) and a line in its `PARSERS` registry — set the start
+[toolcalls.py](https://github.com/HajibagheriLabs/rocketllm/blob/main/rocketllm/server/toolcalls.py) and a line in its `PARSERS` registry — set the start
 markers, say how the template is recognised, and return where each call's JSON begins. Reading the
 name and streaming the arguments is shared. The tests pick up a new family automatically once it has
-a captured sample in the corpus at the top of [tests/test_toolcalls.py](tests/test_toolcalls.py).
+a captured sample in the corpus at the top of [tests/test_toolcalls.py](https://github.com/HajibagheriLabs/rocketllm/blob/main/tests/test_toolcalls.py).
 
 ### Prefix caching
 
@@ -408,7 +408,7 @@ be in completely different regimes.
 
 This table is for results from hardware the author does not own, which is most hardware. A slow
 result is as useful as a fast one, and one where something degraded unexpectedly is the most useful
-of all. See [docs/HARDWARE.md](docs/HARDWARE.md#contributing-a-result-from-your-machine) for how to
+of all. See [docs/HARDWARE.md](https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/HARDWARE.md#contributing-a-result-from-your-machine) for how to
 produce a row.
 
 | Hardware profile | VRAM | Host RAM | Weight storage | Model | Quant | Bytes/token (device / host / storage) | Decode tok/s |
@@ -424,9 +424,9 @@ to anything.
 
 | Document | What is in it |
 | --- | --- |
-| [docs/HARDWARE.md](docs/HARDWARE.md) | Support tiers, what degrades on what and what it costs, how to read `rocketllm doctor`, how to contribute a benchmark result, how to test hardware you do not own. |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the streaming engine works: the hook model, the hardware profile and how every knob derives from it, the tiered cache and why dense layers are deliberately not LRU, the MoE expert paths, and the quantization interface. Enough to add a new quantization backend or a new device backend. |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to run the suite, what a change has to prove before it lands, and what to put in a bug report. |
+| [docs/HARDWARE.md](https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/HARDWARE.md) | Support tiers, what degrades on what and what it costs, how to read `rocketllm doctor`, how to contribute a benchmark result, how to test hardware you do not own. |
+| [docs/ARCHITECTURE.md](https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/ARCHITECTURE.md) | How the streaming engine works: the hook model, the hardware profile and how every knob derives from it, the tiered cache and why dense layers are deliberately not LRU, the MoE expert paths, and the quantization interface. Enough to add a new quantization backend or a new device backend. |
+| [CONTRIBUTING.md](https://github.com/HajibagheriLabs/rocketllm/blob/main/CONTRIBUTING.md) | How to run the suite, what a change has to prove before it lands, and what to put in a bug report. |
 
 ## Credits
 
@@ -437,7 +437,7 @@ by AirLLM or its authors.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/HajibagheriLabs/rocketllm/blob/main/LICENSE).
 
-Attribution is binding: [NOTICE](NOTICE) must be retained and reproduced in any distribution or
+Attribution is binding: [NOTICE](https://github.com/HajibagheriLabs/rocketllm/blob/main/NOTICE) must be retained and reproduced in any distribution or
 derivative work, as required by Section 4(d) of the license.

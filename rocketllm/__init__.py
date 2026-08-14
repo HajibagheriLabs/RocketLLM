@@ -8,6 +8,16 @@ them, so a missing extra costs one model family or one backend, never the packag
 import warnings as _warnings
 from sys import platform
 
+# Read from the installed distribution rather than repeated here, so pyproject.toml stays the one
+# place a version is written. A source checkout that was never installed has no distribution to ask,
+# which is not an error worth raising at import time.
+try:
+    from importlib.metadata import PackageNotFoundError as _PackageNotFoundError, version as _version
+
+    __version__ = _version("rocketllm")
+except _PackageNotFoundError:  # running from a checkout with no install
+    __version__ = "0.0.0.dev0"
+
 # Core entry points. These have no optional dependencies beyond torch/transformers, so a plain
 # `import rocketllm` always works once the base install is in place -- on every platform.
 from .base import RocketModel
