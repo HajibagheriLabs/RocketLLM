@@ -118,21 +118,47 @@ jobs:
       #   test_optional_imports.py the package importing with every optional dependency absent
       - name: Unit suite (no accelerator)
         run: |
-          pytest tests/ -q \
+          set -o pipefail
+          pytest tests/ -q -rf \
             --ignore=tests/test_cpu_generation.py \
-            --ignore=tests/test_portability.py
+            --ignore=tests/test_portability.py 2>&1 | tee pytest-unit.log
 
       # The correctness gate, in the form a runner without a GPU can answer: streamed generation
       # against a full load of the same weights, token for token. A fast engine that produces the
       # wrong tokens is worth nothing, so this is the one result that is never negotiable.
       - name: End-to-end generation on the CPU backend
-        run: pytest tests/test_cpu_generation.py -q
+        run: |
+          set -o pipefail
+          pytest tests/test_cpu_generation.py -q -rf 2>&1 | tee pytest-generation.log
 
       # Devices this runner is not: one that holds the whole model, one that holds half, one with
       # room for a single layer, one whose pin budget works out to zero, and devices missing pinned
       # memory, copy streams, fused kernels and bf16.
       - name: Portability matrix (emulated hardware)
-        run: pytest tests/test_portability.py -q
+        run: |
+          set -o pipefail
+          pytest tests/test_portability.py -q -rf 2>&1 | tee pytest-portability.log
+
+      # Downloading a job's raw log needs admin rights on the repository, which a contributor
+      # looking at their own failed pull request does not have. Workflow annotations do not, so
+      # whatever failed is repeated as an annotation and is readable by anyone who can see the run.
+      # A red CI that will not say why is barely better than no CI.
+      - name: Report what failed
+        if: failure()
+        run: |
+          for log in pytest-unit.log pytest-generation.log pytest-portability.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log (tail)"
+            tail -n 40 "$log"
+            echo "::endgroup::"
+            grep -E "^(FAILED|ERROR) " "$log" | head -n 25 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            grep -E "^E  +[A-Za-z_.]*(Error|Exception):" "$log" | sort -u | head -n 10 \
+              | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          done
 
       # The command a bug reporter is asked to run has to work on the machine they are reporting
       # from, which is frequently one with no accelerator at all.
