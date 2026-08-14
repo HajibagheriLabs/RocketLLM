@@ -28,7 +28,11 @@ classifiers = [
 dependencies = [
     "tqdm",
     "torch>=2.4",
-    "transformers>=4.49,<5.13",
+    # The upper bound is where the engine has actually been run, not a guess. transformers 5
+    # renamed the expert containers this engine streams -- Mixtral's block_sparse_moe, Qwen2-MoE's
+    # per-expert ModuleList -- and MoE streaming reads the wrong modules against it. The whole 4.x
+    # range from the floor up is covered by CI, both ends of it, on every supported Python.
+    "transformers>=4.49,<5.0",
     "accelerate>=1.0",
     "safetensors",
     "huggingface-hub",

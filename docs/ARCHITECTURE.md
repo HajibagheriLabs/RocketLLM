@@ -378,6 +378,43 @@ Nothing in `caps.py` raises because an optional accelerator feature is absent.
 The gate that outranks all of them is `tests/test_streaming_gpu.py --compare`, which must report
 `MATCH`. A fast engine that produces the wrong tokens is worth nothing.
 
+## transformers compatibility
+
+RocketLLM lets `transformers` own the forward pass, which is what makes new architectures work
+without code changes here — and it means transformers' own refactors land directly on this engine.
+Supported range: **`>= 4.49, < 5.0`**, with both ends run in CI on every supported Python.
+
+Two of its changes are absorbed rather than pinned around:
+
+- **`torch_dtype` → `dtype`** on configs (4.56). Both spellings are written; see
+  `RocketModel._declare_runtime_dtype`.
+- **The Cache layout** (4.57). A cache stopped being two parallel lists (`key_cache` /
+  `value_cache`) and became a list of layer objects (`layers[i].keys` / `.values`), and
+  `Cache.__init__` stopped accepting no arguments. Everything that reaches into another cache's
+  storage goes through `cache_layer_count` / `cache_keys` / `cache_values` / `new_dynamic_cache`
+  in `rocketllm/quant/kv_cache.py`, and `QuantizedKVCache` initialises its base through
+  `_init_cache_base`. **Do not touch `key_cache` directly** — that is the one pattern that breaks
+  silently across the boundary. Our own cache keeps the flat lists internally on every version,
+  since it overrides every method transformers calls and one internal layout is easier to reason
+  about than two.
+
+  transformers also withdrew `QuantizedCacheConfig` and the HQQ/quanto cache classes in 4.57. Those
+  are a reference implementation to compare against, never a dependency, so their absence degrades
+  to the built-in int4 cache with a message.
+
+### What transformers 5 still needs
+
+Not supported, and the blocker is MoE rather than the cache. transformers 5 renamed the expert
+containers this engine streams: Mixtral's `block_sparse_moe` is gone, and Qwen2-MoE's per-expert
+`ModuleList` became a fused `Qwen2MoeExperts` module. Expert streaming reads the wrong modules
+against it, which costs correctness on mixtures and is why the pin exists.
+
+The port is mostly in `moe/detect.py`, and the detector is already structural — it decides from
+module shape and checkpoint tensor shape rather than from an architecture name — so the work is
+teaching it the new container shapes, not special-casing versions. Dense models are unaffected;
+the KV cache and prefix cache already work on 5.x. Anyone picking this up should start by running
+`pytest tests/test_moe_detect.py tests/test_moe_streaming.py` against transformers 5.
+
 ## Things that look like improvements and are not
 
 - **Unifying the dense and expert cache policies.** See above; it zeroes the dense hit rate.

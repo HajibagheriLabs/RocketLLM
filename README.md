@@ -76,6 +76,11 @@ pip install "rocketllm[quant]"
 pulls in the Apple Silicon backend; `server` pulls in FastAPI, uvicorn and pydantic for
 `rocketllm serve`. None is required for a base install.
 
+**Supported versions.** Python 3.9–3.13, PyTorch >= 2.4, and `transformers >= 4.49, < 5.0`. CI runs
+both ends of that transformers range on every supported Python. transformers 5 is not supported yet:
+it renamed the expert containers this engine streams, so mixture-of-experts models read the wrong
+modules against it — [tracked as a follow-up](docs/ARCHITECTURE.md#transformers-compatibility).
+
 ## Quickstart
 
 ```python

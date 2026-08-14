@@ -20,7 +20,8 @@ import unittest
 
 import torch
 
-from rocketllm.quant.kv_cache import KVCacheConfig, QuantizedKVCache
+from rocketllm.quant.kv_cache import (KVCacheConfig, QuantizedKVCache, cache_keys,
+                                      cache_layer_count, cache_values)
 from rocketllm.server import prefix_cache as pc
 
 VOCAB = 64
@@ -230,9 +231,12 @@ class TestTheFullPrecisionLayout(unittest.TestCase):
 
         restored = pc.restore(pc.capture(cache, pc._BlockStore()), pc._BlockStore(), "cpu")
         self.assertEqual(restored.get_seq_length(), 300)
+        # Through the accessors, because a stock DynamicCache stores its tensors differently
+        # either side of transformers 4.57 and this assertion is about the values, not the layout.
+        self.assertEqual(cache_layer_count(restored), LAYERS)
         for layer in range(LAYERS):
-            self.assertTrue(torch.equal(cache.key_cache[layer], restored.key_cache[layer]))
-            self.assertTrue(torch.equal(cache.value_cache[layer], restored.value_cache[layer]))
+            self.assertTrue(torch.equal(cache_keys(cache, layer), cache_keys(restored, layer)))
+            self.assertTrue(torch.equal(cache_values(cache, layer), cache_values(restored, layer)))
 
 
 # ---- the cache itself --------------------------------------------------------------------------

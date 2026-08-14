@@ -45,6 +45,9 @@ from pathlib import Path
 import torch
 
 from ..hw import caps
+# transformers changed its cache layout in 4.57; these read and rebuild a cache's per-layer
+# tensors on either side of that change. See rocketllm/quant/kv_cache.py.
+from ..quant.kv_cache import cache_keys, cache_layer_count, cache_values, new_dynamic_cache
 
 log = logging.getLogger("rocketllm.server")
 
@@ -216,13 +219,13 @@ def _is_dynamic(cache):
 def _capture_quantized(cache, store, memo):
     layers = []
     residual = []
-    for layer_idx in range(len(cache.key_cache)):
+    for layer_idx in range(cache_layer_count(cache)):
         key_blocks, value_blocks = cache._blocks[layer_idx]
         keys = tuple(_hold(block, store, memo) for block in key_blocks)
         values = tuple(_hold(block, store, memo) for block in value_blocks)
         layers.append((keys, values))
-        residual.append((cache.key_cache[layer_idx].detach().to("cpu", copy=True),
-                         cache.value_cache[layer_idx].detach().to("cpu", copy=True)))
+        residual.append((cache_keys(cache, layer_idx).detach().to("cpu", copy=True),
+                         cache_values(cache, layer_idx).detach().to("cpu", copy=True)))
     checkpoint = Checkpoint(
         length=cache.get_seq_length(), kind=KIND_QUANTIZED, blocks=tuple(layers),
         residual=tuple(residual), group_size=cache.config.group_size,
@@ -241,9 +244,9 @@ def _hold(block, store, memo):
 
 
 def _capture_dynamic(cache):
-    residual = tuple((cache.key_cache[i].detach().to("cpu", copy=True),
-                      cache.value_cache[i].detach().to("cpu", copy=True))
-                     for i in range(len(cache.key_cache)))
+    residual = tuple((cache_keys(cache, i).detach().to("cpu", copy=True),
+                      cache_values(cache, i).detach().to("cpu", copy=True))
+                     for i in range(cache_layer_count(cache)))
     return Checkpoint(
         length=cache.get_seq_length(), kind=KIND_DYNAMIC, residual=residual,
         resident_bytes=sum(_tensor_bytes(k) + _tensor_bytes(v) for k, v in residual))
@@ -262,13 +265,10 @@ def restore(checkpoint, store, device, config=None, memo=None):
 
 
 def _restore_dynamic(checkpoint, device):
-    from transformers.cache_utils import DynamicCache
-
-    cache = DynamicCache()
-    cache.key_cache = [key.to(device, copy=True) for key, _ in checkpoint.residual]
-    cache.value_cache = [value.to(device, copy=True) for _, value in checkpoint.residual]
-    cache._seen_tokens = checkpoint.length
-    return cache
+    return new_dynamic_cache(
+        keys=[key.to(device, copy=True) for key, _ in checkpoint.residual],
+        values=[value.to(device, copy=True) for _, value in checkpoint.residual],
+        seen_tokens=checkpoint.length)
 
 
 def _restore_quantized(checkpoint, store, device, config, memo):

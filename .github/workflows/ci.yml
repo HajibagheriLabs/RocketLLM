@@ -60,9 +60,11 @@ jobs:
       fail-fast: false
       matrix:
         # The floor of requires-python through to the newest interpreter, against both ends of the
-        # transformers range pyproject.toml declares. transformers renames things between these
-        # versions -- torch_dtype to dtype, relocated cache symbols -- and the engine supports both
-        # spellings, which is only true for as long as something checks it.
+        # transformers range pyproject.toml declares -- "latest" being the newest release that
+        # range still admits. transformers moves things between these versions: torch_dtype to
+        # dtype, relocated cache symbols, and in 4.57 the whole Cache layout from parallel
+        # key/value lists to per-layer objects. The engine reads both, which is only true for as
+        # long as something checks it, so both ends run on every supported Python.
         python-version: ["3.9", "3.10", "3.11", "3.12"]
         transformers: ["minimum", "latest"]
         include:

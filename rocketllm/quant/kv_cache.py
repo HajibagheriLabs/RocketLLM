@@ -53,6 +53,75 @@ from ..hw import caps
 
 log = logging.getLogger(__name__)
 
+
+# -- transformers Cache compatibility ------------------------------------------------------------
+#
+# transformers restructured its cache in 4.57: a Cache stopped being two parallel lists of tensors
+# (`key_cache` / `value_cache`) and became a list of layer objects (`layers[i].keys` / `.values`),
+# and `Cache.__init__` stopped accepting no arguments. RocketLLM supports transformers across that
+# boundary, so everything that reaches into another cache's storage goes through the four helpers
+# below rather than touching either layout directly.
+#
+# Our own QuantizedKVCache keeps the flat lists whichever version is installed: it overrides every
+# method transformers calls, so the base class's storage is unused either way, and one internal
+# layout is far easier to reason about than two.
+
+def _init_cache_base(cache):
+    """Initialise the transformers Cache base class across its incompatible signatures.
+
+    The modern signature wants either a list of predefined layers or a layer class to replicate.
+    An empty list is the honest answer for a subclass that stores its own tensors and never lets
+    the base allocate a layer.
+    """
+    try:
+        Cache.__init__(cache)
+    except (TypeError, ValueError):
+        Cache.__init__(cache, layers=[])
+
+
+def cache_layer_count(cache):
+    """How many layers a cache is holding, on either layout."""
+    flat = getattr(cache, "key_cache", None)
+    if flat is not None:
+        return len(flat)
+    return len(getattr(cache, "layers", ()))
+
+
+def cache_keys(cache, layer_idx):
+    flat = getattr(cache, "key_cache", None)
+    if flat is not None:
+        return flat[layer_idx]
+    return cache.layers[layer_idx].keys
+
+
+def cache_values(cache, layer_idx):
+    flat = getattr(cache, "value_cache", None)
+    if flat is not None:
+        return flat[layer_idx]
+    return cache.layers[layer_idx].values
+
+
+def new_dynamic_cache(keys=(), values=(), seen_tokens=None):
+    """A stock DynamicCache holding `keys`/`values`, built the way this transformers wants.
+
+    On the flat layout the tensors are assigned straight onto the two lists. On the layer layout
+    they are fed through the cache's own ``update``, so the layer objects are constructed by the
+    version that owns them rather than by us guessing at their fields.
+    """
+    from transformers.cache_utils import DynamicCache
+
+    cache = DynamicCache()
+    if hasattr(cache, "key_cache"):
+        cache.key_cache = list(keys)
+        cache.value_cache = list(values)
+    else:
+        for layer_idx, (key, value) in enumerate(zip(keys, values)):
+            cache.update(key, value, layer_idx)
+    if seen_tokens is not None:
+        cache._seen_tokens = seen_tokens
+    return cache
+
+
 #: Settings a KV cache can be asked for. Strings rather than an enum because they arrive from a
 #: constructor argument and an environment override, and both are text.
 KV_AUTO = "auto"
@@ -217,7 +286,7 @@ class QuantizedKVCache(Cache):
     is_compileable = False
 
     def __init__(self, config=None):
-        super().__init__()
+        _init_cache_base(self)
         self.config = config if config is not None else KVCacheConfig()
         #: Per layer: the list of quantized (key, value) blocks, oldest first.
         self._blocks = []
@@ -442,11 +511,24 @@ def _delegated_cache(choice, config, device, compute_dtype):
 
     Both backends are optional packages and neither is needed to load a model, so a missing one
     degrades to the cache the engine would otherwise have used and names what to install.
-    """
-    from transformers.cache_utils import (HQQQuantizedCache, QuantizedCacheConfig,
-                                          QuantoQuantizedCache)
 
+    transformers itself withdrew these classes in 4.57, which is the same situation from the
+    engine's point of view -- the reference implementation is unavailable -- and it degrades the
+    same way rather than failing a load over a diagnostic aid.
+    """
     config = config or KVCacheConfig()
+    try:
+        from transformers.cache_utils import (HQQQuantizedCache, QuantizedCacheConfig,
+                                              QuantoQuantizedCache)
+    except ImportError:
+        caps.announce_once(
+            f"kv-backend-gone-{choice}",
+            f"kv_cache={choice!r} asks for transformers' own quantized cache, which this version "
+            f"of transformers no longer provides. Falling back to RocketLLM's int4 KV cache, which "
+            f"is the default anyway; it exists only as a reference to compare against.",
+            logging.INFO)
+        return QuantizedKVCache(config)
+
     module, package = _DELEGATED[choice]
     try:
         __import__(module)
