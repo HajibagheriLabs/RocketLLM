@@ -904,8 +904,13 @@ def resolve_tools(request):
     return ToolSetup(tools=tools, parse=True)
 
 
-def render_message(message):
+def render_message(message, content=None):
     """One request message in the shape a chat template expects.
+
+    ``content`` overrides what the message's own text would be, and exists for the one case where
+    flattening to a string loses something the template needs: a multimodal turn, whose image parts
+    have to survive as parts so the template can render the model's placeholder tokens where they
+    belong. Left alone, this is the plain string every text request has always produced.
 
     The arguments conversion is the round-trip bug almost every implementation ships. OpenAI's wire
     format makes ``arguments`` a JSON *string*, but every chat template that renders a tool call
@@ -916,8 +921,8 @@ def render_message(message):
     that matters, and the second call in a conversation degrades for no visible reason. Decoding it
     back to an object is what makes a multi-turn agentic exchange work.
     """
-    content = message.text()
-    rendered = {"role": message.role, "content": content}
+    rendered = {"role": message.role,
+                "content": message.text() if content is None else content}
     if message.name:
         rendered["name"] = message.name
     if message.tool_call_id:

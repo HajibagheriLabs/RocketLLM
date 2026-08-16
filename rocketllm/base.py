@@ -1,11 +1,14 @@
 
+import json
 import logging
 import os
+import re
 from collections import OrderedDict
+from pathlib import Path
 import time
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 from transformers.generation import GenerationMixin
 from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
@@ -28,8 +31,103 @@ from .streaming import HostStagingPool, LayerLoader, WeightTransfer
 from .profiler import LayeredProfiler
 
 from .utils import clean_memory, load_layer, load_layer_rows, load_layer_subset, \
-    find_or_create_local_splitted_path, reject_compression_argument
+    find_or_create_local_splitted_path, load_checkpoint_config, reject_compression_argument
 from .persist import ModelPersister
+
+
+#: Auto classes tried, in order, to build the empty skeleton.
+#:
+#: A causal LM first, because that is what nearly every checkpoint is and what a remote-code model
+#: registers itself as. Then the two multimodal factories: a vision-language config is registered
+#: only there, and ``AutoModelForCausalLM`` refuses it outright with a ValueError listing every
+#: config class it does know -- which is the failure this list exists to get past.
+#:
+#: Named rather than imported, because which of them exists differs across the transformers range
+#: this project supports. One that is absent is skipped, not an ImportError at module load.
+MODEL_FACTORIES = ("AutoModelForCausalLM", "AutoModelForImageTextToText", "AutoModelForVision2Seq")
+
+#: Keys in a preprocessor config that only an image processor writes. A checkpoint that ships one
+#: has a vision tower whatever it calls itself, and a speech checkpoint's preprocessor has none of
+#: them -- which keeps this from claiming a processor for a model that has no images to process.
+_IMAGE_PREPROCESSOR_KEYS = ("image_processor_type", "image_mean", "image_std", "crop_size")
+
+#: Substrings that mark a generate() keyword as a non-text model input. Speculation reads token ids
+#: and nothing else, so a call carrying any of these has to take the ordinary path or the draft
+#: would propose from a prompt with the image removed -- fluent, plausible, and about the wrong
+#: picture. No text-generation argument contains any of these.
+_NON_TEXT_INPUT_MARKERS = ("pixel", "image", "video", "audio", "vision", "input_features")
+
+_NO_MODEL_FACTORY = """\
+RocketLLM could not build a model for this checkpoint. transformers has its config class \
+({config}), but none of its model factories accepts one:
+
+{attempts}
+
+The skeleton is built through transformers' auto classes on purpose -- it is what lets a newly \
+released architecture stream here without a code change -- so a config no factory accepts is \
+usually one whose model class lives in a newer transformers than the {version} installed, or one \
+for a task this engine does not serve. RocketLLM generates text; an encoder-only, embedding or \
+speech checkpoint has no path through it."""
+
+
+def _brief(error, limit=200):
+    """An exception's first line, capped. Some of these run to two kilobytes of config classes."""
+    text = str(error).strip().splitlines()
+    first = text[0] if text else type(error).__name__
+    return first if len(first) <= limit else first[:limit - 3] + "..."
+
+
+def _refuses_config(error):
+    """Whether an auto class rejected the config outright rather than the attention choice.
+
+    Read off transformers' own message, which is the only place the distinction is recorded. Being
+    wrong about it costs one extra build attempt and a differently-worded log line, never a
+    different outcome, so a message that gets reworded upstream degrades rather than breaks.
+    """
+    text = str(error)
+    return "Unrecognized configuration class" in text or "for this kind of AutoModel" in text
+
+
+def _model_factories():
+    """The auto classes this transformers actually has, in the order they should be tried."""
+    import transformers
+
+    found = []
+    for name in MODEL_FACTORIES:
+        factory = getattr(transformers, name, None)
+        if factory is not None:
+            found.append((name, factory))
+    return found
+
+
+def checkpoint_name_mapper(model_class):
+    """Translate checkpoint tensor names into the parameter names the built model actually has.
+
+    These are the same string for almost every checkpoint, and were the same string for all of them
+    until transformers started restructuring multimodal wrappers after their weights had shipped.
+    Qwen2.5-VL stores ``model.layers.0...`` and ``visual...``; the class transformers now builds
+    holds ``model.language_model.layers.0...`` and ``model.visual...``. transformers reconciles the
+    two while loading, through a per-class ``_checkpoint_conversion_mapping`` of regex renames.
+    RocketLLM does its own placement, so it has to apply the same renames or every parameter is
+    placed at a path the model does not have.
+
+    First rule that matches wins and the rest are skipped -- that is what transformers does, and the
+    order the rules are written in is part of their meaning. Returns None when there is nothing to
+    translate, so the ordinary path pays nothing for this.
+    """
+    mapping = getattr(model_class, "_checkpoint_conversion_mapping", None) or {}
+    rules = [(re.compile(pattern), replacement) for pattern, replacement in mapping.items()]
+    if not rules:
+        return None
+
+    def translate(name):
+        for pattern, replacement in rules:
+            renamed, count = pattern.subn(replacement, name)
+            if count:
+                return renamed
+        return name
+
+    return translate
 
 
 # Helpers that transformers 5.0 moved out of transformers.utils.generic. Remote model code is
@@ -235,8 +333,11 @@ class RocketModel:
                 self.model_local_path, trust_remote_code=False, **token_kwargs)
             self.trust_remote_code = False
         except Exception:
-            self.config = AutoConfig.from_pretrained(
-                self.model_local_path, trust_remote_code=True, **token_kwargs)
+            # load_checkpoint_config on the second attempt, not the first: an architecture this
+            # transformers does not have fails BOTH ways, and only the last failure should be the
+            # one that gets explained.
+            self.config = load_checkpoint_config(
+                self.model_local_path, trust_remote_code=True, hf_token=hf_token)
             self.trust_remote_code = True
 
         # Default to the model's native dtype (bf16 for most modern models). Forcing fp16 overflows
@@ -259,7 +360,11 @@ class RocketModel:
         self._declare_runtime_dtype()
 
         self.generation_config = self.get_generation_config()
-        self.tokenizer = self.get_tokenizer(hf_token=hf_token)
+        #: The checkpoint's multimodal processor, or None for a text-only model. The tokenizer is
+        #: taken from inside it where it has one, so the two cannot disagree about the vocabulary.
+        self.processor = self.init_processor(hf_token=hf_token)
+        self.tokenizer = (getattr(self.processor, "tokenizer", None)
+                          or self.get_tokenizer(hf_token=hf_token))
 
         self.prefetching = prefetching
         # Debugging overrides; None everywhere means "use what the machine measured".
@@ -313,10 +418,7 @@ class RocketModel:
         self.init_model()
 
         # compute layer count from the instantiated model
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        layers_count = len(model_attr)
+        layers_count = len(self.submodule(self.layer_names_dict["layer_prefix"]))
 
         self.layer_names = [self.layer_names_dict['embed']] + \
                            [f'{self.layer_names_dict["layer_prefix"]}.{i}' for i in range(layers_count)] + \
@@ -346,6 +448,64 @@ class RocketModel:
             return AutoTokenizer.from_pretrained(self.model_local_path, token=hf_token, trust_remote_code=True)
         else:
             return AutoTokenizer.from_pretrained(self.model_local_path, trust_remote_code=True)
+
+    def declares_vision_components(self):
+        """Whether this checkpoint carries a vision tower, from what it says and what it ships.
+
+        Structural, like every other decision here: a nested vision sub-config, or the image
+        preprocessor a checkpoint has to ship for one. Never an architecture name, so a
+        vision-language model released next month is recognised without a code change.
+        """
+        for name, value in vars(self.config).items():
+            if name.endswith("vision_config") and value is not None:
+                return True
+        for name in ("preprocessor_config.json", "processor_config.json"):
+            path = Path(self.model_local_path) / name
+            if not path.exists():
+                continue
+            try:
+                with open(path, "rb") as handle:
+                    settings = json.load(handle)
+            except Exception:  # noqa: BLE001 - an unreadable hint is not a vision tower
+                continue
+            if isinstance(settings, dict) and any(key in settings
+                                                  for key in _IMAGE_PREPROCESSOR_KEYS):
+                return True
+        return False
+
+    def init_processor(self, hf_token=None):
+        """The checkpoint's own multimodal processor, or None for a text-only model.
+
+        A processor is what turns an image into the tensors a vision-language model's forward reads,
+        and it is the only thing that knows how many placeholder tokens one image expands to for
+        THIS checkpoint -- a count that depends on the image's size against the model's patch and
+        merge sizes, and that no amount of care with the tokenizer alone reproduces.
+
+        It deliberately does not REPLACE the tokenizer. Every text path in this engine calls the
+        tokenizer directly, and a processor's ``__call__`` takes images as its first argument, so
+        substituting one would silently pass prompts in as pictures. It is carried alongside instead.
+        """
+        if not self.declares_vision_components():
+            return None
+        try:
+            from transformers import AutoProcessor
+        except ImportError:  # pragma: no cover - AutoProcessor predates the supported range
+            return None
+        kwargs = {'trust_remote_code': True}
+        if hf_token is not None:
+            kwargs['token'] = hf_token
+        try:
+            return AutoProcessor.from_pretrained(self.model_local_path, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - text generation must survive this
+            caps.announce_once(
+                "processor-unavailable",
+                f"this checkpoint declares vision components but its processor could not be built: "
+                f"{_brief(exc, limit=400)}. Text generation is unaffected; image inputs will be "
+                f"refused. A missing imaging package is the usual cause and both live in one "
+                f"extra -- `pip install \"rocketllm[vision]\"` -- but note that torchvision has to "
+                f"match your torch build, so on CUDA install it from the index torch came from.",
+                logging.WARNING)
+            return None
 
     # ---- model construction -----------------------------------------------------------------
 
@@ -401,25 +561,63 @@ class RocketModel:
 
         walk(self.config)
 
+    def _build_empty_model(self, factory):
+        """One auto class's attempt at the skeleton on meta, or ``(None, why it refused)``.
+
+        sdpa first, then eager: some (often remote-code) architectures do not implement sdpa and
+        also default to it, so eager has to be asked for explicitly or transformers re-selects sdpa
+        and errors again. A factory with no entry for this config refuses both ways, which is a
+        different thing entirely -- that is the caller's cue to try the next factory rather than to
+        report an attention problem.
+        """
+        last = None
+        for impl in ("sdpa", "eager"):
+            try:
+                self._propagate_attn_implementation(impl)
+                with init_empty_weights(include_buffers=False):
+                    return factory.from_config(self.config, attn_implementation=impl,
+                                               trust_remote_code=self.trust_remote_code), None
+            except (ValueError, TypeError) as exc:
+                last = exc
+                if _refuses_config(exc):
+                    break
+                if impl == "sdpa":
+                    print(f"attn_implementation='sdpa' not available ({_brief(exc)}), "
+                          f"falling back to eager attention")
+        return None, last
+
     def init_model(self):
         # Build the real model on meta (no memory). include_buffers=False so non-persistent
         # buffers such as rotary inv_freq are actually computed (they aren't in the checkpoint).
+        #
+        # Several factories are tried because a vision-language config is registered under a
+        # different one: AutoModelForCausalLM rejects Qwen2.5-VL's config outright, and did so with
+        # a ValueError so long that it read like an attention-implementation problem. Which factory
+        # succeeded is a property of the checkpoint, not of the machine, so it is discovered rather
+        # than configured.
         self.model = None
-        try:
-            self._propagate_attn_implementation("sdpa")
-            with init_empty_weights(include_buffers=False):
-                self.model = AutoModelForCausalLM.from_config(
-                    self.config, attn_implementation="sdpa", trust_remote_code=self.trust_remote_code)
-        except (ValueError, TypeError) as e:
-            print(f"attn_implementation='sdpa' not available ({e}), falling back to eager attention")
-            self.model = None
+        attempts = []
+        for name, factory in _model_factories():
+            model, refusal = self._build_empty_model(factory)
+            if model is None:
+                attempts.append(f"  {name}: {_brief(refusal)}")
+                continue
+            self.model = model
+            self.model_factory = name
+            if attempts:
+                print(f"built with {name}; {', '.join(a.split(':')[0].strip() for a in attempts)} "
+                      f"{'does' if len(attempts) == 1 else 'do'} not accept this config.")
+            break
+
         if self.model is None:
-            # Some (often remote-code) architectures don't support sdpa and also default to it, so we
-            # must request eager explicitly; otherwise transformers re-selects sdpa and errors again.
-            self._propagate_attn_implementation("eager")
-            with init_empty_weights(include_buffers=False):
-                self.model = AutoModelForCausalLM.from_config(
-                    self.config, attn_implementation="eager", trust_remote_code=self.trust_remote_code)
+            raise ValueError(_NO_MODEL_FACTORY.format(
+                config=type(self.config).__name__, attempts="\n".join(attempts) or "  (none)",
+                version=__import__("transformers").__version__))
+
+        #: Checkpoint tensor names and model parameter names are the same string for almost every
+        #: checkpoint and differ for the multimodal wrappers transformers has restructured. None
+        #: when they agree, which is the fast path.
+        self._to_module_name = checkpoint_name_mapper(type(self.model))
 
         quantization_config = getattr(self.config, "quantization_config", None)
         if quantization_config is None:
@@ -492,28 +690,48 @@ class RocketModel:
 
         self.model.__class__ = _RocketRuntimeModel
 
+    # ---- checkpoint names vs module names ---------------------------------------------------
+
+    def module_name(self, checkpoint_name):
+        """Where the model keeps what the checkpoint calls ``checkpoint_name``.
+
+        The identity for every ordinary checkpoint. See :func:`checkpoint_name_mapper` for the case
+        it exists to serve, and note that it works on module paths as well as parameter names --
+        the rules are anchored prefixes, so ``model.layers`` renames exactly as
+        ``model.layers.0.mlp.up_proj.weight`` does.
+        """
+        translate = getattr(self, "_to_module_name", None)
+        return checkpoint_name if translate is None else translate(checkpoint_name)
+
+    def _to_module_namespace(self, state_dict):
+        """Re-key a shard from the checkpoint's names to the model's, where the two differ."""
+        translate = getattr(self, "_to_module_name", None)
+        if translate is None:
+            return state_dict
+        renamed = OrderedDict()
+        for name, value in state_dict.items():
+            renamed[translate(name)] = value
+        return renamed
+
+    def submodule(self, checkpoint_name):
+        """The module the checkpoint stores under this name."""
+        model_attr = self.model
+        for attr_name in self.module_name(checkpoint_name).split("."):
+            model_attr = getattr(model_attr, attr_name)
+        return model_attr
+
+    def has_submodule(self, checkpoint_name):
+        try:
+            self.submodule(checkpoint_name)
+        except AttributeError:
+            return False
+        return True
+
     def set_layers_from_layer_names(self):
-        self.layers = []
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["embed"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.extend(list(model_attr))
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["norm"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["lm_head"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
+        self.layers = [self.submodule(self.layer_names_dict["embed"])]
+        self.layers.extend(list(self.submodule(self.layer_names_dict["layer_prefix"])))
+        self.layers.append(self.submodule(self.layer_names_dict["norm"]))
+        self.layers.append(self.submodule(self.layer_names_dict["lm_head"]))
 
     # ---- weight streaming -------------------------------------------------------------------
 
@@ -582,8 +800,13 @@ class RocketModel:
         typical all-bf16 layer to a single transfer. Anything that cannot be packed -- a param the
         quantizer reconstructs itself, or one that errors on the way in -- falls back to being
         placed on its own, because a slower correct path beats a faster broken one.
+
+        The one choke point where a shard's tensor names are turned into the model's parameter
+        names. Everything downstream of here -- the quant plan, the coalesced binds, the list of
+        names sent back to meta afterwards -- is in the model's namespace and needs no further
+        translation.
         """
-        state_dict = self._prepare_layer(state_dict)
+        state_dict = self._prepare_layer(self._to_module_namespace(state_dict))
 
         groups, individual = self._plan_transfer(state_dict)
 
@@ -680,18 +903,50 @@ class RocketModel:
     def _load_resident_modules(self):
         """Load modules that sit outside the streamed embed -> layers -> norm -> lm_head sequence.
 
-        Multimodal checkpoints carry a vision tower and projector, and some architectures add
-        extra top-level norms. They never get a streaming hook, so without this they would stay on
-        the meta device and fail the moment they run. They are small (well under a GB), so we load
-        them once and leave them resident.
+        A multimodal checkpoint carries a vision tower and a projector; some architectures add extra
+        top-level norms. None of them ever gets a streaming hook, so without this they stay on the
+        meta device and fail the moment they run.
+
+        Resident rather than streamed, and that is a decision rather than an oversight. A vision
+        tower runs once per REQUEST, not once per token, so streaming it would add a full pass of
+        its bytes to every prompt to buy back device memory the decoder is not contending for in
+        between. What it does cost is measured and reported, and the weight cache is sized after
+        this runs -- the budget it reads is what is left once these are placed, so the two cannot
+        double-count.
         """
+        self.resident_bytes = 0
+        placed = []
         for name in self.layer_names_dict.get('resident', []):
             try:
                 state_dict = self.load_layer_to_cpu(name)
             except FileNotFoundError:
                 # Not every checkpoint of a given architecture ships every optional module.
                 continue
+            if not self.has_submodule(name):
+                # Found in the checkpoint rather than declared by a subclass, and this model class
+                # builds nothing at that path -- a table transformers computes for itself, or a
+                # leftover from a differently-shaped release. Placing it would raise; skipping it
+                # costs nothing, because no forward reads it.
+                caps.announce_once(
+                    f"resident-absent-{name}",
+                    f"the checkpoint stores {name}, which this model class does not build, so "
+                    f"those tensors are not loaded. Nothing reads them; this is not an error.",
+                    logging.INFO)
+                continue
             self.move_layer_to_device(state_dict)
+            self.resident_bytes += self._shard_bytes(name)
+            placed.append(name)
+        if placed:
+            print(f"resident modules: {', '.join(placed)} -- "
+                  f"{self.resident_bytes / 1024 ** 2:.1f}MB placed once and kept outside the "
+                  f"streaming cache.")
+
+    def _shard_bytes(self, name):
+        """Packed bytes of one module's shard, from its header rather than its data."""
+        try:
+            return self.loader.plan(name).total_bytes
+        except Exception:  # noqa: BLE001 - a byte count must not be able to fail a load
+            return 0
 
     def _install_streaming_hooks(self):
         # Modules execute in this order during a forward: embed -> layers -> norm -> lm_head.
@@ -1058,10 +1313,14 @@ class RocketModel:
             target = self.quant.target_dtype(key, value)
             full = torch.zeros(container.fused_shapes[key], dtype=target,
                                device=self.running_device)
-            self._adopt_checkpoint_shape(key, full)
+            # `key` is the checkpoint's name, which is what the shard was read by and what
+            # fused_shapes is keyed on; the model may keep it somewhere else. This path does not go
+            # through move_layer_to_device, so it does its own translation.
+            param_name = self.module_name(key)
+            self._adopt_checkpoint_shape(param_name, full)
             full.index_copy_(0, index, value.to(device=self.running_device, dtype=target))
-            set_module_tensor_to_device(self.model, key, self.running_device, value=full)
-            moved.append(key)
+            set_module_tensor_to_device(self.model, param_name, self.running_device, value=full)
+            moved.append(param_name)
         return moved
 
     def _knob(self, name, fallback=0):
@@ -1119,6 +1378,7 @@ class RocketModel:
             window_share = (window_budget / device_bytes) if device_bytes else 0.0
             device_bytes = live.usable
             window_budget = int(device_bytes * window_share)
+        self._report_resident_share(device_bytes)
         pinned = self._plan_pins(device_bytes, window_budget, largest)
 
         self.cache = TieredWeightCache(
@@ -1149,6 +1409,35 @@ class RocketModel:
         print(f"cache: window {window} layers, device budget "
               f"{device_bytes / 1024 ** 3:.1f}GB, host tier {host_bytes / 1024 ** 3:.1f}GB, "
               f"{len(pinned)} pinned, pin_policy={self.pin_policy}")
+
+    def _report_resident_share(self, device_bytes):
+        """Say so when the modules held outside the cache took a real bite out of the device.
+
+        A vision tower is placed before the cache is sized, so by the time the budget is read those
+        bytes are simply gone and nothing downstream would ever mention them. On a card with room
+        that is invisible and fine; on one without, it is the whole explanation for why the decoder
+        can keep so few layers, and it has to be said once rather than left to be inferred from a
+        low hit rate. The threshold below changes no behaviour -- it decides only whether the line
+        is worth printing -- so it is a reporting choice rather than a tuning constant.
+        """
+        resident = getattr(self, "resident_bytes", 0)
+        # A backend with no device pool to speak of -- CPU, or one whose driver reports nothing --
+        # has no share to report, and dividing by what it did report would say "100%" about a
+        # number that means nothing. The cache prints the budget it actually got either way.
+        if not resident or device_bytes <= 0:
+            return
+        share = resident / (resident + device_bytes)
+        if share <= 0.25:
+            return
+        caps.announce_once(
+            "resident-share",
+            f"modules held resident outside the weight cache take "
+            f"{resident / 1024 ** 3:.2f}GB, {share * 100:.0f}% of this device's usable memory, "
+            f"leaving {device_bytes / 1024 ** 3:.2f}GB for streamed weights and the KV cache. On a "
+            f"vision-language checkpoint that is the vision tower; it runs once per request rather "
+            f"than once per token, so it is kept rather than streamed. If the decoder ends up "
+            f"holding too few layers to be worth it, a text-only checkpoint of the same family "
+            f"will run faster on this device.", logging.WARNING)
 
     def _resolve_kv_cache(self, device_bytes):
         """Settle the KV cache now that both the weights and the budget have been measured."""
@@ -1224,6 +1513,20 @@ class RocketModel:
         the stock path and the right answer, never a quietly different generation.
         """
         if self.spec is None:
+            return None
+        non_text = sorted(name for name in kwargs
+                          if any(marker in name for marker in _NON_TEXT_INPUT_MARKERS))
+        if non_text:
+            # The draft proposes from token ids alone. Handed a prompt whose images live in a
+            # separate tensor it never sees, it would propose fluently about the wrong picture and
+            # the verifier -- which does see them -- would reject nearly everything, so this is a
+            # correctness stop as much as a throughput one.
+            caps.announce_once(
+                "spec-multimodal",
+                f"this request carries non-text model inputs ({', '.join(non_text)}), which the "
+                f"speculative loop does not propose over, so it runs on the ordinary generation "
+                f"path. The output is the same as it would be without a draft model.",
+                logging.INFO)
             return None
         input_ids = kwargs.get("input_ids", kwargs.get("inputs"))
         if input_ids is None and args:

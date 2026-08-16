@@ -74,12 +74,23 @@ pip install "rocketllm[quant]"
 
 `quant` pulls in the readers for bitsandbytes-prequantized and compressed-tensors checkpoints; `mlx`
 pulls in the Apple Silicon backend; `server` pulls in FastAPI, uvicorn and pydantic for
-`rocketllm serve`. None is required for a base install.
+`rocketllm serve`; `vision` pulls in Pillow and torchvision, which are what a vision-language
+checkpoint needs to turn a request's picture into tensors. None is required for a base install.
+
+On CUDA, install torchvision from the same index your torch came from, or pip resolves a second
+torch behind it:
+
+```bash
+pip install "rocketllm[vision]" --extra-index-url https://download.pytorch.org/whl/cu121
+```
 
 **Supported versions.** Python 3.9–3.13, PyTorch >= 2.4, and `transformers >= 4.49, < 5.0`. CI runs
 both ends of that transformers range on every supported Python. transformers 5 is not supported yet:
-it renamed the expert containers this engine streams, so mixture-of-experts models read the wrong
-modules against it — [tracked as a follow-up](https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/ARCHITECTURE.md#transformers-compatibility).
+it replaced the expert containers this engine streams with fused ones, so mixture-of-experts models
+read the wrong modules against it. The cost of that bound is worth knowing before you meet it — an
+architecture added in 5.x cannot be loaded here at all, `qwen3_5` and `qwen3_5_moe` among them, and
+a checkpoint declaring one fails at config load with a message that says so rather than a
+`KeyError`. [Scope of the port](https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/ARCHITECTURE.md#what-transformers-5-still-needs).
 
 ## Quickstart
 
@@ -314,6 +325,48 @@ python tests/bench_streaming.py --model <model> --conversation 3
 
 replays a multi-turn conversation with reuse on and off and prints the measured prefill time of
 each turn.
+
+### Vision-language models
+
+A checkpoint with a vision tower is served the same way as any other — point `--model` at it and
+send OpenAI's multimodal payload:
+
+```bash
+pip install "rocketllm[vision]" --extra-index-url https://download.pytorch.org/whl/cu121
+rocketllm serve --model Qwen/Qwen2.5-VL-7B-Instruct --port 8000
+```
+
+```json
+{"model": "qwen2.5-vl", "messages": [{"role": "user", "content": [
+  {"type": "text", "text": "What is in this picture?"},
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KG..."}}]}]}
+```
+
+`GET /v1/models` reports `"multimodal": true` when the loaded checkpoint can take images at all, so
+a client does not have to discover it from a 400.
+
+Nothing about this is per-architecture. The empty model is built through whichever transformers auto
+class accepts the checkpoint's config, the decoder stack is found by looking at the checkpoint's own
+tensor names rather than by knowing where a given family keeps it, and everything outside the
+streamed `embed → layers → norm → lm_head` sequence — the vision tower, a projector, extra norms —
+is discovered, given its own shard, and loaded once.
+
+**The vision tower is resident, not streamed.** It runs once per request rather than once per token,
+so streaming it would add a full pass of its bytes to every prompt to buy back memory the decoder is
+not contending for in between. What it costs is reported at load (`resident modules: visual —
+1290.4MB …`) and comes out of the budget the weight cache is then sized against, so the two never
+double-count. If it takes a large enough share of a small card to matter, the load says so.
+
+**Images are decoded, not fetched.** `data:` URLs and paths on the server are read; an `http(s)` URL
+is refused with an explanation. Fetching one would make the server issue outbound requests chosen by
+whoever sent the request, against whatever the machine it runs on can reach — including addresses
+the client cannot. Inline the image instead.
+
+Two things are switched off for a request carrying images, both for correctness rather than
+caution. Prefix caching is keyed by token ids, and two different pictures of the same size expand to
+identical placeholder tokens — reuse would answer the second request from the first one's KV cache
+and say nothing. Speculative decoding proposes from token ids alone, so a draft would never see the
+picture. Text requests to the same server keep both.
 
 Every `rocketllm serve` flag is listed under [Configuration](#configuration) above, and every one
 defaults to what `rocketllm profile` measured on your machine. `rocketllm serve --help` prints the

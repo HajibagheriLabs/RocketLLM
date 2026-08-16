@@ -1,7 +1,12 @@
 # Runtime dependencies, kept in step with [project.dependencies] in pyproject.toml.
 # `pip install -e .` is the supported install; this file exists for environments that want a
-# plain requirements pin. Accelerator and kernel packages are deliberately NOT here — install
-# them through the extras (`.[quant]`, `.[mlx]`) so a base install stays hardware-neutral.
+# plain requirements pin. Accelerator, kernel and image packages are deliberately NOT here —
+# install them through the extras (`.[quant]`, `.[mlx]`, `.[vision]`) so a base install stays
+# hardware-neutral.
+#
+# The transformers bound is explained at length in pyproject.toml. Short version: 5.x fused the
+# per-expert containers this engine streams, so the cap stays until that is ported, and any
+# architecture added in 5.x (qwen3_5, qwen3_5_moe) cannot be served here yet.
 tqdm
 torch>=2.4
 transformers>=4.49,<5.0

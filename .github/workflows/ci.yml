@@ -114,6 +114,10 @@ jobs:
       #   test_kv_cache.py         int4 KV quantize/dequantize round trips and the residual window
       #   test_toolcalls.py        every family's raw tool-call syntax, streaming and buffered
       #   test_server.py           the OpenAI-compatible schemas and the request path
+      #   test_multimodal_protocol.py  image parts on the wire: decoding, rendering,
+      #                            and routing them to the checkpoint's own processor
+      #   test_checkpoint_layout.py  snapshot resolution, and where a checkpoint keeps
+      #                            its decoder when it is not where it usually is
       #   test_doctor.py           the diagnosis a bug report is asked to paste
       #   test_optional_imports.py the package importing with every optional dependency absent
       - name: Unit suite (no accelerator)
@@ -121,15 +125,21 @@ jobs:
           set -o pipefail
           pytest tests/ -q -rf \
             --ignore=tests/test_cpu_generation.py \
+            --ignore=tests/test_vision_streaming.py \
             --ignore=tests/test_portability.py 2>&1 | tee pytest-unit.log
 
       # The correctness gate, in the form a runner without a GPU can answer: streamed generation
       # against a full load of the same weights, token for token. A fast engine that produces the
       # wrong tokens is worth nothing, so this is the one result that is never negotiable.
+      #
+      # test_vision_streaming.py asks the same question of a vision-language checkpoint,
+      # with a picture actually going through it: a text-only comparison would pass with
+      # the vision tower still on the meta device, because nothing would ever call it.
       - name: End-to-end generation on the CPU backend
         run: |
           set -o pipefail
-          pytest tests/test_cpu_generation.py -q -rf 2>&1 | tee pytest-generation.log
+          pytest tests/test_cpu_generation.py tests/test_vision_streaming.py -q -rf \
+            2>&1 | tee pytest-generation.log
 
       # Devices this runner is not: one that holds the whole model, one that holds half, one with
       # room for a single layer, one whose pin budget works out to zero, and devices missing pinned

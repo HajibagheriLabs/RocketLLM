@@ -17,6 +17,14 @@ that legitimately calls ``importlib.util.find_spec`` to test for a package -- tr
 for half this list at import time, and would fail for the wrong reason. Failing at load leaves the
 probe working and the import broken, which is exactly the shape of a package that is not there.
 
+The distribution METADATA has to go with it, and that is not belt-and-braces. A probe that finds a
+spec commonly confirms it by asking importlib.metadata for a version, and the name it asks under is
+the distribution's, not the module's -- transformers decides whether images are available by looking
+for a module called PIL and a distribution called Pillow. Leave the metadata behind and the probe
+says yes, the caller imports the module unguarded, and the run dies on an import error instead of
+taking the fallback under test. So the blocker works out which distributions install a blocked
+top-level module and makes those disappear too.
+
 The list of packages comes from the doctor's own inventory, so a new optional dependency is covered
 here the moment it is documented there, and cannot be added to one without the other.
 """
@@ -39,7 +47,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BLOCKED = sorted({package.module for package in OPTIONAL_PACKAGES} | {"quanto", "httpx"})
 
 _BLOCKER = '''
-import importlib.abc, importlib.machinery, sys
+import importlib.abc, importlib.machinery, importlib.metadata, sys
 
 BLOCKED = {blocked!r}
 
@@ -62,6 +70,76 @@ class _Blocker(importlib.abc.MetaPathFinder):
         return None
 
 
+def _normalise(name):
+    return (name or "").strip().lower().replace("-", "_")
+
+
+def _top_level_names(dist):
+    """Every top-level module a distribution installs.
+
+    Read from the files it recorded rather than assumed from its name: PIL comes from Pillow, and a
+    probe that asks for one by the other is exactly what this has to cover. top_level.txt is
+    consulted first where it exists, because a wheel that ships a namespace package records it there
+    and nowhere else.
+    """
+    names = set()
+    try:
+        recorded = dist.read_text("top_level.txt") or ""
+    except Exception:
+        recorded = ""
+    names.update(line.strip() for line in recorded.splitlines() if line.strip())
+    for path in (dist.files or ()):
+        parts = str(path).replace("\\\\", "/").split("/")
+        head = parts[0]
+        if head in ("", "..") or head.endswith((".dist-info", ".egg-info")):
+            continue
+        if len(parts) == 1:
+            head = head[:-3] if head.endswith(".py") else head
+        names.add(head)
+    return names
+
+
+_HIDDEN_DISTRIBUTIONS = set()
+for _dist in importlib.metadata.distributions():
+    if _top_level_names(_dist) & set(BLOCKED):
+        try:
+            _HIDDEN_DISTRIBUTIONS.add(_normalise(_dist.metadata["Name"]))
+        except Exception:
+            pass
+_HIDDEN_DISTRIBUTIONS.update(_normalise(name) for name in BLOCKED)
+_HIDDEN_DISTRIBUTIONS.discard("")
+
+_real_version = importlib.metadata.version
+_real_distribution = importlib.metadata.distribution
+_real_metadata = importlib.metadata.metadata
+
+
+def _hidden(name):
+    return _normalise(name) in _HIDDEN_DISTRIBUTIONS
+
+
+def _version(name):
+    if _hidden(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+    return _real_version(name)
+
+
+def _distribution(name):
+    if _hidden(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+    return _real_distribution(name)
+
+
+def _metadata(name):
+    if _hidden(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+    return _real_metadata(name)
+
+
+importlib.metadata.version = _version
+importlib.metadata.distribution = _distribution
+importlib.metadata.metadata = _metadata
+
 for _name in [n for n in sys.modules if n.split(".")[0] in BLOCKED]:
     del sys.modules[_name]
 sys.meta_path.insert(0, _Blocker())
@@ -69,11 +147,21 @@ sys.path.insert(0, {root!r})
 '''
 
 
-def run_without_optionals(body):
-    """Run `body` in a fresh interpreter with every optional package unimportable."""
-    source = _BLOCKER.format(blocked=BLOCKED, root=str(REPO_ROOT)) + textwrap.dedent(body)
+def run_without(body, blocked):
+    """Run `body` in a fresh interpreter with `blocked` unimportable and their metadata hidden.
+
+    Exposed rather than kept private because a degradation is only worth checking with exactly the
+    package it depends on removed: hiding the whole list would also remove pydantic, and the module
+    under test would then fail to import for an unrelated reason.
+    """
+    source = _BLOCKER.format(blocked=sorted(blocked), root=str(REPO_ROOT)) + textwrap.dedent(body)
     return subprocess.run([sys.executable, "-c", source], capture_output=True, text=True,
                           cwd=str(REPO_ROOT), timeout=600)
+
+
+def run_without_optionals(body):
+    """Run `body` in a fresh interpreter with every optional package unimportable."""
+    return run_without(body, BLOCKED)
 
 
 class OptionalImportCase(unittest.TestCase):

@@ -80,6 +80,15 @@ OPTIONAL_PACKAGES = (
         "request and response validation for the OpenAI schemas",
         "generate() from Python still works; only the server is unavailable"),
     OptionalPackage(
+        "PIL", "pip install 'rocketllm[vision]'",
+        "decoding the images in a multimodal chat request",
+        "text generation is unaffected; a request carrying an image is refused with this hint"),
+    OptionalPackage(
+        "torchvision", "pip install 'rocketllm[vision]'",
+        "the processors of video-capable checkpoints, and transformers' faster image processors",
+        "a checkpoint whose processor declares a video processor cannot build one at all "
+        "(Qwen2.5-VL is one), so it serves text only; others just preprocess more slowly"),
+    OptionalPackage(
         "compressed_tensors", "pip install 'rocketllm[quant]'",
         "reading compressed-tensors W4A16 and MXFP4 checkpoints",
         "those checkpoints cannot be loaded; every other format still can"),

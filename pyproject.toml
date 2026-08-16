@@ -32,9 +32,21 @@ dependencies = [
     "tqdm",
     "torch>=2.4",
     # The upper bound is where the engine has actually been run, not a guess. transformers 5
-    # renamed the expert containers this engine streams -- Mixtral's block_sparse_moe, Qwen2-MoE's
-    # per-expert ModuleList -- and MoE streaming reads the wrong modules against it. The whole 4.x
-    # range from the floor up is covered by CI, both ends of it, on every supported Python.
+    # replaced the per-expert containers this engine streams -- Mixtral's block_sparse_moe,
+    # Qwen2-MoE's per-expert ModuleList -- with a single fused expert module, so per-expert
+    # streaming reads the wrong tensors against it. The whole 4.x range from the floor up is
+    # covered by CI, both ends of it, on every supported Python.
+    #
+    # The cost of that bound is concrete and worth writing down: architectures added in 5.x cannot
+    # be served here at all. qwen3_5 and qwen3_5_moe first appear in transformers 5.2, so a
+    # checkpoint declaring either fails at config load. rocketllm/utils.py says exactly that when
+    # it happens rather than leaving a KeyError to be interpreted. Lifting the bound is a port, not
+    # a version bump: the fused layout has to be mapped back onto per-expert checkpoints first.
+    #
+    # Nothing in the vision-language path needs a higher floor. AutoModelForImageTextToText is
+    # skipped where it does not exist and AutoModelForVision2Seq is tried instead; the checkpoint
+    # name mapping is the identity on a transformers that has no such mapping, which is also the
+    # transformers on which those checkpoints needed no mapping.
     "transformers>=4.49,<5.0",
     "accelerate>=1.0",
     "safetensors",
@@ -54,6 +66,23 @@ mlx = [
     "mlx",
     "psutil",
 ]
+# Serving images to a vision-language model. Pillow decodes the picture in a request; the
+# checkpoint's own processor does everything after that.
+#
+# torchvision is here because on several checkpoints it is not optional in practice, however much
+# it looks like an accelerant. transformers builds a processor by resolving every attribute the
+# processor class declares, and a video-capable one declares a video processor -- so
+# AutoProcessor.from_pretrained on Qwen2.5-VL raises "AutoVideoProcessor requires the Torchvision
+# library" and the checkpoint serves text only. Measured, not assumed: that is exactly what this
+# extra was missing the first time it was tried against Qwen2.5-VL-7B-Instruct.
+#
+# Install the build that matches your torch. On CUDA that means the same index torch came from,
+# e.g. pip install torchvision --index-url https://download.pytorch.org/whl/cu121 -- a mismatched
+# pair pulls a second torch in behind it.
+vision = [
+    "pillow",
+    "torchvision",
+]
 # `rocketllm serve` only. Someone who calls generate() from Python should not be made to install a
 # web framework for it, so these are not base dependencies.
 server = [
@@ -62,6 +91,9 @@ server = [
     "pydantic>=2.5",
 ]
 # httpx drives the server tests through the ASGI transport, with no socket and no accelerator.
+# pillow is here because the image-decoding tests build their own pictures in memory; the suite
+# still passes without it, since the tests that need it skip and the refusal path is checked either
+# way.
 dev = [
     "pytest",
     "ruff",
@@ -69,6 +101,7 @@ dev = [
     "uvicorn>=0.27",
     "pydantic>=2.5",
     "httpx>=0.24",
+    "pillow",
 ]
 
 # One console script with subcommands: `rocketllm profile` and `rocketllm serve`.

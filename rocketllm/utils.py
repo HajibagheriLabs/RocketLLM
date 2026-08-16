@@ -2,6 +2,7 @@ import gc
 import json
 import os
 import ctypes
+import logging
 import shutil
 from tqdm import tqdm
 from pathlib import Path
@@ -17,6 +18,8 @@ from safetensors.torch import load_file
 from .persist import ModelPersister
 
 import huggingface_hub
+
+log = logging.getLogger(__name__)
 
 is_on_mac_os = (platform == "darwin")
 
@@ -51,6 +54,7 @@ def reject_compression_argument(compression):
     if compression is None:
         return
     raise ValueError(_COMPRESSION_REMOVED.format(value=compression))
+
 
 # Function to clean RAM & vRAM
 def clean_memory(device=None):
@@ -179,10 +183,297 @@ def link_or_copy_file(src, dst):
     return 'copy'
 
 
+#: Files that mark a directory as holding a checkpoint rather than pointing at one.
+WEIGHT_INDEX_FILES = ('pytorch_model.bin.index.json', 'model.safetensors.index.json',
+                      'model.safetensors', 'pytorch_model.bin')
+
+
+def resolve_snapshot_path(path):
+    """The directory that actually holds a checkpoint, given one that may only point at it.
+
+    A Hugging Face cache entry is ``models--org--name/{blobs,refs,snapshots/<commit>}``: config.json
+    and the weight files live under a commit hash inside ``snapshots``, not at the top. The
+    directory a user can actually read the model's name off is the one they type, and it used to
+    fail twice over -- once as "found a local directory but no downloaded model", then again when
+    the same string was retried as a repo id and rejected as an invalid repo name.
+
+    Anything that is not a cache root comes back unchanged, so no caller has to know the difference.
+    """
+    path = Path(path)
+    snapshots = path / 'snapshots'
+    if not snapshots.is_dir():
+        return path
+
+    # refs/<revision> holds the commit that revision resolves to. Prefer main, then any other
+    # revision the cache knows, and only then fall back to whichever snapshot was written last --
+    # a cache may hold several commits and the newest directory is not always the checked-out one.
+    candidates = []
+    refs = path / 'refs'
+    if refs.is_dir():
+        for ref in sorted(refs.iterdir(), key=lambda p: (p.name != 'main', p.name)):
+            try:
+                commit = ref.read_text(encoding='utf-8').strip()
+            except OSError:
+                continue
+            if commit and (snapshots / commit).is_dir():
+                candidates.append(snapshots / commit)
+    try:
+        by_age = sorted((d for d in snapshots.iterdir() if d.is_dir()),
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        by_age = []
+    candidates.extend(d for d in by_age if d not in candidates)
+
+    for candidate in candidates:
+        if (candidate / 'config.json').exists():
+            return candidate
+    return candidates[0] if candidates else path
+
+
+# A checkpoint whose model_type this transformers does not have produces a message about updating
+# transformers and nothing about where that leaves RocketLLM, which is the half a user standing in
+# front of it actually needs. The engine defers every architecture to transformers on purpose -- it
+# is what makes a model released this morning stream tonight -- so "transformers does not have it"
+# really does mean "nothing here can supply it", and the honest thing is to say so and name the
+# bound that may be in the way.
+_UNKNOWN_MODEL_TYPE = """\
+transformers {version} does not recognise the model type {model_type!r}, so this checkpoint cannot \
+be loaded.
+
+RocketLLM does not implement architectures itself: transformers owns the forward pass, which is \
+what lets a newly released model stream here without a code change. An architecture transformers \
+does not have is therefore one nothing in this package can supply.
+{remote}
+Upgrade transformers to a release that has it:
+
+  pip install --upgrade transformers
+
+If the checkpoint is newer than any release:
+
+  pip install "transformers @ git+https://github.com/huggingface/transformers.git"
+
+Note that RocketLLM currently requires transformers<5.0, and that bound is not arbitrary: \
+transformers 5 replaced the per-expert module lists this engine streams with one fused expert \
+module, so per-expert streaming reads the wrong tensors against it. If {model_type!r} exists only \
+in a 5.x release, it cannot be served here until that port is done.
+
+Original error: {error}"""
+
+_SHIPS_NO_REMOTE_CODE = """
+The checkpoint ships no modeling code of its own either -- there is no auto_map in its config.json \
+-- so trust_remote_code, which RocketLLM already passes, has nothing to load.
+"""
+
+_SHIPS_REMOTE_CODE = """
+The checkpoint does declare modeling code of its own under auto_map in config.json, and RocketLLM \
+already loads that with trust_remote_code=True, so this is not a permission problem. Either that \
+auto_map has no AutoConfig entry -- which leaves the config type for transformers to resolve on its \
+own, and it cannot -- or the code it names would not import against the transformers installed here.
+"""
+
+
+def _declares_remote_code(path):
+    try:
+        with open(Path(path) / 'config.json', 'rb') as handle:
+            return bool(json.load(handle).get('auto_map'))
+    except Exception:  # noqa: BLE001 - a diagnostic must not be what fails the load
+        return False
+
+
+def _unrecognised_model_type(path, error):
+    """The model_type transformers refused, or None when this was some other failure."""
+    text = str(error)
+    if 'does not recognize this architecture' not in text and 'Unrecognized model' not in text:
+        return None
+    try:
+        with open(Path(path) / 'config.json', 'rb') as handle:
+            return json.load(handle).get('model_type')
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_checkpoint_config(path, trust_remote_code=True, hf_token=None):
+    """``AutoConfig.from_pretrained``, with a readable failure for an architecture it lacks."""
+    from transformers import AutoConfig
+
+    path = resolve_snapshot_path(path) if os.path.exists(str(path)) else path
+    kwargs = {'trust_remote_code': trust_remote_code}
+    if hf_token is not None:
+        kwargs['token'] = hf_token
+    try:
+        return AutoConfig.from_pretrained(path, **kwargs)
+    except Exception as exc:
+        model_type = _unrecognised_model_type(path, exc)
+        if model_type is None:
+            raise
+        import transformers
+
+        remote = (_SHIPS_REMOTE_CODE if _declares_remote_code(path) else _SHIPS_NO_REMOTE_CODE)
+        raise ValueError(_UNKNOWN_MODEL_TYPE.format(
+            version=transformers.__version__, model_type=model_type, remote=remote,
+            error=exc)) from exc
+
+
+def checkpoint_weight_map(checkpoint_path):
+    """``(tensor name -> file that stores it, is_safetensors)`` for a checkpoint directory.
+
+    Multi-shard checkpoints ship an index.json; small and modern ones often ship a single file with
+    no index at all, so one is synthesized from the file's own header. Nothing here reads tensor
+    data for the safetensors case -- the header answers it.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    if os.path.exists(checkpoint_path / 'pytorch_model.bin.index.json'):
+        with open(checkpoint_path / 'pytorch_model.bin.index.json', 'rb') as f:
+            return json.load(f)['weight_map'], False
+    if os.path.exists(checkpoint_path / 'model.safetensors.index.json'):
+        with open(checkpoint_path / 'model.safetensors.index.json', 'rb') as f:
+            return json.load(f)['weight_map'], True
+    if os.path.exists(checkpoint_path / 'model.safetensors'):
+        with safe_open(str(checkpoint_path / 'model.safetensors'), framework='pt') as f:
+            return {k: 'model.safetensors' for k in f.keys()}, True
+    if os.path.exists(checkpoint_path / 'pytorch_model.bin'):
+        single_sd = torch.load(checkpoint_path / 'pytorch_model.bin', map_location='cpu')
+        index = {k: 'pytorch_model.bin' for k in single_sd.keys()}
+        del single_sd
+        return index, False
+    raise FileNotFoundError(
+        f"No model weights found under {checkpoint_path}. Expected one of: "
+        f"model.safetensors(.index.json) or pytorch_model.bin(.index.json).")
+
+
+def _decoder_layer_prefix(names):
+    """Where the repeated decoder blocks live, read off the checkpoint's own tensor names.
+
+    The engine streams one thing per token: the stack of identical decoder layers. Finding it is
+    structural -- a path segment ``layers`` followed by an integer -- and never a lookup by
+    architecture, so a model released next month is found the same way.
+
+    A vision tower is frequently a stack of ``layers`` too, and on a small language model paired
+    with a big encoder it can be the *longer* stack, so counting blocks alone would stream the
+    wrong half of the checkpoint. What separates them is that only the text decoder has a token
+    embedding beside it, so that is the first thing sorted on.
+    """
+    stacks = {}
+    for name in names:
+        parts = name.split('.')
+        for index, part in enumerate(parts[:-1]):
+            if part == 'layers' and parts[index + 1].isdigit():
+                stacks.setdefault('.'.join(parts[:index + 1]), set()).add(int(parts[index + 1]))
+    if not stacks:
+        return None
+
+    known = set(names)
+
+    def score(prefix):
+        stem = prefix[:-len('.layers')].rstrip('.')
+        embed = f'{stem}.embed_tokens' if stem else 'embed_tokens'
+        has_embed = any(name == embed or name.startswith(embed + '.') for name in known)
+        # Shortest prefix last in the key, negated, so a tie breaks toward the outer stack.
+        return (has_embed, len(stacks[prefix]), -len(prefix))
+
+    return max(stacks, key=score)
+
+
+def _first_present(names, candidates):
+    """The first candidate module path the checkpoint actually stores tensors for."""
+    for candidate in candidates:
+        if candidate and any(name.startswith(candidate + '.') for name in names):
+            return candidate
+    return None
+
+
+def _resident_groups(names, streamed):
+    """Modules the streamed sequence does not cover, as the shallowest paths that stay clear of it.
+
+    A multimodal checkpoint carries a vision tower and a projector beside the decoder; some
+    checkpoints add extra top-level norms or a materialised rotary table. None of them are part of
+    embed -> layers -> norm -> lm_head, so nothing would ever load them, and the model would run
+    with those modules still on the meta device.
+
+    Each leftover tensor is walked outward from its root until the path stops being an ancestor of
+    something streamed. That is what keeps ``model.visual`` from collapsing into ``model`` on a
+    checkpoint whose decoder is ``model.language_model.layers``, without needing to know that
+    either name means anything.
+    """
+    groups = set()
+    for name in names:
+        if any(name == path or name.startswith(path + '.') for path in streamed):
+            continue
+        parts = name.split('.')
+        for cut in range(1, len(parts)):
+            candidate = '.'.join(parts[:cut])
+            if any(path == candidate or path.startswith(candidate + '.') for path in streamed):
+                continue
+            groups.add(candidate)
+            break
+    return sorted(groups)
+
+
+def resolve_layer_names(tensor_names, layer_names):
+    """Fit a layer-name plan to the checkpoint in front of us.
+
+    ``layer_names`` is what the model class declares -- the ordinary
+    ``model.embed_tokens / model.layers / model.norm / lm_head``, or a subclass's own. It is right
+    for nearly every text checkpoint and is left completely alone when it matches. What it cannot
+    cover is a checkpoint that nests its decoder somewhere else, which is what every multimodal one
+    does, and modules sitting outside the streamed sequence, which is what a vision tower is.
+
+    Returns a new dict; the input is not modified. Detection only overrides a name the checkpoint
+    disagrees with, so a model that already loads keeps loading exactly as it did.
+    """
+    names = list(tensor_names)
+    resolved = dict(layer_names)
+    known = set(names)
+
+    prefix = layer_names.get('layer_prefix')
+    if not prefix or not any(name.startswith(prefix + '.') for name in known):
+        found = _decoder_layer_prefix(names)
+        if found is None:
+            # Nothing that looks like a stack of decoder blocks. Say nothing and change nothing:
+            # the declared names are still the best information available, and the splitter's own
+            # error is clearer than a guess would be.
+            return resolved
+        prefix = found
+        resolved['layer_prefix'] = prefix
+        stem = prefix[:-len('.layers')].rstrip('.')
+        parent = stem.rpartition('.')[0]
+        for key, candidates in (
+                ('embed', (f'{stem}.embed_tokens' if stem else 'embed_tokens',)),
+                ('norm', (f'{stem}.norm' if stem else 'norm',)),
+                # lm_head sits at the top for a plain causal model, beside the decoder for one
+                # wrapped in a multimodal container, and under it for a couple of others.
+                ('lm_head', ('lm_head', f'{parent}.lm_head' if parent else None,
+                             f'{stem}.lm_head' if stem else None))):
+            found = _first_present(known, candidates)
+            if found is not None:
+                resolved[key] = found
+        log.info("decoder layers found at %r; streaming %s -> %s -> %s -> %s",
+                 prefix, resolved.get('embed'), prefix, resolved.get('norm'),
+                 resolved.get('lm_head'))
+
+    streamed = {resolved.get(key) for key in ('embed', 'layer_prefix', 'norm', 'lm_head')}
+    streamed.discard(None)
+    if 'rotary_pos_emb' in resolved:
+        streamed.add(resolved['rotary_pos_emb'])
+
+    declared = list(resolved.get('resident', ()))
+    discovered = [group for group in _resident_groups(known, streamed) if group not in declared]
+    if discovered:
+        log.info("modules outside the streamed sequence, loaded once and kept resident: %s",
+                 ", ".join(discovered))
+    resolved['resident'] = declared + discovered
+    return resolved
+
+
 def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitted_model_dir_name='splitted_model',
                           layer_names=None, delete_original=False, repo_id=None, hf_token=None):
     """
     Save the all layers of a model sharded checkpoint using safetensors.
+
+    ``layer_names`` is updated IN PLACE with whatever the checkpoint turns out to need -- a nested
+    decoder prefix, a vision tower to keep resident. The caller owns that dict and has to see the
+    same plan the split was written under, and this is the first point at which every tensor name
+    in the checkpoint is known.
     """
 
     checkpoint_path = Path(checkpoint_path)
@@ -194,38 +485,23 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         saving_path = Path(layer_shards_saving_path) / splitted_model_dir_name
 
 
-    # Build a weight_map (param name -> file that stores it). Multi-shard checkpoints ship an
-    # index.json; small/modern models often ship a single file with no index, so synthesize one.
-    safetensors_format = False
-    if os.path.exists(checkpoint_path / 'pytorch_model.bin.index.json'):
-        with open(checkpoint_path / 'pytorch_model.bin.index.json', 'rb') as f:
-            index = json.load(f)['weight_map']
-    elif os.path.exists(checkpoint_path / 'model.safetensors.index.json'):
-        safetensors_format = True
-        with open(checkpoint_path / 'model.safetensors.index.json', 'rb') as f:
-            index = json.load(f)['weight_map']
-    elif os.path.exists(checkpoint_path / 'model.safetensors'):
-        # single-file safetensors checkpoint: map every tensor to that one file
-        safetensors_format = True
-        from safetensors import safe_open
-        with safe_open(str(checkpoint_path / 'model.safetensors'), framework='pt') as f:
-            index = {k: 'model.safetensors' for k in f.keys()}
-    elif os.path.exists(checkpoint_path / 'pytorch_model.bin'):
-        # single-file torch checkpoint: map every tensor to that one file
-        safetensors_format = False
-        single_sd = torch.load(checkpoint_path / 'pytorch_model.bin', map_location='cpu')
-        index = {k: 'pytorch_model.bin' for k in single_sd.keys()}
-        del single_sd
-    else:
-        raise FileNotFoundError(
-            f"No model weights found under {checkpoint_path}. Expected one of: "
-            f"model.safetensors(.index.json) or pytorch_model.bin(.index.json).")
+    index, safetensors_format = checkpoint_weight_map(checkpoint_path)
+
+    if layer_names is not None:
+        layer_names.update(resolve_layer_names(index.keys(), layer_names))
 
     if layer_names is None:
         n_layers = len(set([int(k.split('.')[2]) for k in index.keys() if 'model.layers' in k]))
     else:
         prefix = layer_names['layer_prefix']
-        n_layers = len(set([int(k[len(prefix):].split('.')[1]) for k in index.keys() if prefix in k]))
+        # Anchored, not a substring test. `k[len(prefix):]` already assumes the key starts with the
+        # prefix, and a multimodal checkpoint is exactly where the two diverge: a vision tower's
+        # `...vision_model.encoder.layers.3....` contains `model.layers` without being one of them,
+        # and slicing it by length lands mid-name and either counts a layer that does not exist or
+        # raises on int().
+        n_layers = len(set(int(k[len(prefix) + 1:].split('.')[0])
+                           for k in index.keys() if k.startswith(prefix + '.')
+                           and k[len(prefix) + 1:].split('.')[0].isdigit()))
 
     if layer_names is None:
         layers = (['model.embed_tokens.'] + [f'model.layers.{i}.' for i in range(n_layers)]
@@ -447,15 +723,17 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
 
     # try local model path, if the model exist split and save there
     if os.path.exists(model_local_path_or_repo_id):
+        # A Hugging Face cache root keeps the files one level down under snapshots/<commit>, and
+        # that directory is the one people actually type -- it is the only one with the model's
+        # name in it. Resolving it here means both spellings work.
+        local_path = resolve_snapshot_path(model_local_path_or_repo_id)
         # Accept single-file checkpoints too, not just sharded ones with an index: the splitter
         # handles both, so requiring an index needlessly sent local single-file models down the
         # "treat it as a repo id" path, where they fail as an invalid repo name.
-        local_weight_files = ('pytorch_model.bin.index.json', 'model.safetensors.index.json',
-                              'model.safetensors', 'pytorch_model.bin')
-        if any(os.path.exists(Path(model_local_path_or_repo_id) / f) for f in local_weight_files):
+        if any(os.path.exists(local_path / f) for f in WEIGHT_INDEX_FILES):
             print("found local checkpoint...")
-            return Path(model_local_path_or_repo_id), split_and_save_layers(
-                model_local_path_or_repo_id, layer_shards_saving_path,
+            return local_path, split_and_save_layers(
+                local_path, layer_shards_saving_path,
                 layer_names=layer_names, delete_original=delete_original)
         else:
             print(f"Found local directory in {model_local_path_or_repo_id}, but didn't find a "

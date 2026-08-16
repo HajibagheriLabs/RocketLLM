@@ -38,6 +38,7 @@ from .protocol import (FINISH_LENGTH, FINISH_STOP, FINISH_TOOL_CALLS, SSE_DONE,
                        chat_id, completion_id, error_payload, sse)
 from .toolcalls import (ContentDelta, ToolCallDelta, ToolCallStream, ToolSetup, render_message,
                         resolve_tools, select_parser)
+from . import multimodal
 from . import prefix_cache as prefixes
 
 log = logging.getLogger("rocketllm.server")
@@ -532,11 +533,22 @@ class GenerationEngine:
     # -- prompts ----------------------------------------------------------------------------------
 
     def _encode_chat(self, request, setup):
+        """``(input_ids, extra model inputs)`` for a chat request.
+
+        The second element is empty for every text request and carries a vision-language model's
+        pixel tensors for the rest. It is kept separate from the token ids all the way through
+        because two things branch on whether it is empty: prefix reuse, which keys on token ids and
+        would happily hand back a cache built from a different picture, and speculative decoding,
+        whose draft never sees it.
+        """
+        if multimodal.has_images(request.messages):
+            return self._encode_multimodal(request, setup)
+
         messages = [render_message(m) for m in request.messages]
         template = getattr(self.tokenizer, "chat_template", None)
         if template:
             try:
-                return self._apply_template(messages, request, setup)
+                return self._apply_template(messages, request, setup), {}
             except Exception as exc:  # noqa: BLE001 - a broken template must not be a 500
                 caps.announce_once(
                     "server-chat-template",
@@ -550,7 +562,61 @@ class GenerationEngine:
                 "this tokenizer ships no chat template, so /v1/chat/completions renders a plain "
                 "role: content transcript. Use /v1/completions if you want to control the prompt "
                 "exactly.", logging.WARNING)
-        return self._encode_text(_plain_transcript(messages), add_special_tokens=True)
+        return self._encode_text(_plain_transcript(messages), add_special_tokens=True), {}
+
+    def _encode_multimodal(self, request, setup):
+        """A request carrying images, through the checkpoint's own processor.
+
+        The processor does both halves and neither can be done without it: it renders the template
+        with the model's image placeholders in the right places, and it expands each placeholder to
+        the number of tokens THIS checkpoint's patch and merge sizes produce for THAT image's
+        dimensions. Encoding the text separately and pasting pixels beside it gets the count wrong
+        and the model reads the picture at the wrong offset.
+        """
+        processor = getattr(self.model, "processor", None)
+        if processor is None:
+            raise RequestError(
+                "this request contains an image, and the loaded model has no multimodal processor "
+                "-- it is a text-only checkpoint, or its processor could not be built (the load "
+                "log says which). Send text-only messages, or serve a vision-language checkpoint.",
+                param="messages", code="model_not_multimodal")
+        if not (getattr(processor, "chat_template", None)
+                or getattr(self.tokenizer, "chat_template", None)):
+            raise RequestError(
+                "this model ships no chat template, so there is nowhere to put an image: the "
+                "template is what renders the placeholder tokens the model was trained to read a "
+                "picture from. Use /v1/completions for exact control of a text prompt.",
+                param="messages", code="no_chat_template")
+
+        images = multimodal.collect_images(request.messages)
+        messages = [render_message(m, content=multimodal.template_content(m))
+                    for m in request.messages]
+        kwargs = dict(add_generation_prompt=request.add_generation_prompt, tokenize=False)
+        if request.continue_final_message:
+            kwargs["add_generation_prompt"] = False
+            kwargs["continue_final_message"] = True
+        if setup.tools:
+            kwargs["tools"] = setup.tools
+            self._check_template_renders_tools(messages, request, setup)
+        try:
+            text = processor.apply_chat_template(messages, **kwargs)
+            encoded = processor(text=[text], images=images, return_tensors="pt")
+        except RequestError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a client's picture must not be a 500
+            raise RequestError(
+                f"this model's processor could not render the request ({exc}). The usual cause is "
+                f"an image the model's own template does not expect -- a count of images the "
+                f"conversation's turns do not account for, or a size the processor rejects.",
+                param="messages") from exc
+
+        # attention_mask is rebuilt in _generate from the ids, and input_ids is returned on its own,
+        # so everything else the processor produced is what the model needs beside the tokens.
+        extra = {name: value for name, value in encoded.items()
+                 if name not in ("input_ids", "attention_mask")}
+        log.info("multimodal request: %d image(s), %d prompt tokens, extra inputs %s",
+                 len(images), int(encoded["input_ids"].shape[-1]), sorted(extra))
+        return encoded["input_ids"], extra
 
     def _apply_template(self, messages, request, setup):
         kwargs = dict(add_generation_prompt=request.add_generation_prompt,
@@ -645,8 +711,8 @@ class GenerationEngine:
             caps.announce_once(f"server-tool-choice-{setup.unenforced[:24]}", setup.unenforced,
                                logging.INFO)
 
-        input_ids = (self._encode_chat(request, setup) if chat
-                     else self._encode_completion(request))
+        input_ids, model_inputs = (self._encode_chat(request, setup) if chat
+                                   else (self._encode_completion(request), {}))
         prompt_tokens = int(input_ids.shape[-1])
         settings = SamplingSettings.from_request(request, self._token_budget(request, prompt_tokens))
         if settings.ignored:
@@ -667,14 +733,19 @@ class GenerationEngine:
                                    hold=max((len(s) for s in settings.stop), default=0))
 
         sink = _Sink(self.tokenizer, settings, job.emit, job.cancel, tools=tools)
+        # A request carrying images opts out of prefix reuse, and that is a correctness rule rather
+        # than a tuning choice: the cache is keyed by token ids, and one image's placeholder tokens
+        # are identical to another's of the same size. Two different pictures would key the same
+        # checkpoint and the second request would answer about the first one's, with nothing
+        # anywhere to show it had happened.
+        store = None if model_inputs else self.prefixes
         session = prefixes.PrefixSession(
-            self.prefixes, input_ids[0].tolist(), config=getattr(self.model, "kv_cache_config",
-                                                                 None),
+            store, input_ids[0].tolist(), config=getattr(self.model, "kv_cache_config", None),
             layers=self.layer_count, device=getattr(self.model, "device", None))
         sink.prefix = session
 
         started = time.perf_counter()
-        self._generate(input_ids, settings, sink, session)
+        self._generate(input_ids, settings, sink, session, model_inputs)
         prefill_seconds = ((sink.first_token_at - started)
                            if sink.first_token_at is not None else None)
         session.finish(prefill_seconds=prefill_seconds)
@@ -687,7 +758,9 @@ class GenerationEngine:
                            tool_calls=sink.tool_calls))
 
     def _log_prefix(self, job, session, prefill_seconds):
-        if not self.prefixes.enabled:
+        # session.cache is None for a request that opted out -- reporting a "miss" for one that was
+        # never looked up would put it in the hit-rate arithmetic a reader does in their head.
+        if not self.prefixes.enabled or session.cache is None:
             return
         summary = session.summary()
         measured = f"{prefill_seconds * 1000:.0f}ms" if prefill_seconds is not None else "unknown"
@@ -704,7 +777,7 @@ class GenerationEngine:
             log.info("request %s: prefix miss, %d prompt tokens prefilled in %s",
                      job.id, summary["prompt_tokens"], measured)
 
-    def _generate(self, input_ids, settings, sink, session=None):
+    def _generate(self, input_ids, settings, sink, session=None, model_inputs=None):
         import torch
 
         if settings.seed is not None:
@@ -727,6 +800,19 @@ class GenerationEngine:
         if device is not None:
             input_ids = input_ids.to(device)
         attention_mask = torch.ones_like(input_ids)
+
+        for name, value in (model_inputs or {}).items():
+            # The pixel tensors travel to the device with the ids. A float one is cast to the
+            # running dtype as well: the processor produces float32 whatever the model runs in, and
+            # a vision tower whose weights are bf16 refuses a float32 input in its first matmul.
+            if isinstance(value, torch.Tensor):
+                if device is not None:
+                    value = value.to(device)
+                if value.is_floating_point():
+                    dtype = getattr(self.model, "running_dtype", None)
+                    if dtype is not None:
+                        value = value.to(dtype)
+            kwargs[name] = value
 
         if session is not None and self.prefixes.enabled:
             # Handing generate() a pre-filled cache with the FULL input_ids is how transformers is
@@ -769,6 +855,9 @@ class GenerationEngine:
             "tool_parser": self.tool_parser.family,
             "prefix_cache": self.prefixes.enabled,
             "max_tokens_cap": self.max_tokens_cap,
+            # Whether this deployment accepts image parts at all. A client that gets a 400 on its
+            # first picture should be able to find out here rather than by reading the load log.
+            "multimodal": getattr(model, "processor", None) is not None,
         })
 
     def health(self, queue, verbose=False):

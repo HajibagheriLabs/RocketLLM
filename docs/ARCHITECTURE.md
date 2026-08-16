@@ -271,6 +271,74 @@ What does work, and is implemented:
 - parallel fetch of the top-k *within* a layer, once that layer's router has fired,
 - pinning shared/always-on experts, which run for every token by construction.
 
+## Vision-language models
+
+There is no vision-language code path. A multimodal checkpoint reaches the same `RocketModel` as
+every other, and the four places it differs are each answered structurally.
+
+**Which auto class builds the skeleton.** `AutoModelForCausalLM.from_config` rejects a
+vision-language config outright — with a ValueError listing every config class it *does* know, which
+reads like an attention-implementation failure and is not one. `MODEL_FACTORIES` in
+`rocketllm/base.py` tries the causal factory, then `AutoModelForImageTextToText`, then
+`AutoModelForVision2Seq`, and `_refuses_config` separates "this factory has no entry for that
+config" from "sdpa is unavailable" so only the second one is reported as an attention fallback.
+`model.model_factory` records which one won.
+
+**Where the decoder is.** `utils.resolve_layer_names` reads the checkpoint's own tensor names and
+finds the stack of repeated blocks: a path segment `layers` followed by an integer. A vision tower
+is frequently a stack of `layers` too, and on a small language model with a big encoder it is the
+*longer* one, so candidates are sorted first on whether a token embedding sits beside them. The
+declared names are left completely alone when the checkpoint agrees with them, which is every text
+model.
+
+**What the streamed sequence does not cover.** Whatever is left after `embed → layers → norm →
+lm_head` becomes a *resident* module: it gets its own shard and is loaded once. That is where a
+vision tower, a projector or an extra top-level norm ends up, found by exclusion rather than by
+name. Resident rather than streamed because it runs once per *request*, not once per token — see
+`RocketModel._load_resident_modules`. It is placed before the weight cache is sized, so the budget
+the cache reads is what is left after it, and `_report_resident_share` says so when that share is
+large enough to explain a small cache.
+
+### Checkpoint names are not always module names
+
+This is the one that fails everywhere at once when it is wrong, and it is invisible until the first
+parameter is placed.
+
+transformers restructured its multimodal wrappers after their checkpoints had shipped. Qwen2.5-VL
+stores `model.layers.0…` and `visual…`; the class transformers now builds holds
+`model.language_model.layers.0…` and `model.visual…`. transformers reconciles the two while loading,
+through a per-class `_checkpoint_conversion_mapping` of regex renames. RocketLLM does its own
+placement, so it applies the same renames itself: `checkpoint_name_mapper` compiles that mapping and
+`RocketModel.module_name` applies it, first rule that matches winning and the rest skipped, which is
+what transformers does.
+
+There is exactly one place a shard is translated — the top of `move_layer_to_device`. Everything
+downstream of it (the quant plan, the coalesced binds, the names sent back to meta afterwards) is in
+the model's namespace. The fused-expert path does not pass through there and translates its own keys
+in `_place_expert_rows`; if a third placement path is ever added, it needs the same line. Shard
+filenames, `layer_names`, and everything the loader reads stay in the *checkpoint's* namespace,
+because that is what is on disk.
+
+On a transformers with no such mapping the translation is the identity — and that is also the
+transformers on which those checkpoints needed no translation, which is why nothing here has a
+version test in it.
+
+### The processor sits beside the tokenizer, never in place of it
+
+`RocketModel.processor` is the checkpoint's own `AutoProcessor`, or None. It is the only thing that
+knows how many placeholder tokens one image expands to for a given checkpoint — a count that depends
+on the image's dimensions against the model's patch and merge sizes.
+
+It does not replace `RocketModel.tokenizer`. Every text path calls the tokenizer directly and a
+processor's `__call__` takes images as its first positional argument, so substituting one would pass
+prompts in as pictures. The tokenizer is taken from *inside* the processor where it has one, so the
+two cannot disagree about the vocabulary.
+
+Note that a processor is not always buildable: transformers resolves every attribute a processor
+class declares, and a video-capable one declares a video processor, which needs torchvision. Absent
+it, `init_processor` warns once and returns None — text generation is unaffected and image requests
+are refused with the reason.
+
 ## The quantization interface
 
 RocketLLM **imports** pre-quantized checkpoints; it never quantizes a model itself.
@@ -420,16 +488,44 @@ Two of its changes are absorbed rather than pinned around:
 
 ### What transformers 5 still needs
 
-Not supported, and the blocker is MoE rather than the cache. transformers 5 renamed the expert
+Not supported, and the blocker is MoE rather than the cache. transformers 5 replaced the expert
 containers this engine streams: Mixtral's `block_sparse_moe` is gone, and Qwen2-MoE's per-expert
-`ModuleList` became a fused `Qwen2MoeExperts` module. Expert streaming reads the wrong modules
-against it, which costs correctness on mixtures and is why the pin exists.
+`ModuleList` became a fused `Qwen2MoeExperts` module holding `gate_up_proj` / `down_proj` batched
+over the expert axis. Expert streaming reads the wrong modules against it, which costs correctness
+on mixtures and is why the pin exists.
 
-The port is mostly in `moe/detect.py`, and the detector is already structural — it decides from
-module shape and checkpoint tensor shape rather than from an architecture name — so the work is
-teaching it the new container shapes, not special-casing versions. Dense models are unaffected;
-the KV cache and prefix cache already work on 5.x. Anyone picking this up should start by running
-`pytest tests/test_moe_detect.py tests/test_moe_streaming.py` against transformers 5.
+**What the pin costs.** Architectures added in 5.x cannot be served here at all. `qwen3_5` and
+`qwen3_5_moe` first appear in transformers 5.2, so a checkpoint declaring either fails at config
+load; `utils.load_checkpoint_config` says exactly that, names the installed version, and states the
+bound, rather than leaving a `KeyError: 'qwen3_5'` to be interpreted. That list grows with every 5.x
+release, so this is the deadline on the port rather than a nice-to-have.
+
+**What the port actually involves.** More than teaching `moe/detect.py` a new container shape, and
+the extra part is the reason it is not a version bump:
+
+1. **A fused module over a per-expert checkpoint is a shape change, not a rename.** transformers 5
+   converts a `ModuleList` checkpoint into fused tensors as it loads. The engine already applies
+   transformers' rename mapping (see *Checkpoint names are not always module names* above), but
+   `…experts.0.w1.weight` → a row of `experts.gate_up_proj` is a concatenation of many checkpoint
+   tensors into one parameter, which no rename expresses. Either the loader learns to assemble a
+   fused parameter from per-expert shards — placing only the routed rows, which is the whole point —
+   or the split writes fused shards up front and pays it once at split time.
+2. **Detection stays structural but gains a case.** Today a checkpoint is either per-expert or
+   fused, and the module tree agrees with it. On 5.x the module tree is fused while the checkpoint
+   may be either, so `detect_expert_layout` needs the two to be allowed to disagree, and
+   `_module_list_container`'s "the module tree says experts, the shard does not store them per
+   expert" rejection becomes a supported combination rather than a reason to stream the layer whole.
+3. **The rest is smaller than it looks.** The detector already decides from module shape and
+   checkpoint tensor shape rather than from an architecture name; dense models are unaffected; the
+   KV cache and prefix cache already work on 5.x; the vision-language path was written against
+   transformers' own rename mechanism and needs nothing.
+
+Anyone picking this up should start by running `pytest tests/test_moe_detect.py
+tests/test_moe_streaming.py tests/test_cpu_generation.py` against transformers 5 in a throwaway
+environment, and should expect the dense half to pass immediately. Raise the ceiling in
+`pyproject.toml` and `requirements.txt` only once `tests/test_cpu_generation.py`'s Mixtral case
+reports identical tokens — a mixture that reads the wrong experts still generates fluent text, so a
+smoke test will not catch it.
 
 ## Things that look like improvements and are not
 

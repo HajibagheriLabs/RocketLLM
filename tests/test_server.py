@@ -751,8 +751,11 @@ class TestTheChatTemplateEncoding(unittest.TestCase):
 
         engine = GenerationEngine(FakeModel(tokenizer))
         request = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}])
-        encoded = engine._encode_chat(request, resolve_tools(request))
+        encoded, model_inputs = engine._encode_chat(request, resolve_tools(request))
         self.assertEqual(encoded.tolist(), expected.tolist())
+        # A text request carries nothing beside its token ids, and that emptiness is load-bearing:
+        # it is what keeps prefix reuse and speculative decoding switched on for ordinary traffic.
+        self.assertEqual(model_inputs, {})
 
 
 class TestMetadataEndpoints(ServerTestCase):

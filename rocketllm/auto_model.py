@@ -1,7 +1,8 @@
 import importlib
 import warnings
-from transformers import AutoConfig
 from sys import platform
+
+from .utils import load_checkpoint_config
 
 is_on_mac_os = (platform == "darwin")
 
@@ -29,11 +30,11 @@ class AutoModel:
 
     @classmethod
     def get_module_class(cls, pretrained_model_name_or_path, *inputs, **kwargs):
-        if 'hf_token' in kwargs:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True,
-                                                token=kwargs['hf_token'])
-        else:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+        # A path may be a Hugging Face cache root rather than the snapshot inside it; load_checkpoint_config
+        # resolves that, and turns "transformers does not recognize this architecture" into a
+        # message that says where it leaves RocketLLM.
+        config = load_checkpoint_config(pretrained_model_name_or_path, trust_remote_code=True,
+                                        hf_token=kwargs.get('hf_token'))
 
         architectures = getattr(config, "architectures", None) or []
         arch = architectures[0] if architectures else ""
