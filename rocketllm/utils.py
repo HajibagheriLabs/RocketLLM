@@ -252,10 +252,9 @@ If the checkpoint is newer than any release:
 
   pip install "transformers @ git+https://github.com/huggingface/transformers.git"
 
-Note that RocketLLM currently requires transformers<5.0, and that bound is not arbitrary: \
-transformers 5 replaced the per-expert module lists this engine streams with one fused expert \
-module, so per-expert streaming reads the wrong tensors against it. If {model_type!r} exists only \
-in a 5.x release, it cannot be served here until that port is done.
+RocketLLM supports transformers 4.49 and up, both the 4.x and 5.x lines, so an upgrade is not \
+blocked from this side. Note that transformers 5 requires Python 3.10 or newer -- on 3.9, pip \
+resolves the newest 4.x instead and an architecture added in 5.x stays out of reach.
 
 Original error: {error}"""
 

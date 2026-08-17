@@ -99,6 +99,22 @@ class DenseLayer(nn.Module):
         self.norm = nn.LayerNorm(hidden)
 
 
+class GatedLinearAttention(nn.Module):
+    """A depthwise convolution beside a projection that happens to share its leading dimension.
+
+    Modelled on Qwen3.5's ``linear_attn``, and it is not a mixture. The conv's weight is
+    ``[expanded, 1, kernel]`` and the projection's is ``[expanded, hidden]``, so both lead with the
+    same number and the pair has the shape of "N experts with a router in front of them" -- for a
+    real model, N of 8192.
+    """
+
+    def __init__(self, hidden=8, expanded=32, kernel=4):
+        super().__init__()
+        self.conv1d = nn.Conv1d(expanded, expanded, kernel, groups=expanded, bias=False)
+        self.in_proj_qkv = nn.Linear(hidden, expanded, bias=False)
+        self.out_proj = nn.Linear(expanded, hidden, bias=False)
+
+
 class Layer(nn.Module):
     """A decoder layer wrapping whatever block is under test."""
 
@@ -114,6 +130,23 @@ class TestStructuralDetection(unittest.TestCase):
 
     def detect(self, layer, config=None):
         return detect_expert_layout(layer, shapes_of(layer, self.PREFIX), self.PREFIX, config)
+
+    def test_a_depthwise_convolution_is_not_a_mixture_of_experts(self):
+        """The most dangerous false positive this detector can produce.
+
+        A batched leading dimension plus one sibling that shares it is the whole of the fused
+        signature, and a gated linear-attention block satisfies both by coincidence. Accepting it
+        means streaming top-k rows of a convolution every token needs in full: the rest are left
+        zero, the model still writes fluent text, and nothing anywhere says so. A config that
+        declares a routing width -- which the real one does, for the mixture in the *other* half of
+        the same layer -- removes the last thing that used to stop it.
+        """
+        layer = Layer(GatedLinearAttention(), hidden=8)
+        layout = self.detect(layer, {"num_experts_per_tok": 8, "num_experts": 256})
+
+        self.assertEqual(layout.containers, (),
+                         f"a convolution was read as experts: "
+                         f"{[c.describe() for c in layout.containers]}")
 
     def test_module_list_layout_is_found(self):
         layer = Layer(ModuleListMoE(experts=4))
@@ -350,7 +383,14 @@ class TestRealArchitectures(unittest.TestCase):
         layer = model.get_submodule(layer_name)
         return detect_expert_layout(layer, self._layer_shapes(model, layer_name), layer_name, config)
 
-    def test_mixtral_is_a_module_list(self):
+    def test_mixtral_experts_are_found_whichever_way_transformers_builds_them(self):
+        """The shard here mirrors the model's own parameters, so the two agree by construction.
+
+        Which layout that is, is the running transformers' choice and not the checkpoint's: 4.x
+        builds an ``nn.ModuleList`` and 5.x one batched module. Both are found, both name the same
+        module path, and both agree on how many experts there are and how many a token visits --
+        which is everything the engine goes on to use.
+        """
         from transformers import MixtralConfig, MixtralForCausalLM
         config = MixtralConfig(hidden_size=16, intermediate_size=32, num_hidden_layers=1,
                                num_attention_heads=4, num_key_value_heads=2, vocab_size=64,
@@ -360,8 +400,8 @@ class TestRealArchitectures(unittest.TestCase):
 
         self.assertEqual(len(layout.containers), 1)
         container = layout.containers[0]
-        self.assertEqual(container.layout, LAYOUT_MODULE_LIST)
-        self.assertEqual(container.path, "block_sparse_moe.experts")
+        self.assertIn(container.layout, (LAYOUT_MODULE_LIST, LAYOUT_FUSED))
+        self.assertTrue(container.path.endswith(".experts"), container.path)
         self.assertEqual((container.num_experts, container.top_k), (4, 2))
 
     def test_qwen2_moe_shared_expert_is_found_beside_the_routed_ones(self):

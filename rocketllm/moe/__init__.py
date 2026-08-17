@@ -8,14 +8,15 @@ The rule the rest of the package relies on: there is NO cross-layer router looka
 router runs inside layer L, so layer L+1's experts are unknowable until L has finished. Nothing in
 here may be designed around one.
 """
-from .detect import (LAYOUT_FUSED, LAYOUT_MODULE_LIST, ExpertContainer, ExpertLayout,
-                     detect_expert_layout, resolve_top_k, summarize)
+from .detect import (LAYOUT_FUSED, LAYOUT_FUSED_MERGE, LAYOUT_MODULE_LIST, ExpertContainer,
+                     ExpertLayout, MergedTarget, detect_expert_layout, resolve_top_k, summarize)
 from .expert_cache import ExpertRecord, ExpertResidency, ExpertStats, is_shared, shared_kind
 from .router import RouterSelection
 
 __all__ = [
     "detect_expert_layout", "summarize", "resolve_top_k",
-    "ExpertLayout", "ExpertContainer", "LAYOUT_MODULE_LIST", "LAYOUT_FUSED",
+    "ExpertLayout", "ExpertContainer", "MergedTarget",
+    "LAYOUT_MODULE_LIST", "LAYOUT_FUSED", "LAYOUT_FUSED_MERGE",
     "RouterSelection",
     "ExpertResidency", "ExpertStats", "ExpertRecord", "shared_kind", "is_shared",
 ]

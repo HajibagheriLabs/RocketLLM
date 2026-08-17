@@ -84,13 +84,22 @@ torch behind it:
 pip install "rocketllm[vision]" --extra-index-url https://download.pytorch.org/whl/cu121
 ```
 
-**Supported versions.** Python 3.9–3.13, PyTorch >= 2.4, and `transformers >= 4.49, < 5.0`. CI runs
-both ends of that transformers range on every supported Python. transformers 5 is not supported yet:
-it replaced the expert containers this engine streams with fused ones, so mixture-of-experts models
-read the wrong modules against it. The cost of that bound is worth knowing before you meet it — an
-architecture added in 5.x cannot be loaded here at all, `qwen3_5` and `qwen3_5_moe` among them, and
-a checkpoint declaring one fails at config load with a message that says so rather than a
-`KeyError`. [Scope of the port](https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/ARCHITECTURE.md#what-transformers-5-still-needs).
+**Supported versions.** Python 3.9–3.13, PyTorch >= 2.4, and `transformers >= 4.49, < 6.0` — both
+the 4.x and 5.x lines. CI runs the declared minimum, the newest 4.x and the newest 5.x on every
+supported Python, because the two generations disagree about what a mixture's module tree looks
+like and a green 5.x cell says nothing about the 4.x most installs are still on.
+
+transformers 5 rebuilt mixtures around one batched expert module and replaced the per-class rename
+dict with a declarative conversion pipeline. RocketLLM reads both from transformers rather than
+restating them, so a checkpoint whose stored shape no longer matches the module it loads into — an
+ordinary per-expert Mixtral file, on 5.x — is assembled a row at a time as it streams, and still
+costs a token its own experts rather than the layer's.
+[How it works](https://github.com/HajibagheriLabs/rocketllm/blob/main/docs/ARCHITECTURE.md#transformers-5).
+
+One asymmetry worth knowing: transformers 5 requires Python 3.10, so a 3.9 install resolves back to
+4.x whatever you ask for, and architectures added in 5.x (`qwen3_5`, `qwen3_5_moe`) are out of reach
+there. A checkpoint declaring one fails at config load with a message that says so, rather than a
+`KeyError`.
 
 ## Quickstart
 

@@ -486,46 +486,58 @@ Two of its changes are absorbed rather than pinned around:
   are a reference implementation to compare against, never a dependency, so their absence degrades
   to the built-in int4 cache with a message.
 
-### What transformers 5 still needs
+### transformers 5
 
-Not supported, and the blocker is MoE rather than the cache. transformers 5 replaced the expert
-containers this engine streams: Mixtral's `block_sparse_moe` is gone, and Qwen2-MoE's per-expert
-`ModuleList` became a fused `Qwen2MoeExperts` module holding `gate_up_proj` / `down_proj` batched
-over the expert axis. Expert streaming reads the wrong modules against it, which costs correctness
-on mixtures and is why the pin exists.
+Supported. It is a real break rather than a version bump, and the engine absorbs it in one place
+instead of branching on a version number anywhere.
 
-**What the pin costs.** Architectures added in 5.x cannot be served here at all. `qwen3_5` and
-`qwen3_5_moe` first appear in transformers 5.2, so a checkpoint declaring either fails at config
-load; `utils.load_checkpoint_config` says exactly that, names the installed version, and states the
-bound, rather than leaving a `KeyError: 'qwen3_5'` to be interpreted. That list grows with every 5.x
-release, so this is the deadline on the port rather than a nice-to-have.
+Two of its changes reach this engine directly:
 
-**What the port actually involves.** More than teaching `moe/detect.py` a new container shape, and
-the extra part is the reason it is not a version bump:
+- **The expert containers moved.** Mixtral's `block_sparse_moe` is gone and its per-expert
+  `nn.ModuleList` became a batched `MixtralExperts` holding `gate_up_proj` / `down_proj` over the
+  expert axis; Qwen2-MoE and the Qwen3.5 family are the same. The published *checkpoints* did not
+  move with them, so `…experts.0.w1.weight` is now row 0 of a fused parameter.
+- **The rename dict became a pipeline.** `_checkpoint_conversion_mapping`, a per-class dict of regex
+  renames, was replaced by `conversion_mapping.get_model_conversion_mapping(model)` — an ordered list
+  of `WeightRenaming` and `WeightConverter` objects that can change a tensor's *shape*, not only its
+  name.
 
-1. **A fused module over a per-expert checkpoint is a shape change, not a rename.** transformers 5
-   converts a `ModuleList` checkpoint into fused tensors as it loads. The engine already applies
-   transformers' rename mapping (see *Checkpoint names are not always module names* above), but
-   `…experts.0.w1.weight` → a row of `experts.gate_up_proj` is a concatenation of many checkpoint
-   tensors into one parameter, which no rename expresses. Either the loader learns to assemble a
-   fused parameter from per-expert shards — placing only the routed rows, which is the whole point —
-   or the split writes fused shards up front and pays it once at split time.
-2. **Detection stays structural but gains a case.** Today a checkpoint is either per-expert or
-   fused, and the module tree agrees with it. On 5.x the module tree is fused while the checkpoint
-   may be either, so `detect_expert_layout` needs the two to be allowed to disagree, and
-   `_module_list_container`'s "the module tree says experts, the shard does not store them per
-   expert" rejection becomes a supported combination rather than a reason to stream the layer whole.
-3. **The rest is smaller than it looks.** The detector already decides from module shape and
-   checkpoint tensor shape rather than from an architecture name; dense models are unaffected; the
-   KV cache and prefix cache already work on 5.x; the vision-language path was written against
-   transformers' own rename mechanism and needs nothing.
+Both are read from transformers rather than restated, in `rocketllm/conversion.py`. That module
+never mentions an architecture and must not learn to: the declarations are precisely what changes
+when a model is released, and reading them is what keeps this engine working on the day it is. It
+answers two questions — what a checkpoint key is called in the module tree, and, for a fused expert
+parameter, which checkpoint tensors compose one row of it and how.
 
-Anyone picking this up should start by running `pytest tests/test_moe_detect.py
-tests/test_moe_streaming.py tests/test_cpu_generation.py` against transformers 5 in a throwaway
-environment, and should expect the dense half to pass immediately. Raise the ceiling in
-`pyproject.toml` and `requirements.txt` only once `tests/test_cpu_generation.py`'s Mixtral case
-reports identical tokens — a mixture that reads the wrong experts still generates fluent text, so a
-smoke test will not catch it.
+**The one piece of arithmetic that is derived rather than borrowed.** transformers declares
+`[MergeModulelist(dim=0), Concatenate(dim=1)]`: stack every expert, then join the stacks. RocketLLM
+needs *one row*, so it performs the same join one dimension lower — `cat([w1[e], w3[e]], dim=0)`.
+That shift by one is the whole of the difference, and it is the thing to be careful about: get it
+wrong and every expert's weight has its halves swapped, which produces fluent, wrong output rather
+than an error. `tests/test_conversion.py` checks the arithmetic against a real model's own fused
+tensors, and `tests/test_cpu_generation.py`'s Mixtral case checks the result token for token against
+a full load.
+
+A declared conversion whose operations are anything else — a chunk, a transpose, a rope permutation
+— has no row-level form here and is declined, so that layer streams whole and stays correct. Losing
+the byte savings on a layout nobody has shipped yet is the right trade against guessing at it.
+
+**What this cost the streaming.** Nothing. A per-expert checkpoint already stores each expert as its
+own tensors, so reading the routed few costs their own bytes exactly as slicing a fused tensor does;
+only the assembly is new, and it is a concatenation of tensors already in hand. See
+`RocketModel._merge_expert_rows`.
+
+**The third layout.** `moe/detect.py` now recognises `fused_merge` beside `module_list` and `fused`:
+a batched module over a per-expert checkpoint. Which of the three a given file gets is a property of
+the running transformers, not of the file — one Mixtral checkpoint is a module list on 4.x and a
+`fused_merge` on 5.x — so the tests assert what must hold either way rather than one release's
+answer.
+
+**Where the two generations still differ, deliberately.** transformers 5 requires Python 3.10, so a
+3.9 install resolves to 4.x whatever the declared range allows, and an architecture added in 5.x —
+`qwen3_5` and `qwen3_5_moe` first appear in 5.2 — is out of reach there.
+`utils.load_checkpoint_config` says so by name rather than leaving a `KeyError: 'qwen3_5'` to be
+interpreted. CI runs the declared minimum, the newest 4.x and the newest 5.x, because a green 5.x
+cell says nothing about whether 4.x still streams the checkpoints most people are running.
 
 ## Things that look like improvements and are not
 

@@ -59,14 +59,24 @@ jobs:
       # WHICH combination broke, and fail-fast throws that information away.
       fail-fast: false
       matrix:
-        # The floor of requires-python through to the newest interpreter, against both ends of the
-        # transformers range pyproject.toml declares -- "latest" being the newest release that
-        # range still admits. transformers moves things between these versions: torch_dtype to
-        # dtype, relocated cache symbols, and in 4.57 the whole Cache layout from parallel
-        # key/value lists to per-layer objects. The engine reads both, which is only true for as
-        # long as something checks it, so both ends run on every supported Python.
+        # The floor of requires-python through to the newest interpreter, against three points in
+        # the transformers range pyproject.toml declares. transformers moves things between these:
+        # torch_dtype to dtype, relocated cache symbols, in 4.57 the whole Cache layout from
+        # parallel key/value lists to per-layer objects, and in 5.x both the expert containers this
+        # engine streams and the mechanism that describes a checkpoint's names. The engine reads all
+        # of it, which is only true for as long as something checks it.
+        #
+        # "v4-latest" is not redundant with "latest". The two generations disagree about what a
+        # mixture's module tree looks like -- 5.x builds one batched expert module over the same
+        # per-expert files 4.x builds a ModuleList from -- so a green 5.x cell says nothing about
+        # whether 4.x still streams those checkpoints, which most people are still running.
         python-version: ["3.9", "3.10", "3.11", "3.12"]
-        transformers: ["minimum", "latest"]
+        transformers: ["minimum", "v4-latest", "latest"]
+        exclude:
+          # transformers 5 requires Python 3.10, so on 3.9 "latest" resolves back to a 4.x and the
+          # cell would silently duplicate v4-latest rather than testing what it claims to.
+          - python-version: "3.9"
+            transformers: "latest"
         include:
           # 3.13 is paired only with a current transformers: the minimum this project supports
           # predates 3.13 and pinning it there would be testing pip's resolver, not RocketLLM.
@@ -95,6 +105,12 @@ jobs:
       - name: Pin transformers to the declared minimum
         if: matrix.transformers == 'minimum'
         run: python -m pip install "transformers==4.49.*"
+
+      # The newest of the 4.x line, which is what most installs are still on and which builds
+      # mixtures as per-expert module lists.
+      - name: Pin transformers to the newest 4.x
+        if: matrix.transformers == 'v4-latest'
+        run: python -m pip install "transformers>=4.57,<5.0"
 
       - name: Report the environment under test
         run: |

@@ -247,17 +247,40 @@ class TestUnknownArchitecture(unittest.TestCase):
     def test_it_names_the_model_type_the_installed_transformers_and_what_to_type(self):
         import transformers
 
-        message = self.message_for({"model_type": "qwen3_5",
-                                    "architectures": ["Qwen3_5ForCausalLM"]})
-        self.assertIn("qwen3_5", message)
+        message = self.message_for({"model_type": "a_model_type_nobody_has_published",
+                                    "architectures": ["NoSuchForCausalLM"]})
+        self.assertIn("a_model_type_nobody_has_published", message)
         self.assertIn(transformers.__version__, message)
         self.assertIn("pip install --upgrade transformers", message)
 
-    def test_it_states_the_version_bound_that_may_be_the_real_obstacle(self):
-        """Upgrading transformers is the obvious advice and is not sufficient here. Saying only the
-        obvious half sends someone to install a version this package will then refuse."""
-        message = self.message_for({"model_type": "qwen3_5_moe"})
-        self.assertIn("transformers<5.0", message)
+    def test_it_states_the_supported_range_so_the_upgrade_advice_is_actionable(self):
+        """"Upgrade transformers" is only useful next to what this package will accept.
+
+        It also has to name the interpreter floor: transformers 5 needs Python 3.10, so on 3.9 the
+        upgrade silently resolves back to a 4.x that still does not have the architecture, and
+        nothing would explain why the advice did not work.
+        """
+        message = self.message_for({"model_type": "a_model_type_nobody_has_published"})
+        self.assertIn("4.49", message)
+        self.assertIn("3.10", message)
+
+    def test_an_architecture_added_in_transformers_5_loads_when_transformers_has_it(self):
+        """The `KeyError: 'qwen3_5'` this whole path was built around, from the other side.
+
+        Skipped rather than dropped on an older transformers: the message under test is only
+        reachable where the architecture is genuinely absent, and which of the two cases the
+        running environment is in is exactly what a reader needs to see recorded.
+        """
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+        if "qwen3_5" not in CONFIG_MAPPING_NAMES:
+            # Refused, and the refusal explains itself -- which is the whole of the behaviour on a
+            # transformers that does not have it.
+            self.assertIn("qwen3_5", self.message_for({"model_type": "qwen3_5"}))
+            self.skipTest("this transformers predates qwen3_5, so it is correctly refused")
+        self.write({"model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"]})
+        config = load_checkpoint_config(self.root)
+        self.assertEqual(config.model_type, "qwen3_5")
 
     def test_it_says_whether_the_checkpoint_carries_modeling_code_of_its_own(self):
         """Whether trust_remote_code had anything to work with changes what to do next."""

@@ -261,11 +261,19 @@ class TestTextOnlyIsUnchanged(unittest.TestCase):
         return StreamedVL(str(self.root), device=DEVICE, dtype=torch.float32)
 
     def test_a_text_checkpoint_takes_the_causal_factory_and_needs_no_translation(self):
+        """Asserted over names rather than over whether a mapping object exists.
+
+        transformers 5 declares a handful of legacy renames (LayerNorm.gamma and friends) for every
+        model, so "there is no mapping" stopped being true while "nothing in this checkpoint moves"
+        stayed true. The second is the property that matters.
+        """
         model = self.stream()
         try:
             self.assertEqual(model.model_factory, "AutoModelForCausalLM")
-            self.assertIsNone(model._to_module_name)
-            self.assertEqual(model.module_name("model.layers.0"), "model.layers.0")
+            for name, _ in model.model.named_parameters():
+                self.assertEqual(model.module_name(name), name,
+                                 f"{name} was translated on a checkpoint that needs no translation")
+            self.assertEqual(model.conversion.fusions, ())
         finally:
             model.close()
 

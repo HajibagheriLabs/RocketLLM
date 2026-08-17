@@ -31,23 +31,21 @@ classifiers = [
 dependencies = [
     "tqdm",
     "torch>=2.4",
-    # The upper bound is where the engine has actually been run, not a guess. transformers 5
-    # replaced the per-expert containers this engine streams -- Mixtral's block_sparse_moe,
-    # Qwen2-MoE's per-expert ModuleList -- with a single fused expert module, so per-expert
-    # streaming reads the wrong tensors against it. The whole 4.x range from the floor up is
-    # covered by CI, both ends of it, on every supported Python.
+    # Both live transformers lines, and both are run in CI on every supported Python.
     #
-    # The cost of that bound is concrete and worth writing down: architectures added in 5.x cannot
-    # be served here at all. qwen3_5 and qwen3_5_moe first appear in transformers 5.2, so a
-    # checkpoint declaring either fails at config load. rocketllm/utils.py says exactly that when
-    # it happens rather than leaving a KeyError to be interpreted. Lifting the bound is a port, not
-    # a version bump: the fused layout has to be mapped back onto per-expert checkpoints first.
+    # 5.x is a real break rather than a version bump, and the engine absorbs it rather than pinning
+    # around it: the expert containers this engine streams stopped being per-expert module lists and
+    # became one batched module, and the per-class rename dict became a declarative conversion
+    # pipeline. Both are now read from transformers itself -- see rocketllm/conversion.py -- so a
+    # checkpoint whose shape no longer matches the module it loads into is assembled row by row
+    # instead of being refused. Nothing here restates what transformers declares, which is why this
+    # range can stay open at the top.
     #
-    # Nothing in the vision-language path needs a higher floor. AutoModelForImageTextToText is
-    # skipped where it does not exist and AutoModelForVision2Seq is tried instead; the checkpoint
-    # name mapping is the identity on a transformers that has no such mapping, which is also the
-    # transformers on which those checkpoints needed no mapping.
-    "transformers>=4.49,<5.0",
+    # The floor is where the 4.x behaviour was last verified. Note that transformers 5 itself
+    # requires Python 3.10, so a 3.9 install resolves to 4.x whatever this range allows, and an
+    # architecture added in 5.x is out of reach there -- rocketllm/utils.py says so by name when a
+    # checkpoint asks for one.
+    "transformers>=4.49,<6.0",
     "accelerate>=1.0",
     "safetensors",
     "huggingface-hub",

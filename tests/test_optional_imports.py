@@ -44,12 +44,34 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: Everything the doctor knows is optional, plus the module names those packages import under where
 #: they differ from the pip name. Anything genuinely absent on the running machine is already
 #: hidden; the blocker exists for the ones that happen to be installed here.
-BLOCKED = sorted({package.module for package in OPTIONAL_PACKAGES} | {"quanto", "httpx"})
+#:
+#: httpx is deliberately NOT here, though it was: huggingface-hub 1.x imports it at module scope, so
+#: it is present in every environment that can import transformers at all. Hiding it would not
+#: simulate a bare install, it would simulate one that cannot exist -- and the failure would land on
+#: `import transformers`, which is exactly the signal this file exists to keep clean.
+BLOCKED = sorted({package.module for package in OPTIONAL_PACKAGES} | {"quanto"})
 
 _BLOCKER = '''
-import importlib.abc, importlib.machinery, importlib.metadata, sys
+import importlib.abc, importlib.machinery, importlib.metadata, importlib.util, sys
 
-BLOCKED = {blocked!r}
+_REQUESTED = {blocked!r}
+
+
+def _installed(name):
+    """Whether this package is genuinely importable here, asked before anything is hidden."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+# Only hide what is actually present. A package that was never installed is already absent, and
+# hiding it a second time invents a state that cannot occur: find_spec would answer yes for
+# something with no distribution metadata and no loadable module, and a prober that checks both --
+# transformers checks both, for half this list -- ends in an ImportError instead of the graceful
+# "not available" it is written to produce. That failure lands on `import transformers`, which is
+# the one thing this file must be able to trust.
+BLOCKED = [name for name in _REQUESTED if _installed(name)]
 
 
 class _Missing(importlib.abc.Loader):
@@ -68,6 +90,25 @@ class _Blocker(importlib.abc.MetaPathFinder):
         if fullname.split(".")[0] in BLOCKED:
             return importlib.machinery.ModuleSpec(fullname, _Missing())
         return None
+
+
+# `importlib.util.find_spec` is the probe half of the same question, and it has to agree with the
+# import half or callers end up in a state no real machine produces. transformers asks it first and
+# imports unguarded when it says yes -- `if is_psutil_available(): import psutil` -- so a finder that
+# answers yes while the import fails turns a graceful "not available" into an ImportError inside
+# transformers.generation. Note this is patched on `importlib.util` rather than raising from the
+# finder: raising there breaks every legitimate caller, which is why the finder hands back a spec at
+# all.
+_real_find_spec = importlib.util.find_spec
+
+
+def _find_spec(name, package=None):
+    if name.split(".")[0].lstrip(".") in BLOCKED:
+        return None
+    return _real_find_spec(name, package)
+
+
+importlib.util.find_spec = _find_spec
 
 
 def _normalise(name):

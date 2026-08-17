@@ -2,7 +2,6 @@
 import json
 import logging
 import os
-import re
 from collections import OrderedDict
 from pathlib import Path
 import time
@@ -14,6 +13,7 @@ from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from transformers.quantizers import AutoHfQuantizer
 
+from . import conversion as checkpoint_conversion
 from .hw import caps
 from .hw.caps import get_caps
 from .hw.profile import HardwareProfile
@@ -100,34 +100,38 @@ def _model_factories():
     return found
 
 
-def checkpoint_name_mapper(model_class):
-    """Translate checkpoint tensor names into the parameter names the built model actually has.
+def checkpoint_dtype(config):
+    """The dtype the checkpoint says its weights are in, wherever it says it.
 
-    These are the same string for almost every checkpoint, and were the same string for all of them
-    until transformers started restructuring multimodal wrappers after their weights had shipped.
-    Qwen2.5-VL stores ``model.layers.0...`` and ``visual...``; the class transformers now builds
-    holds ``model.language_model.layers.0...`` and ``model.visual...``. transformers reconciles the
-    two while loading, through a per-class ``_checkpoint_conversion_mapping`` of regex renames.
-    RocketLLM does its own placement, so it has to apply the same renames or every parameter is
-    placed at a path the model does not have.
+    Three spellings have to be read. ``torch_dtype`` up to transformers 4.55, ``dtype`` from 4.56,
+    and -- the one that matters here -- on a multimodal config neither may be set at the top at all,
+    because the weights' dtype is a property of each sub-model. Qwen3.5 declares it only on
+    ``text_config``.
 
-    First rule that matches wins and the rest are skipped -- that is what transformers does, and the
-    order the rules are written in is part of their meaning. Returns None when there is nothing to
-    translate, so the ordinary path pays nothing for this.
+    Reading only the outer name silently produced None, and None fell through to float16. That is
+    the one default this project cannot afford to get wrong by accident: fp16's range overflows on a
+    deep model and corrupts the output without raising, and these are 40- and 64-layer models. So
+    the search descends, and returns None rather than guessing when nothing says.
     """
-    mapping = getattr(model_class, "_checkpoint_conversion_mapping", None) or {}
-    rules = [(re.compile(pattern), replacement) for pattern, replacement in mapping.items()]
-    if not rules:
+    from transformers import PretrainedConfig
+
+    def look(cfg, depth=0):
+        if depth > 2:
+            return None
+        for attribute in ("dtype", "torch_dtype"):
+            value = getattr(cfg, attribute, None)
+            if isinstance(value, str):
+                value = getattr(torch, value, None)
+            if isinstance(value, torch.dtype):
+                return value
+        for sub in vars(cfg).values():
+            if isinstance(sub, PretrainedConfig):
+                found = look(sub, depth + 1)
+                if found is not None:
+                    return found
         return None
 
-    def translate(name):
-        for pattern, replacement in rules:
-            renamed, count = pattern.subn(replacement, name)
-            if count:
-                return renamed
-        return name
-
-    return translate
+    return look(config)
 
 
 # Helpers that transformers 5.0 moved out of transformers.utils.generic. Remote model code is
@@ -350,10 +354,18 @@ class RocketModel:
         # mode otherwise is silently wrong tokens rather than an error.
         self.caps = get_caps(self.running_device)
         if dtype is None:
-            cfg_dtype = getattr(self.config, "torch_dtype", None)
-            if isinstance(cfg_dtype, str):
-                cfg_dtype = getattr(torch, cfg_dtype, None)
-            requested = cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.float16
+            requested = checkpoint_dtype(self.config)
+            if requested is None:
+                # Nothing in the checkpoint says. Ask for the widest of the two candidates and let
+                # the device decide: on hardware with bf16 that is what runs, and on hardware
+                # without it select_compute_dtype degrades to fp16 and says so out loud. Defaulting
+                # straight to fp16 here, as this used to, skipped that warning entirely.
+                requested = torch.bfloat16
+                caps.announce_once(
+                    "dtype-undeclared",
+                    "this checkpoint does not declare the dtype its weights are stored in, so the "
+                    "run uses the widest dtype this device supports. Pass dtype= to choose.",
+                    logging.INFO)
             dtype = self.caps.select_compute_dtype(requested)
         self.running_dtype = dtype
         self.dtype = self.running_dtype
@@ -595,29 +607,57 @@ class RocketModel:
         # a ValueError so long that it read like an attention-implementation problem. Which factory
         # succeeded is a property of the checkpoint, not of the machine, so it is discovered rather
         # than configured.
+        # Which class to build is the CHECKPOINT's statement, not the first factory's guess. One
+        # config can be registered under several auto classes that build different models from it:
+        # Qwen3.5's config is registered under AutoModelForCausalLM, which builds the text-only
+        # Qwen3_5ForCausalLM -- no vision tower, and the checkpoint's `visual` weights silently
+        # never loaded. So every factory that accepts the config is asked what it would build, and
+        # the one that matches `architectures[0]` wins.
+        declared = next(iter(getattr(self.config, "architectures", None) or ()), None)
+
         self.model = None
         attempts = []
+        fallback = None
         for name, factory in _model_factories():
             model, refusal = self._build_empty_model(factory)
             if model is None:
                 attempts.append(f"  {name}: {_brief(refusal)}")
                 continue
-            self.model = model
-            self.model_factory = name
-            if attempts:
-                print(f"built with {name}; {', '.join(a.split(':')[0].strip() for a in attempts)} "
-                      f"{'does' if len(attempts) == 1 else 'do'} not accept this config.")
-            break
+            built = type(model).__name__
+            if declared is None or built == declared:
+                self.model, self.model_factory = model, name
+                break
+            # It builds something, but not what the checkpoint says it is. Keep it only as a last
+            # resort and go on looking.
+            if fallback is None:
+                fallback = (name, model, built)
+                attempts.append(f"  {name}: builds {built}, not the declared {declared}")
+
+        if self.model is None and fallback is not None:
+            name, model, built = fallback
+            self.model, self.model_factory = model, name
+            caps.announce_once(
+                "model-class-mismatch",
+                f"this checkpoint declares {declared}, which no auto class in this transformers "
+                f"builds; {name} was used instead and produced {built}. Anything the declared class "
+                f"has and this one does not -- a vision tower, an extra head -- is not part of the "
+                f"model that will run.", logging.WARNING)
 
         if self.model is None:
             raise ValueError(_NO_MODEL_FACTORY.format(
                 config=type(self.config).__name__, attempts="\n".join(attempts) or "  (none)",
                 version=__import__("transformers").__version__))
 
-        #: Checkpoint tensor names and model parameter names are the same string for almost every
-        #: checkpoint and differ for the multimodal wrappers transformers has restructured. None
-        #: when they agree, which is the fast path.
-        self._to_module_name = checkpoint_name_mapper(type(self.model))
+        if attempts:
+            print(f"built {type(self.model).__name__} with {self.model_factory}; "
+                  f"{len(attempts)} other factory attempt(s) did not fit this checkpoint.")
+
+        #: What this model class says about reading its own checkpoints: the renames between
+        #: checkpoint tensor names and parameter names, and the expert fusions where the two
+        #: disagree about shape rather than about spelling. Read from transformers rather than
+        #: restated here -- see rocketllm/conversion.py.
+        self.conversion = checkpoint_conversion.describe(self.model)
+        self._to_module_name = self.conversion.rename if self.conversion.renames else None
 
         quantization_config = getattr(self.config, "quantization_config", None)
         if quantization_config is None:
@@ -917,21 +957,22 @@ class RocketModel:
         self.resident_bytes = 0
         placed = []
         for name in self.layer_names_dict.get('resident', []):
+            # Asked BEFORE the read, not after. These groups are discovered from the checkpoint
+            # rather than declared, so a checkpoint routinely carries one this model class does not
+            # build -- a multi-token-prediction head is the common case, and Qwen3.5 ships an 849MB
+            # one. Reading it first meant paying for the whole shard, in time and in host memory,
+            # to then throw it away.
+            if not self.has_submodule(name):
+                caps.announce_once(
+                    f"resident-absent-{name}",
+                    f"the checkpoint stores {name}, which this model class does not build, so "
+                    f"those tensors are not read at all. Nothing runs them; this is not an error.",
+                    logging.INFO)
+                continue
             try:
                 state_dict = self.load_layer_to_cpu(name)
             except FileNotFoundError:
                 # Not every checkpoint of a given architecture ships every optional module.
-                continue
-            if not self.has_submodule(name):
-                # Found in the checkpoint rather than declared by a subclass, and this model class
-                # builds nothing at that path -- a table transformers computes for itself, or a
-                # leftover from a differently-shaped release. Placing it would raise; skipping it
-                # costs nothing, because no forward reads it.
-                caps.announce_once(
-                    f"resident-absent-{name}",
-                    f"the checkpoint stores {name}, which this model class does not build, so "
-                    f"those tensors are not loaded. Nothing reads them; this is not an error.",
-                    logging.INFO)
                 continue
             self.move_layer_to_device(state_dict)
             self.resident_bytes += self._shard_bytes(name)
@@ -1040,7 +1081,8 @@ class RocketModel:
             except Exception:  # noqa: BLE001 - a layer we cannot inspect simply streams whole
                 continue
 
-            layout = detect_expert_layout(self.layers[idx], shapes, layer_name, self.config)
+            layout = detect_expert_layout(self.layers[idx], shapes, layer_name, self.config,
+                                          conversion=self.conversion)
             skipped.extend(layout.skipped)
             containers = list(layout.containers) or self._configured_containers(shapes)
 
@@ -1278,12 +1320,52 @@ class RocketModel:
         if rows is None:
             # The router's choice could not be read. Every row is always correct, and costs what a
             # whole layer has always cost -- which is the behaviour this replaces, not a regression.
-            state_dict = load_layer_subset(self.checkpoint_path, layer_name, container.keys)
-            module._rocketllm_moved = self.move_layer_to_device(state_dict)
-            return
-        compact = load_layer_rows(self.checkpoint_path, layer_name,
-                                  {key: rows for key in container.keys})
-        module._rocketllm_moved = self._place_expert_rows(container, rows, compact)
+            if container.is_merged:
+                # There is no whole-layer path here: the per-expert tensors are not parameters of
+                # anything, so they cannot simply be placed. Every row is assembled instead, which
+                # is the same work in the same shape, for all of the experts rather than a few.
+                rows = tuple(range(container.num_experts))
+            else:
+                state_dict = load_layer_subset(self.checkpoint_path, layer_name, container.keys)
+                module._rocketllm_moved = self.move_layer_to_device(state_dict)
+                return
+        if container.is_merged:
+            compact = self._merge_expert_rows(container, layer_name, rows)
+        else:
+            compact = load_layer_rows(self.checkpoint_path, layer_name,
+                                      {key: rows for key in container.keys})
+        module._rocketllm_moved = self._place_expert_rows(
+            container, rows, compact, container.target_shapes(layer_name))
+
+    def _merge_expert_rows(self, container, layer_name, rows):
+        """Build one compacted tensor per fused parameter out of the routed experts' own tensors.
+
+        This is the transformers-5 shape, where the module is batched and the checkpoint is not. It
+        reads the same bytes the fused layout's row slicing reads -- a per-expert checkpoint already
+        stores each expert separately, so asking for the routed few asks for their bytes and no
+        others -- and then performs the join the model declares, one row at a time.
+
+        The result is keyed and shaped exactly as a slice out of a natively fused checkpoint would
+        be, so everything downstream is the path that was already there.
+        """
+        wanted = []
+        for target in container.merged_targets.values():
+            for expert in rows:
+                wanted.extend(target.sources[expert])
+        # dict.fromkeys rather than a set: a tensor asked for twice must be read once, and the read
+        # order should still follow the file rather than a hash.
+        shard = load_layer_subset(self.checkpoint_path, layer_name, dict.fromkeys(wanted))
+
+        compact = {}
+        for target in container.merged_targets.values():
+            built = []
+            for expert in rows:
+                parts = [shard[key] for key in target.sources[expert]]
+                row = parts[0] if len(parts) == 1 else torch.cat(parts, dim=target.concat_dim)
+                built.append(row.unsqueeze(0))
+            compact[f"{layer_name}.{target.path}"] = (built[0] if len(built) == 1
+                                                      else torch.cat(built, dim=0))
+        return compact
 
     def _fused_post_hook(self, module, args, output):
         for param_name in getattr(module, '_rocketllm_moved', []):
@@ -1291,7 +1373,7 @@ class RocketModel:
         module._rocketllm_moved = []
         return output
 
-    def _place_expert_rows(self, container, rows, compact):
+    def _place_expert_rows(self, container, rows, compact, shapes):
         """Bind a fused expert tensor holding only the rows this token routed to.
 
         The parameter keeps its full width. The module's forward indexes it by expert ordinal, and
@@ -1311,8 +1393,7 @@ class RocketModel:
         index = torch.tensor(list(rows), device=self.running_device, dtype=torch.long)
         for key, value in compact.items():
             target = self.quant.target_dtype(key, value)
-            full = torch.zeros(container.fused_shapes[key], dtype=target,
-                               device=self.running_device)
+            full = torch.zeros(shapes[key], dtype=target, device=self.running_device)
             # `key` is the checkpoint's name, which is what the shard was read by and what
             # fused_shapes is keyed on; the model may keep it somewhere else. This path does not go
             # through move_layer_to_device, so it does its own translation.

@@ -4,12 +4,13 @@
 # install them through the extras (`.[quant]`, `.[mlx]`, `.[vision]`) so a base install stays
 # hardware-neutral.
 #
-# The transformers bound is explained at length in pyproject.toml. Short version: 5.x fused the
-# per-expert containers this engine streams, so the cap stays until that is ported, and any
-# architecture added in 5.x (qwen3_5, qwen3_5_moe) cannot be served here yet.
+# The transformers range is explained at length in pyproject.toml. Short version: both the 4.x and
+# 5.x lines work. 5.x rebuilt mixtures around one batched expert module and replaced the rename
+# dict with a conversion pipeline; the engine reads both from transformers rather than restating
+# them. transformers 5 needs Python 3.10, so a 3.9 install resolves to 4.x regardless.
 tqdm
 torch>=2.4
-transformers>=4.49,<5.0
+transformers>=4.49,<6.0
 accelerate>=1.0
 safetensors
 huggingface-hub

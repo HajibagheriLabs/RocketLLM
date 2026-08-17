@@ -42,7 +42,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from rocketllm import base as base_module
 from rocketllm.base import RocketModel
 from rocketllm.memory import is_expert
-from rocketllm.moe.detect import LAYOUT_FUSED, LAYOUT_MODULE_LIST
+from rocketllm.moe.detect import LAYOUT_FUSED, LAYOUT_FUSED_MERGE, LAYOUT_MODULE_LIST
 from rocketllm.moe.expert_cache import is_shared
 
 # The emulated-hardware helpers live with the portability matrix; residency is only observable on
@@ -53,6 +53,28 @@ from test_portability import GB, EmulatedDevice, emulate  # noqa: E402
 
 PROMPT = torch.tensor([[1, 5, 9, 14, 3]])
 ONE_TOKEN = torch.tensor([[7]])
+
+#: Layouts under which each expert is a cache entry of its own. Only the module-list layout is:
+#: the two fused layouts have no per-expert module to hook, so residency is decided for the rows a
+#: token reads rather than for experts held across tokens. Which of them a given checkpoint gets is
+#: a property of the transformers release, not of the checkpoint -- a per-expert Mixtral file is a
+#: module list on 4.x and a fused module assembled from those same tensors on 5.x -- so the tests
+#: that are about per-expert entries ask this rather than assuming an answer.
+PER_EXPERT_ENTRY_LAYOUTS = (LAYOUT_MODULE_LIST,)
+
+
+def sole_container(model):
+    """The one expert container of the first layer that has one."""
+    layout = next(iter(model._expert_layouts.values()))
+    return layout.containers[0]
+
+
+def requires_per_expert_entries(case, model):
+    container = sole_container(model)
+    if container.layout not in PER_EXPERT_ENTRY_LAYOUTS:
+        case.skipTest(f"this transformers builds the experts as {container.layout}, which has no "
+                      f"per-expert module to give its own cache entry")
+    return container
 
 #: CPU by default so this file runs on a plain CI runner, which is a property the suite has to keep.
 #: Point it at an accelerator to exercise the real transfer path -- async copy streams, a genuine
@@ -323,13 +345,20 @@ class TestModuleListStreaming(StreamingCase):
             model.close()
 
     def test_the_layout_is_recognised(self):
+        """A per-expert Mixtral checkpoint, streamed per expert -- however this transformers builds it.
+
+        4.x builds an ``nn.ModuleList`` and the checkpoint matches it. 5.x builds one batched module
+        over those same per-expert tensors, so the rows have to be assembled as they are read. Both
+        are correct readings of one file, and both stream a token's own experts rather than the
+        layer's, which is what this asserts. What must never happen is neither.
+        """
         model = self.stream()
         try:
             self.assertTrue(model._expert_streaming)
             self.assertEqual(len(model._expert_layouts), 2)
             for layout in model._expert_layouts.values():
                 container = layout.containers[0]
-                self.assertEqual(container.layout, LAYOUT_MODULE_LIST)
+                self.assertIn(container.layout, (LAYOUT_MODULE_LIST, LAYOUT_FUSED_MERGE))
                 self.assertEqual(container.num_experts, 4)
                 self.assertEqual(container.top_k, 2)
         finally:
@@ -355,6 +384,7 @@ class TestModuleListStreaming(StreamingCase):
         """
         model = self.stream()
         try:
+            requires_per_expert_entries(self, model)
             with torch.no_grad():
                 model(ONE_TOKEN.to(DEVICE))
             keys = [key for key in model._unit_tensor_keys if is_expert(key[1])]
@@ -364,6 +394,44 @@ class TestModuleListStreaming(StreamingCase):
                             "an expert sized at zero bytes is free to keep and never evicted")
         finally:
             model.close()
+
+    def test_only_the_routed_experts_are_read_when_the_rows_have_to_be_assembled(self):
+        """The saving has to survive the rearrangement, or the port bought correctness with bytes.
+
+        Where transformers builds one batched expert module over a per-expert checkpoint, a row of
+        it is assembled rather than sliced. That is more arithmetic, and it must not be more
+        reading: a per-expert file already stores each expert separately, so a top-2 router over
+        four experts must ask for two experts' tensors and no others.
+        """
+        model = self.stream()
+        container = sole_container(model)
+        if not container.is_merged:
+            model.close()
+            self.skipTest("this transformers builds the experts the way the checkpoint stores them")
+
+        reads = []
+        original = base_module.load_layer_subset
+
+        def recording(path, layer_name, keys):
+            keys = list(keys)
+            reads.append((layer_name, keys))
+            return original(path, layer_name, keys)
+
+        base_module.load_layer_subset = recording
+        try:
+            with torch.no_grad():
+                model(ONE_TOKEN.to(DEVICE))
+        finally:
+            base_module.load_layer_subset = original
+            model.close()
+
+        expert_reads = [keys for _, keys in reads if any(".experts." in key for key in keys)]
+        self.assertTrue(expert_reads, "no expert tensors were read at all")
+        for keys in expert_reads:
+            ordinals = {key.split(".experts.")[1].split(".")[0] for key in keys}
+            self.assertEqual(len(ordinals), 2,
+                             f"a top-2 router over 4 experts read {len(ordinals)} of them: "
+                             f"{sorted(ordinals)}")
 
     def test_a_repeated_forward_does_not_re_read_its_experts(self):
         """Residency across tokens is the reason experts go through the cache at all.
@@ -385,11 +453,15 @@ class TestModuleListStreaming(StreamingCase):
         """Residency is bounded by the generation: reset() has to release experts like anything else."""
         model = self.stream()
         try:
+            container = sole_container(model)
             with torch.no_grad():
                 model(ONE_TOKEN.to(DEVICE))
             model.reset()
-            experts = model.model.model.layers[0].block_sparse_moe.experts
-            devices = {p.device.type for expert in experts for p in expert.parameters()}
+            # Reached through the container's own path rather than a hardcoded module name: what
+            # the mixture block is called moved between transformers releases (block_sparse_moe ->
+            # mlp) and the point of the test is where the weights are, not what the path spells.
+            experts = model.layers[1].get_submodule(container.path)
+            devices = {p.device.type for p in experts.parameters()}
             self.assertEqual(devices, {"meta"})
         finally:
             model.close()
@@ -441,6 +513,7 @@ class TestSharedExperts(StreamingCase):
         """A class boundary, not a score: no amount of popularity promotes an expert past one."""
         model = self.stream()
         try:
+            requires_per_expert_entries(self, model)
             with torch.no_grad():
                 model(PROMPT.to(DEVICE))
             candidates = model._pin_candidates()
@@ -455,6 +528,7 @@ class TestSharedExperts(StreamingCase):
     def test_each_routed_expert_is_loaded_at_most_once_per_forward(self):
         """Re-reading an expert within one forward would be a straight loss over whole-layer."""
         model = self.stream()
+        requires_per_expert_entries(self, model)
         loaded = []
         original = model._unit_pre_hook
 
