@@ -1,4 +1,4 @@
-"""How many shard files stay memory-mapped, and why that is a hardware question.
+"""How much of a checkpoint may be held memory-mapped, and why that is a hardware question.
 
 A ``safe_open`` handle looks free. It is free in file descriptors and it is not free in address
 space: the handle holds the shard mapped, and an operating system that charges mappings against a
@@ -6,15 +6,17 @@ commit limit is charged the shard's whole size the moment it is opened -- touche
 charges RAM plus page file that way; Linux, under the default overcommit policy, charges a
 read-only file mapping nothing at all, because it is page cache.
 
-That difference had a concrete consequence. Sizing a checkpoint reads every shard's header once, so
-the loader ended up holding every shard mapped at once, and a 67GB model died inside ``safe_open``
-on a machine with an 18GB commit limit -- while doing nothing but reading headers, on hardware that
-streams that model perfectly well.
+That difference had a concrete consequence. safetensors returns tensors that ALIAS the mapping, so
+every layer the cache held kept its whole shard mapped, and a 67GB model exhausted an 18GB commit
+limit on hardware that streams it perfectly well.
 
-What is tested here is the decision, not the platform. Every case below drives the loader with a
-synthesised measurement, so the constrained path is exercised on a machine that is not constrained
-and the unbounded path on one that is. Real measurements are only checked for shape and internal
-consistency, since their values belong to whatever box the suite is running on.
+So the engine picks how to read a shard from what it measured: mapping is the cheaper route and is
+kept wherever the checkpoint fits what the machine will let the process charge, and byte-range
+reads are used where it does not. What is tested here is that decision, not the platform. Every
+case below drives it with a synthesised measurement, so the constrained path is exercised on a
+machine that is not constrained and the unconstrained path on one that is. Real measurements are
+checked only for shape and internal consistency, since their values belong to whatever box the
+suite is running on. That the two routes return the same bytes is ``tests/test_shards.py``.
 """
 import os
 import sys
@@ -29,11 +31,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rocketllm.hw import caps  # noqa: E402
 from rocketllm.hw.profile import DEFAULT_POLICY, Derivation, HardwareProfile  # noqa: E402
+from rocketllm.streaming import shards  # noqa: E402
 from rocketllm.streaming.loader import LayerLoader  # noqa: E402
 
 
 def fake_profile(budget_bytes, io_workers=1, floor=2, ceiling=4):
-    """A stand-in carrying only what the loader reads out of a profile."""
+    """A stand-in carrying only what the reader and the loader read out of a profile."""
 
     class _Profile:
         derived = {
@@ -58,17 +61,36 @@ class LoaderCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         # Registered first so it runs LAST: cleanups unwind in reverse, and a mapped shard cannot
-        # be deleted on Windows, so every loader has to be closed before the directory goes. That
-        # ordering is not incidental tidiness -- it is the same property this file is testing.
+        # be deleted on Windows, so every reader has to be released before the directory goes.
+        # That ordering is not incidental tidiness -- it is the same property this file is testing.
         self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(shards.release_all)
         self.root = Path(self._tmp.name)
         self.shards = build_shards(self.root, 8)
         self.shard_bytes = self.shards[0].stat().st_size
+
+    def reader(self, mapped=False, **kwargs):
+        """A reader for this checkpoint, optionally forced onto the mapped path."""
+        original = shards.direct_reads_available
+        if mapped:
+            shards.direct_reads_available = lambda: False
+        try:
+            built = shards.ShardReader(self.root, **kwargs)
+        finally:
+            shards.direct_reads_available = original
+        self.addCleanup(built.release)
+        return built
 
     def loader(self, **kwargs):
         loader = LayerLoader(self.root, pool=None, **kwargs)
         self.addCleanup(loader.close)
         return loader
+
+    def read_all(self, reader):
+        """Read one tensor out of every shard, which is what opens a handle on the mapped path."""
+        for index in range(len(self.shards)):
+            reader.read_tensors(self.root / f"model.layers.{index}.safetensors")
+        return getattr(reader._local, "handles", {})
 
 
 # ---- the measurement ---------------------------------------------------------------------------
@@ -132,142 +154,176 @@ class TestCommitHeadroom(unittest.TestCase):
 
 class TestModeSelection(LoaderCase):
 
-    def test_a_checkpoint_that_fits_the_budget_keeps_every_handle_open(self):
-        loader = self.loader(profile=fake_profile(budget_bytes=10 * 1024 ** 3))
-        self.assertEqual(loader.handle_mode, "unbounded")
-        self.assertEqual(loader.handle_limit, 0)
-        self.assertIn("fits", loader.handle_reason)
+    def test_a_checkpoint_that_fits_the_budget_is_mapped(self):
+        """Mapping is the cheaper read -- no copy at all -- so it is kept wherever it is safe."""
+        reader = self.reader(profile=fake_profile(budget_bytes=10 * 1024 ** 3))
+        self.assertEqual(reader.mode, shards.ShardReader.MAPPED)
+        self.assertEqual(reader.handle_limit, 0)
+        self.assertIn("fits", reader.reason)
 
-    def test_a_checkpoint_larger_than_the_budget_is_bounded(self):
-        loader = self.loader(profile=fake_profile(budget_bytes=self.shard_bytes * 2))
-        self.assertEqual(loader.handle_mode, "bounded")
-        self.assertGreaterEqual(loader.handle_limit, 2)
-        self.assertLessEqual(loader.handle_limit, 4)
+    def test_a_checkpoint_larger_than_the_budget_is_read_by_byte_range(self):
+        """Bounding handles cannot fix this. safetensors hands back tensors that alias the
+        mapping, so a cached expert holds its whole shard however few handles are open."""
+        reader = self.reader(profile=fake_profile(budget_bytes=self.shard_bytes * 2))
+        self.assertEqual(reader.mode, shards.ShardReader.DIRECT)
+        self.assertEqual(reader.handle_limit, 0)
+        self.assertIn("byte range", reader.reason)
 
-    def test_a_machine_that_does_not_charge_for_mappings_is_never_bounded(self):
-        """Linux under default overcommit publishes no budget, and gets the fast path for free."""
-        loader = self.loader(profile=fake_profile(budget_bytes=0))
-        self.assertEqual(loader.handle_mode, "unbounded")
-        self.assertIn("commit limit", loader.handle_reason)
+    def test_a_machine_that_does_not_charge_for_mappings_maps_freely(self):
+        """Linux under default overcommit publishes no budget, and keeps the fast path for free."""
+        reader = self.reader(profile=fake_profile(budget_bytes=0))
+        self.assertEqual(reader.mode, shards.ShardReader.MAPPED)
+        self.assertIn("commit limit", reader.reason)
 
-    def test_no_profile_at_all_is_unbounded(self):
-        self.assertEqual(self.loader().handle_mode, "unbounded")
+    def test_no_profile_at_all_maps(self):
+        self.assertEqual(self.reader().mode, shards.ShardReader.MAPPED)
+
+    def test_a_host_that_cannot_read_the_payload_as_stored_maps_and_bounds_instead(self):
+        """Big-endian. It has no direct path, so the handle bound is all that is left."""
+        reader = self.reader(mapped=True, profile=fake_profile(budget_bytes=self.shard_bytes * 3))
+        self.assertEqual(reader.mode, shards.ShardReader.MAPPED)
+        self.assertEqual(reader.handle_limit, 3)
+        self.assertIn("big-endian", reader.reason)
 
     def test_the_bound_is_shared_across_reader_threads_not_applied_per_thread(self):
-        """Four workers each holding four handles is sixteen mappings, not four.
+        """Four readers each holding four handles is sixteen mappings, not four.
 
         The budget below affords five of these shards against a checkpoint of eight, so the limit
         lands on the ceiling and there is room for the division to be visible.
         """
-        loader = self.loader(profile=fake_profile(budget_bytes=self.shard_bytes * 5, io_workers=4))
-        self.assertEqual(loader.handle_limit, 4)
-        self.assertEqual(loader._per_thread_limit, 1)
-
-    def test_the_count_is_what_the_budget_affords_when_that_is_under_the_ceiling(self):
-        loader = self.loader(profile=fake_profile(budget_bytes=self.shard_bytes * 3))
-        self.assertEqual(loader.handle_limit, 3)
+        reader = self.reader(mapped=True, readers=4,
+                             profile=fake_profile(budget_bytes=self.shard_bytes * 5))
+        self.assertEqual(reader.handle_limit, 4)
+        self.assertEqual(reader._per_thread_limit, 1)
 
     def test_a_limit_below_the_reader_count_is_raised_to_what_can_be_held(self):
         """A reader cannot hold fewer than the handle it is reading through, so two handles across
         four readers is not achievable. Reporting 2 while holding 4 would be the wrong answer."""
-        loader = self.loader(shard_handle_limit=2,
-                             profile=fake_profile(budget_bytes=self.shard_bytes * 5, io_workers=4))
-        self.assertEqual(loader._per_thread_limit, 1)
-        self.assertEqual(loader.handle_limit, 4)
-        self.assertIn("cannot share fewer", loader.handle_reason)
+        reader = self.reader(shard_handle_limit=2, readers=4,
+                             profile=fake_profile(budget_bytes=self.shard_bytes * 5))
+        self.assertEqual(reader._per_thread_limit, 1)
+        self.assertEqual(reader.handle_limit, 4)
+        self.assertIn("cannot share fewer", reader.reason)
 
     def test_a_budget_that_affords_less_than_the_floor_still_gets_the_floor(self):
-        """One handle would reopen the same shard between planning it and reading it. Two is the
-        smallest number that is not simply wasteful."""
-        loader = self.loader(profile=fake_profile(budget_bytes=1))
-        self.assertEqual(loader.handle_limit, 2)
+        """One handle would reopen the same shard between two reads of it. Two is the smallest
+        number that is not simply wasteful."""
+        reader = self.reader(mapped=True, profile=fake_profile(budget_bytes=1))
+        self.assertEqual(reader.handle_limit, 2)
 
     def test_an_explicit_count_overrides_the_measurement(self):
-        loader = self.loader(profile=fake_profile(budget_bytes=10 * 1024 ** 3),
+        reader = self.reader(profile=fake_profile(budget_bytes=self.shard_bytes * 2),
                              shard_handle_limit=2)
-        self.assertEqual((loader.handle_mode, loader.handle_limit), ("bounded", 2))
+        self.assertEqual((reader.mode, reader.handle_limit),
+                         (shards.ShardReader.MAPPED, 2))
 
-    def test_unbounded_can_be_forced_on_a_machine_that_would_bound(self):
-        loader = self.loader(profile=fake_profile(budget_bytes=self.shard_bytes * 2),
+    def test_mapping_can_be_forced_on_a_machine_that_would_not(self):
+        reader = self.reader(profile=fake_profile(budget_bytes=self.shard_bytes * 2),
                              shard_handle_limit="unbounded")
-        self.assertEqual((loader.handle_mode, loader.handle_limit), ("unbounded", 0))
+        self.assertEqual((reader.mode, reader.handle_limit),
+                         (shards.ShardReader.MAPPED, 0))
+
+    def test_byte_range_reads_can_be_forced_on_a_machine_that_would_map(self):
+        reader = self.reader(profile=fake_profile(budget_bytes=10 * 1024 ** 3),
+                             shard_handle_limit="direct")
+        self.assertEqual(reader.mode, shards.ShardReader.DIRECT)
+
+    def test_zero_means_hold_nothing_mapped(self):
+        self.assertEqual(self.reader(shard_handle_limit=0).mode, shards.ShardReader.DIRECT)
 
     def test_a_meaningless_setting_is_refused_rather_than_guessed_at(self):
         with self.assertRaises(ValueError) as caught:
             LayerLoader(self.root, pool=None, shard_handle_limit="sometimes")
         self.assertIn("auto", str(caught.exception))
+        self.assertIn("direct", str(caught.exception))
 
     def test_the_footprint_and_largest_shard_are_measured_from_the_checkpoint(self):
-        loader = self.loader()
-        self.assertEqual(loader.checkpoint_bytes(),
-                         sum(p.stat().st_size for p in self.shards))
-        self.assertEqual(loader.largest_shard_bytes(), self.shard_bytes)
+        reader = self.reader()
+        self.assertEqual(reader.checkpoint_bytes(), sum(p.stat().st_size for p in self.shards))
+        self.assertEqual(reader.largest_shard_bytes(), self.shard_bytes)
+
+    def test_the_loader_hands_its_settings_to_the_checkpoints_reader(self):
+        """The loader owns no file state; it configures the reader everything else shares."""
+        loader = self.loader(shard_handle_limit=8, io_workers=2)
+        self.assertIs(shards.reader_for(self.root), loader.reader)
+        self.assertEqual(loader.reader.handle_limit, 8)
+        self.assertEqual(loader.reader.handle_mode, "bounded")
+        # Wider than the loader's own pool: the cache prefetches on a pool of its own, and the
+        # thread running the forward reads too. A bound sized off io_workers alone is not a bound.
+        self.assertGreater(loader.reader.readers, loader.io_workers)
+
+    def test_a_limit_the_readers_cannot_meet_is_reported_as_what_will_be_held(self):
+        """The engine's reader count is what decides this, so it is worth pinning down here."""
+        loader = self.loader(shard_handle_limit=2, io_workers=2)
+        self.assertEqual(loader.reader.handle_limit, loader.reader.readers)
+        self.assertIn("cannot share fewer", loader.reader.handle_reason)
 
 
 # ---- eviction -----------------------------------------------------------------------------------
 
 class TestHandleEviction(LoaderCase):
-
-    def open_all(self, loader):
-        for index in range(len(self.shards)):
-            loader.plan(f"model.layers.{index}")
-        return loader._local.handles
+    """Only the mapped path holds anything open, so these force it on."""
 
     def test_bounded_mode_never_holds_more_than_its_limit(self):
-        loader = self.loader(profile=fake_profile(budget_bytes=self.shard_bytes * 2))
-        handles = self.open_all(loader)
-        self.assertLessEqual(len(handles), loader._per_thread_limit)
-        self.assertEqual(loader.handle_opens, len(self.shards))
-        self.assertEqual(loader.handle_evictions, len(self.shards) - loader._per_thread_limit)
+        reader = self.reader(mapped=True, profile=fake_profile(budget_bytes=self.shard_bytes * 2))
+        handles = self.read_all(reader)
+        self.assertLessEqual(len(handles), reader._per_thread_limit)
+        self.assertEqual(reader.handle_opens, len(self.shards))
+        self.assertEqual(reader.handle_evictions, len(self.shards) - reader._per_thread_limit)
 
     def test_unbounded_mode_holds_them_all(self):
-        loader = self.loader(profile=fake_profile(budget_bytes=10 * 1024 ** 3))
-        handles = self.open_all(loader)
+        reader = self.reader(mapped=True, profile=fake_profile(budget_bytes=10 * 1024 ** 3))
+        handles = self.read_all(reader)
         self.assertEqual(len(handles), len(self.shards))
-        self.assertEqual(loader.handle_evictions, 0)
+        self.assertEqual(reader.handle_evictions, 0)
 
     def test_the_least_recently_used_shard_is_the_one_dropped(self):
-        loader = self.loader(shard_handle_limit=2)
-        loader.plan("model.layers.0")
-        loader.plan("model.layers.1")
-        loader.plan("model.layers.0")      # 0 becomes the most recent, so 1 is next out
-        loader.plan("model.layers.2")
-        held = {Path(path).stem for path in loader._local.handles}
+        reader = self.reader(mapped=True, shard_handle_limit=2)
+        for index in (0, 1, 0, 2):
+            reader.read_tensors(self.root / f"model.layers.{index}.safetensors")
+        held = {Path(path).stem for path in reader._local.handles}
         self.assertEqual(held, {"model.layers.0", "model.layers.2"})
 
     def test_a_repeated_shard_is_not_reopened(self):
-        loader = self.loader(shard_handle_limit=2)
+        reader = self.reader(mapped=True, shard_handle_limit=2)
         for _ in range(5):
-            loader.plan("model.layers.0")
-        self.assertEqual(loader.handle_opens, 1)
-        self.assertEqual(loader.handle_evictions, 0)
+            reader.read_tensors(self.root / "model.layers.0.safetensors")
+        self.assertEqual(reader.handle_opens, 1)
+        self.assertEqual(reader.handle_evictions, 0)
 
     def test_an_evicted_handle_is_closed_rather_than_merely_dropped(self):
         """Dropping the reference leaves the mapping alive until the collector runs, which is the
         whole thing this exists to stop."""
-        loader = self.loader(shard_handle_limit=1)
-        loader.plan("model.layers.0")
-        evicted = next(iter(loader._local.handles.values()))
-        loader.plan("model.layers.1")
-        self.assertEqual(loader.handle_evictions, 1)
+        reader = self.reader(mapped=True, shard_handle_limit=1)
+        reader.read_tensors(self.root / "model.layers.0.safetensors")
+        evicted = next(iter(reader._local.handles.values()))
+        reader.read_tensors(self.root / "model.layers.1.safetensors")
+        self.assertEqual(reader.handle_evictions, 1)
         with self.assertRaises(Exception):
             evicted.get_slice("model.layers.0.weight")
 
-    def test_close_releases_everything_still_held(self):
-        loader = LayerLoader(self.root, pool=None, shard_handle_limit="unbounded")
-        for index in range(len(self.shards)):
-            loader.plan(f"model.layers.{index}")
-        self.assertEqual(len(loader._handles), len(self.shards))
-        loader.close()
-        self.assertEqual(loader._handles, set())
+    def test_release_frees_everything_still_held(self):
+        reader = self.reader(mapped=True, shard_handle_limit="unbounded")
+        self.read_all(reader)
+        self.assertEqual(len(reader._handles), len(self.shards))
+        reader.release()
+        self.assertEqual(reader._handles, set())
 
-    def test_the_shards_can_be_deleted_after_close(self):
+    def test_the_shards_can_be_deleted_after_release(self):
         """A mapped file cannot be unlinked on Windows, so this is the observable proof that the
         mappings are gone rather than merely dereferenced."""
-        loader = LayerLoader(self.root, pool=None, shard_handle_limit="unbounded")
-        for index in range(len(self.shards)):
-            loader.plan(f"model.layers.{index}")
+        reader = self.reader(mapped=True, shard_handle_limit="unbounded")
+        self.read_all(reader)
+        reader.release()
+        for shard in self.shards:
+            shard.unlink()
+        self.assertEqual(list(self.root.glob("*.safetensors")), [])
+
+    def test_closing_the_loader_releases_the_checkpoints_reader(self):
+        loader = LayerLoader(self.root, pool=None)
+        loader.plan("model.layers.0")
         loader.close()
+        self.assertIsNot(shards.reader_for(self.root), loader.reader)
         for shard in self.shards:
             shard.unlink()
         self.assertEqual(list(self.root.glob("*.safetensors")), [])
@@ -291,17 +347,28 @@ class TestReadsAreUnaffected(LoaderCase):
                              [p.shape for p in other.placements])
 
     def test_a_shard_reopened_after_eviction_still_reads_the_same_bytes(self):
-        loader = self.loader(shard_handle_limit=1)
-        first = loader.plan("model.layers.0")
-        loader.plan("model.layers.1")          # evicts 0
-        again = loader.plan("model.layers.0")  # reopens it
-        self.assertEqual(first.total_bytes, again.total_bytes)
-        self.assertGreaterEqual(loader.handle_evictions, 1)
+        reader = self.reader(mapped=True, shard_handle_limit=1)
+        name = "model.layers.0.weight"
+        path = self.root / "model.layers.0.safetensors"
+        first = reader.read_tensors(path)[name]
+        reader.read_tensors(self.root / "model.layers.1.safetensors")   # evicts 0
+        again = reader.read_tensors(path)[name]                         # reopens it
+        self.assertGreaterEqual(reader.handle_evictions, 1)
+        self.assertTrue(torch.equal(first, again))
+
+    def test_planning_reads_no_tensor_data_at_all(self):
+        """What lets the engine size a checkpoint far larger than the machine could ever hold."""
+        loader = self.loader()
+        before = loader.reader.bytes_read
+        for index in range(len(self.shards)):
+            loader.plan(f"model.layers.{index}")
+        self.assertEqual(loader.reader.bytes_read, before)
 
     def test_stats_report_the_mode_so_a_slow_run_can_be_explained(self):
         stats = self.loader(shard_handle_limit=2).stats()
-        for key in ("shard_handle_mode", "shard_handle_limit", "shard_handle_opens",
-                    "shard_handle_evictions", "io_workers", "reads", "bytes_read"):
+        for key in ("shard_read_mode", "shard_handle_mode", "shard_handle_limit",
+                    "shard_handle_opens", "shard_handle_evictions", "io_workers", "reads",
+                    "bytes_read"):
             self.assertIn(key, stats)
 
 

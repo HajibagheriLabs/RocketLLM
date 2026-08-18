@@ -211,12 +211,15 @@ def _add_serve_parser(subparsers):
     tuning.add_argument("--window-max", type=int, default=None,
                         help="hard cap on decoder layers held in the prefetch window. Default: the "
                              "window budget divided by the largest layer")
-    tuning.add_argument("--shard-handle-limit", default="auto",
+    tuning.add_argument("--shard-handle-limit", type=_shard_handle_limit, default="auto",
                         help="how many shard files may stay memory-mapped at once: 'auto', "
-                             "'unbounded', or a count. 'auto' bounds them only where the measured "
-                             "commit headroom says holding them all would exhaust it -- a property "
-                             "of the OS's memory accounting rather than of the card. Reads are "
-                             "unaffected either way (default: auto)")
+                             "'unbounded', 'direct', or a count. Mapping a shard is the cheaper "
+                             "read -- the tensors alias the file rather than being copied out of "
+                             "it -- but on an OS that charges mappings against a commit limit they "
+                             "stay charged for as long as any tensor read from them lives. 'auto' "
+                             "maps where the measured headroom covers the checkpoint and reads "
+                             "byte ranges where it does not; 'direct' maps nothing. Reads return "
+                             "the same bytes either way (default: auto)")
     tuning.add_argument("--pin-policy", choices=["auto", "off"], default="auto",
                         help="'auto' fills the pin budget by bytes-saved-per-resident-byte; 'off' "
                              "pins nothing and streams everything (default: auto)")
@@ -249,14 +252,15 @@ def _add_serve_parser(subparsers):
 
 
 def _shard_handle_limit(value):
-    """'auto' / 'unbounded' pass through; anything numeric becomes a count."""
-    if value in ("auto", "unbounded"):
+    """'auto' / 'unbounded' / 'direct' pass through; anything numeric becomes a count."""
+    if value in ("auto", "unbounded", "direct"):
         return value
     try:
         return int(value)
     except (TypeError, ValueError):
         raise argparse.ArgumentTypeError(
-            f"--shard-handle-limit takes 'auto', 'unbounded' or a count, not {value!r}")
+            f"--shard-handle-limit takes 'auto', 'unbounded', 'direct' or a count, "
+            f"not {value!r}")
 
 
 def _run_serve(args):

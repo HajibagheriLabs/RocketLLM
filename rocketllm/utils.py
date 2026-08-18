@@ -12,10 +12,10 @@ from collections import defaultdict
 from sys import platform
 
 import torch
-from safetensors import safe_open
 from safetensors.torch import load_file
 
 from .persist import ModelPersister
+from .streaming import shards
 
 import huggingface_hub
 
@@ -74,44 +74,47 @@ def clean_memory(device=None):
     get_caps(device, announce=False).empty_cache()
 
 
+# Every read below goes through the checkpoint's shared ShardReader rather than opening a shard of
+# its own. These functions run on the cache's prefetch workers, several at a time and concurrently
+# with the loader's own pool, so a shard each of them opened privately would be a shard nothing was
+# counting -- which is exactly how a 67GB model exhausted an 18GB commit limit while the loader
+# believed it was holding two files. Routing them here also means they read byte ranges instead of
+# mapping whole shards, so on a machine that charges for mappings they now cost nothing at all.
+
+
+def _shard_path(local_path, layer_name):
+    return Path(local_path) / (layer_name + ".safetensors")
+
+
 def layer_tensor_names(local_path, layer_name):
     """List the tensors in a layer shard without reading any tensor data."""
-    with safe_open(str(Path(local_path) / (layer_name + ".safetensors")), framework="pt") as f:
-        return list(f.keys())
+    return shards.reader_for(local_path).keys(_shard_path(local_path, layer_name))
 
 
 def load_layer_subset(local_path, layer_name, keys):
     """Read only `keys` from a layer shard.
 
-    safetensors can seek to individual tensors, so a single MoE expert costs its own few MB rather
-    than the whole ~16GB layer file. That is what makes per-expert streaming worthwhile.
+    A shard's header gives every tensor's byte range, so a single MoE expert costs its own few MB
+    rather than the whole ~16GB layer file. That is what makes per-expert streaming worthwhile.
     """
-    out = {}
-    with safe_open(str(Path(local_path) / (layer_name + ".safetensors")), framework="pt") as f:
-        for k in keys:
-            out[k] = f.get_tensor(k)
-    return out
+    return shards.reader_for(local_path).read_tensors(
+        _shard_path(local_path, layer_name), keys=list(keys))
 
 
 def load_layer_rows(local_path, layer_name, rows):
     """Read only the given rows of each named tensor out of a layer shard.
 
     This is the fused-expert read. Where a mixture stores its experts as one batched tensor there is
-    no per-expert tensor to ask for, but safetensors can still seek inside one: ``get_slice(key)[e]``
-    reads that row's bytes and nothing else. So a token that routes to 8 of 128 experts pays for 8,
-    exactly as it would under the per-expert layout.
+    no per-expert tensor to ask for, but a row of a contiguous tensor is a contiguous byte range, so
+    it can still be read on its own. A token that routes to 8 of 128 experts pays for 8, exactly as
+    it would under the per-expert layout.
 
     `rows` maps a tensor name to the row indices wanted. The result is one compacted tensor per name,
     its rows in the order they were asked for -- the caller knows where each belongs and scatters
     them into the full-width parameter on the device.
     """
-    out = {}
-    with safe_open(str(Path(local_path) / (layer_name + ".safetensors")), framework="pt") as f:
-        for k, indices in rows.items():
-            entry = f.get_slice(k)
-            parts = [entry[i:i + 1] for i in indices]
-            out[k] = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
-    return out
+    return shards.reader_for(local_path).read_tensors(
+        _shard_path(local_path, layer_name), keys=list(rows), rows=rows)
 
 
 def load_layer(local_path, layer_name):
@@ -328,8 +331,8 @@ def checkpoint_weight_map(checkpoint_path):
         with open(checkpoint_path / 'model.safetensors.index.json', 'rb') as f:
             return json.load(f)['weight_map'], True
     if os.path.exists(checkpoint_path / 'model.safetensors'):
-        with safe_open(str(checkpoint_path / 'model.safetensors'), framework='pt') as f:
-            return {k: 'model.safetensors' for k in f.keys()}, True
+        index = shards.read_index(checkpoint_path / 'model.safetensors')
+        return {k: 'model.safetensors' for k in index.keys()}, True
     if os.path.exists(checkpoint_path / 'pytorch_model.bin'):
         single_sd = torch.load(checkpoint_path / 'pytorch_model.bin', map_location='cpu')
         index = {k: 'pytorch_model.bin' for k in single_sd.keys()}

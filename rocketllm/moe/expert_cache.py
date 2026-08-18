@@ -99,6 +99,14 @@ class ExpertStats:
         """Register an expert before anything has routed to it."""
         self._records[record.key] = record
 
+    def serves(self, key):
+        """Whether this expert is one the weight cache holds an entry for.
+
+        False for a fused layer's experts, which are rows of a batched parameter rather than
+        modules and never become cache entries.
+        """
+        return key in self._records
+
     def observe(self, layer, selected):
         """Record one router firing: the experts this layer just chose."""
         with self._lock:
@@ -287,10 +295,20 @@ class ExpertResidency:
         return bool(tracked) and tracked <= self.stats.layers_seen
 
     def _prefetch(self, layer, selected):
-        """Issue the layer's top-k reads together rather than one per expert as each runs."""
+        """Issue the layer's top-k reads together rather than one per expert as each runs.
+
+        Only for experts the cache actually serves. A fused layer's experts are rows of one batched
+        parameter, not modules, so they have no entry of their own and are read by the container's
+        own hook -- a read started here for one of them would be collected by nobody, and the
+        payload would sit in the cache's in-flight table for the rest of the run. That is not a
+        hypothetical: it held 25GB of host memory on a 40-layer mixture before it was found.
+        """
         if self.cache is None:
             return 0
-        keys = [(layer, expert_kind(index)) for index in selected]
+        keys = [key for key in ((layer, expert_kind(index)) for index in selected)
+                if self.stats.serves(key)]
+        if not keys:
+            return 0
         started = self.cache.prefetch(keys)
         if started:
             self.prefetched += started

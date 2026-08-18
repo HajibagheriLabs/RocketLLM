@@ -3,7 +3,9 @@
 import os
 from pathlib import Path
 from .model_persister import ModelPersister
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
+
+from ..streaming import shards
 
 
 
@@ -34,5 +36,7 @@ class SafetensorModelPersister(ModelPersister):
 
 
     def load_model(self, layer_name, path):
-        layer_state_dict = load_file(Path(path) / (layer_name + ".safetensors"), device="cpu")
-        return layer_state_dict
+        # Not load_file: that maps the whole shard and then allocates the tensors beside it, so a
+        # 1.5GB layer needs 3GB at once and the mapping half of it is charged against a commit
+        # limit on the systems that have one. Reading the byte ranges costs the tensors alone.
+        return shards.reader_for(path).read_tensors(Path(path) / (layer_name + ".safetensors"))

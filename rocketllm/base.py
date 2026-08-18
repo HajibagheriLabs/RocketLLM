@@ -260,12 +260,14 @@ class RocketModel:
             hard cap on how many decoder layers the prefetch window may hold. Default: profile
             `window_budget_bytes` divided by the largest layer, which is the memory-derived answer.
         shard_handle_limit: str or int, optional
-            how many shard files may stay memory-mapped at once. "auto" (default) compares this
-            checkpoint's size against the commit headroom the profile measured, and bounds the
-            handles only where holding them all would exhaust it -- which is a property of the
-            operating system's memory accounting, not of the card. "unbounded" keeps every handle
-            open; an integer forces that many. This changes only what stays OPEN, never what is
-            read, so it cannot change a single token.
+            how many shard files may stay memory-mapped at once. Mapping is the cheaper read --
+            safetensors hands back tensors that alias the file rather than copies of it -- but on
+            an operating system that charges mappings against a commit limit they stay charged for
+            as long as any tensor read from them is alive. "auto" (default) compares this
+            checkpoint against the commit headroom measured at load and maps where it fits, reading
+            byte ranges where it does not. "unbounded" always maps, "direct" never does, and an
+            integer maps with at most that many shards held. Both routes return the same bytes, so
+            this cannot change a single token.
         pin_policy: str, optional
             "auto" (default) ranks candidates by access-frequency-per-packed-byte and fills the pin
             budget; "off" pins nothing and streams everything, which is the pure-streaming
@@ -386,6 +388,9 @@ class RocketModel:
                           or self.get_tokenizer(hf_token=hf_token))
 
         self.prefetching = prefetching
+        #: Module path -> whether the model class has a home for it. Memoised because
+        #: the question is asked of every tensor of every layer on every pass.
+        self._homes = {}
         # Debugging overrides; None everywhere means "use what the machine measured".
         self._overrides = {
             "reserve_bytes": vram_reserve,
@@ -761,6 +766,51 @@ class RocketModel:
             renamed[translate(name)] = value
         return renamed
 
+    def _has_home(self, module_name):
+        """Whether the model class has somewhere to put this tensor."""
+        known = self._homes.get(module_name)
+        if known is not None:
+            return known
+        parent, _, leaf = module_name.rpartition(".")
+        try:
+            owner = self.model.get_submodule(parent) if parent else self.model
+            found = hasattr(owner, leaf)
+        except AttributeError:
+            found = False
+        self._homes[module_name] = found
+        return found
+
+    def _drop_homeless(self, state_dict):
+        """Leave out checkpoint tensors this model class has nowhere to put.
+
+        A checkpoint outlives the library that wrote it. transformers 5 stopped keeping a rotary
+        embedding on each attention module, so every Llama checkpoint written before that carries
+        ``...self_attn.rotary_emb.inv_freq`` for a module the model no longer builds -- and placing
+        it raised an AttributeError from inside accelerate naming an attribute, which says nothing
+        about which checkpoint tensor caused it or that the checkpoint is simply older than the
+        library.
+
+        Dropping it is right: inv_freq is derived from the config, not learned, and a model class
+        that does not declare it computes it for itself. Dropping something the model DOES need is
+        not silent either -- that parameter stays on meta and the forward fails on it by name.
+        """
+        keep = OrderedDict()
+        homeless = []
+        for name, value in state_dict.items():
+            if self._has_home(name):
+                keep[name] = value
+            else:
+                homeless.append(name)
+        if homeless:
+            caps.announce_once(
+                "checkpoint-homeless-tensors",
+                f"this checkpoint stores tensors the model class does not build, so they are not "
+                f"placed: {', '.join(sorted(homeless)[:3])}"
+                f"{' and others' if len(homeless) > 3 else ''}. This is what an older checkpoint "
+                f"looks like to a newer transformers; anything the model actually needs would fail "
+                f"by name at the first forward rather than be skipped here.", logging.INFO)
+        return keep
+
     def submodule(self, checkpoint_name):
         """The module the checkpoint stores under this name."""
         model_attr = self.model
@@ -854,7 +904,8 @@ class RocketModel:
         names sent back to meta afterwards -- is in the model's namespace and needs no further
         translation.
         """
-        state_dict = self._prepare_layer(self._to_module_namespace(state_dict))
+        state_dict = self._prepare_layer(self._drop_homeless(
+            self._to_module_namespace(state_dict)))
 
         groups, individual = self._plan_transfer(state_dict)
 

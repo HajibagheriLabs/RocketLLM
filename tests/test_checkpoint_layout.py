@@ -26,6 +26,7 @@ from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from rocketllm.base import RocketModel  # noqa: E402
 from rocketllm.utils import (  # noqa: E402
     checkpoint_weight_map, load_checkpoint_config, resolve_layer_names, resolve_snapshot_path)
 
@@ -313,3 +314,67 @@ class TestUnknownArchitecture(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---- tensors the model class has nowhere to put -------------------------------------------------
+
+class TestHomelessTensors(unittest.TestCase):
+    """A checkpoint outlives the library that wrote it.
+
+    transformers 5 stopped keeping a rotary embedding on each attention module, so every Llama
+    checkpoint written before that carries ``self_attn.rotary_emb.inv_freq`` for a module the model
+    no longer builds. Placing it raised an AttributeError from inside accelerate that named an
+    attribute and nothing else -- not the tensor, not the checkpoint, not the reason. The engine
+    could not load JackFram/llama-160m at all.
+
+    Dropping it is correct: inv_freq is derived from the config rather than learned. Dropping
+    something the model does need is not silent -- that parameter stays on meta and the forward
+    fails on it by name.
+    """
+
+    def model(self):
+        module = torch.nn.Module()
+        module.self_attn = torch.nn.Module()
+        module.self_attn.q_proj = torch.nn.Linear(4, 4, bias=False)
+        module.mlp = torch.nn.Module()
+        module.mlp.up_proj = torch.nn.Linear(4, 4, bias=False)
+
+        engine = RocketModel.__new__(RocketModel)
+        engine.model = module
+        engine._homes = {}
+        return engine
+
+    def test_a_tensor_whose_module_is_gone_is_left_out(self):
+        engine = self.model()
+        kept = engine._drop_homeless({
+            "self_attn.q_proj.weight": torch.zeros(4, 4),
+            "self_attn.rotary_emb.inv_freq": torch.zeros(2),
+            "mlp.up_proj.weight": torch.zeros(4, 4),
+        })
+        self.assertEqual(list(kept), ["self_attn.q_proj.weight", "mlp.up_proj.weight"])
+
+    def test_a_tensor_whose_module_exists_but_attribute_does_not_is_left_out(self):
+        engine = self.model()
+        kept = engine._drop_homeless({"self_attn.q_proj.scale": torch.zeros(4)})
+        self.assertEqual(list(kept), [])
+
+    def test_a_parameter_the_model_declares_as_absent_is_still_placed(self):
+        """``nn.Linear(bias=False)`` registers `bias` as None rather than not at all, so the model
+        does have a slot for it. A checkpoint that fills one is a mismatch worth surfacing, not
+        something to drop quietly here."""
+        engine = self.model()
+        kept = engine._drop_homeless({"self_attn.q_proj.bias": torch.zeros(4)})
+        self.assertEqual(list(kept), ["self_attn.q_proj.bias"])
+
+    def test_everything_the_model_declares_is_kept_in_order(self):
+        engine = self.model()
+        state = {"mlp.up_proj.weight": torch.zeros(4, 4),
+                 "self_attn.q_proj.weight": torch.zeros(4, 4)}
+        self.assertEqual(list(engine._drop_homeless(state)), list(state))
+
+    def test_the_answer_is_remembered_rather_than_rewalked(self):
+        engine = self.model()
+        engine._drop_homeless({"self_attn.q_proj.weight": torch.zeros(4, 4),
+                               "self_attn.rotary_emb.inv_freq": torch.zeros(2)})
+        self.assertEqual(engine._homes,
+                         {"self_attn.q_proj.weight": True, "self_attn.rotary_emb.inv_freq": False})

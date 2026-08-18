@@ -147,13 +147,15 @@ class TieredWeightCache:
         self._executor = (ThreadPoolExecutor(max_workers=workers,
                                              thread_name_prefix="rocketllm-prefetch")
                           if workers > 0 and self._sequence is not None else None)
-        self._pending = {}
+        self._pending = OrderedDict()
+        self._pending_bytes = 0
 
         self.stats = {
             "hits_device": 0, "hits_host": 0, "misses": 0,
             "evicted_to_host": 0, "evicted_to_storage": 0, "host_evictions": 0,
             "fetches": 0, "promotions": 0, "agings": 0,
             "rejected_too_large": 0, "prefetches": 0, "prefetch_hits": 0,
+            "prefetches_dropped": 0,
             # Counted separately for experts. A mixture's dense layers and its experts have
             # different access patterns and different policies, so one combined hit rate averages
             # away the only number that says whether expert residency is working.
@@ -265,7 +267,7 @@ class TieredWeightCache:
             with self._lock:
                 if upcoming in self._entries or upcoming in self._pending:
                     continue
-                self._pending[upcoming] = self._executor.submit(self._prefetch_one, upcoming)
+                self._start_pending(upcoming)
             started += 1
         return started
 
@@ -285,9 +287,41 @@ class TieredWeightCache:
             with self._lock:
                 if key in self._entries or key in self._pending:
                     continue
-                self._pending[key] = self._executor.submit(self._prefetch_one, key)
+                self._start_pending(key)
             started += 1
         return started
+
+    def _start_pending(self, key):
+        """Record one in-flight read, and drop the stalest if too much is in flight.
+
+        A read is collected by whichever thread later acquires that key, and until then its payload
+        is held here -- so this table is a tier like any other, and has to be capped like one. It
+        was not, and a mixture that prefetched experts its fused container then read for itself
+        filled it with payloads nobody would ever collect: 25GB of host memory on a 40-layer model,
+        invisible in every tier's accounting because it belonged to none of them.
+
+        The source of that has been fixed, but the cap stays. Nothing else in this class can hold
+        an unbounded amount, and an in-flight read is not special enough to be the exception.
+
+        The bound is what the cache could admit if every one of them arrived at once, which is the
+        most that can ever be usefully in flight. Dropping a future does not cancel the read; the
+        payload is simply freed when it completes, and the key is re-read if it is wanted after all.
+
+        Called with the lock held.
+        """
+        self._pending[key] = self._executor.submit(self._prefetch_one, key)
+        self._pending_bytes += self._pending_size(key)
+        capacity = self.device.capacity + self.host.capacity
+        while len(self._pending) > 1 and self._pending_bytes > capacity:
+            stale, _ = self._pending.popitem(last=False)
+            self._pending_bytes -= self._pending_size(stale)
+            self.stats["prefetches_dropped"] += 1
+
+    def _pending_size(self, key):
+        try:
+            return max(0, int(self._sizer(key)))
+        except Exception:  # noqa: BLE001 - an unsizeable key must not stop the read
+            return 0
 
     def _prefetch_one(self, key):
         self.stats["fetches"] += 1
@@ -298,6 +332,8 @@ class TieredWeightCache:
         """Collect a prefetched payload, waiting for it if the read is still running."""
         with self._lock:
             future = self._pending.pop(key, None)
+            if future is not None:
+                self._pending_bytes -= self._pending_size(key)
         if future is None:
             return None
         try:

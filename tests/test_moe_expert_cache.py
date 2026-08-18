@@ -234,6 +234,47 @@ class TestRouterDrivenFetch(unittest.TestCase):
         self.assertEqual(touched_layers, {1})
 
 
+class TestOnlyServedExpertsArePrefetched(unittest.TestCase):
+    """A read nobody will collect is a leak, not a head start.
+
+    A fused layer's experts are rows of one batched parameter, not modules, so they never become
+    cache entries and the container's own hook reads the rows it needs. The router hook fires for
+    that layout too, and it used to start a cache read per selected expert -- reads whose payloads
+    then sat in the cache's in-flight table for the rest of the run because nothing ever acquired
+    those keys. Measured on Qwen3.6-35B-A3B: 733 in-flight payloads holding 25GB of host memory
+    after two tokens, which exhausted the machine's commit limit and killed the process.
+    """
+
+    def test_an_untracked_expert_is_never_prefetched(self):
+        cache = FakeCache()
+        # Nothing tracked: this is what a fused container looks like to residency.
+        unit = residency(layers=0, cache=cache)
+        self.assertEqual(unit.on_router(0, (1, 3, 5)), 0)
+        self.assertEqual(cache.prefetched, [])
+
+    def test_a_tracked_expert_is_still_prefetched(self):
+        cache = FakeCache()
+        unit = residency(layers=1, experts=8, cache=cache)
+        self.assertEqual(unit.on_router(0, (1, 3)), 2)
+        self.assertEqual(cache.prefetched, [(expert_key(0, 1), expert_key(0, 3))])
+
+    def test_a_mixed_selection_prefetches_only_the_served_half(self):
+        """One layer streams its experts as modules, another as rows. Both route."""
+        cache = FakeCache()
+        unit = residency(layers=1, experts=4, cache=cache)
+        unit.on_router(0, (0, 1))
+        unit.on_router(1, (0, 1))          # layer 1 is fused: nothing tracked for it
+        self.assertEqual(cache.prefetched, [(expert_key(0, 0), expert_key(0, 1))])
+
+    def test_the_routing_statistics_are_still_recorded(self):
+        """Popularity is observed whether or not the cache serves the expert, so a later layout
+        change does not start from a blank ranking."""
+        cache = FakeCache()
+        unit = residency(layers=0, cache=cache)
+        unit.on_router(0, (2, 4))
+        self.assertEqual(unit.stats.firings, 1)
+
+
 class TestReplanCadence(unittest.TestCase):
     def test_the_first_rebuild_happens_as_soon_as_every_layer_has_routed(self):
         """The plan made at load holds no expert at all, so the first replacement cannot wait."""
@@ -338,6 +379,57 @@ class TestCachePrefetchesInParallel(unittest.TestCase):
             cache.release(key)
             self.assertEqual(len(reads), 1)
             self.assertEqual(cache.report()["prefetch_hits"], 1)
+        finally:
+            cache.close()
+
+    def test_reads_in_flight_cannot_grow_without_bound(self):
+        """The in-flight table is a tier like any other and has to be capped like one.
+
+        Nothing should reach this cap in normal operation -- a prefetch is collected by the acquire
+        that follows it -- but "nothing should" is exactly what was believed about the mixture that
+        filled it with 25GB of payloads nobody would collect. The bound is what the cache could
+        admit if every read landed at once, since more than that can never be useful.
+        """
+        cache = TieredWeightCache(fetch=lambda key: f"payload:{key}", sizer=lambda key: MB,
+                                  device_bytes=4 * MB, host_bytes=0,
+                                  sequence=lambda key, w: [], prefetch_workers=2)
+        try:
+            for index in range(64):
+                cache.prefetch([expert_key(0, index)])
+            self.assertLessEqual(len(cache._pending), 4)
+            self.assertGreater(cache.report()["prefetches_dropped"], 0)
+        finally:
+            cache.close()
+
+    def test_a_dropped_read_is_re_read_rather_than_lost(self):
+        """Dropping an in-flight payload must cost time, never correctness."""
+        cache = TieredWeightCache(fetch=lambda key: f"payload:{key}", sizer=lambda key: MB,
+                                  device_bytes=2 * MB, host_bytes=0,
+                                  sequence=lambda key, w: [], prefetch_workers=2)
+        try:
+            first = expert_key(0, 0)
+            cache.prefetch([first])
+            for index in range(1, 16):
+                cache.prefetch([expert_key(0, index)])
+            self.assertNotIn(first, cache._pending)
+            self.assertEqual(cache.acquire(first), f"payload:{first}")
+            cache.release(first)
+        finally:
+            cache.close()
+
+    def test_collecting_a_read_frees_its_place_in_the_table(self):
+        cache = TieredWeightCache(fetch=lambda key: f"payload:{key}", sizer=lambda key: MB,
+                                  device_bytes=64 * MB, sequence=lambda key, w: [],
+                                  prefetch_workers=2)
+        try:
+            keys = [expert_key(0, i) for i in range(4)]
+            cache.prefetch(keys)
+            self.assertEqual(cache._pending_bytes, 4 * MB)
+            for key in keys:
+                cache.acquire(key)
+                cache.release(key)
+            self.assertEqual(cache._pending_bytes, 0)
+            self.assertEqual(len(cache._pending), 0)
         finally:
             cache.close()
 

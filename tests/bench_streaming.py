@@ -1215,13 +1215,36 @@ def print_comparison(current, previous, forced):
     return True
 
 
+#: Path components that identify no model. A Hugging Face cache entry is
+#: ``<hub>/models--Org--Name/snapshots/<40-hex commit>``, so the last two components of the path
+#: are the two that say the least.
+_UNINFORMATIVE = {"snapshots", "splitted_model", "blobs", "refs"}
+
+
+def model_slug_parts(model):
+    """The last components of a model id or path that actually name the model.
+
+    ``--model`` takes a hub id (``Org/Name``) or a local directory, and both end up in the result
+    filename. Splitting on both separators keeps an absolute Windows path from being turned into a
+    directory tree under ``bench_results/``, which is what it used to do.
+    """
+    parts = [part for part in str(model).replace("\\", "/").split("/") if part]
+    named = [part for part in parts
+             if part.lower() not in _UNINFORMATIVE
+             and not (len(part) >= 32 and all(c in "0123456789abcdef" for c in part.lower()))]
+    return (named or parts)[-2:]
+
+
 def write_record(record, explicit_path=None):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     if explicit_path:
         path = Path(explicit_path)
     else:
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        slug = record["run"]["model"].replace("/", "_").replace(":", "_")
+        # A hub id is "org/model" and a local checkpoint is an absolute path, and both end up
+        # here. Taking the last two components names them the same way and, more to the point,
+        # stops an absolute path from being turned into a directory tree under bench_results.
+        slug = "_".join(model_slug_parts(record["run"]["model"])).replace(":", "_")
         key = record["hardware_profile"]["profile_key"]
         path = RESULTS_DIR / f"{stamp}_{slug}_{key}.json"
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,448 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-18T15:39:39-0400",
+  "hardware_profile": {
+    "schema_version": 4,
+    "fingerprint": "155f406eaba3b273",
+    "probed_at": "2026-08-18T01:37:40-0400",
+    "probe_seconds": 0.8047758999746293,
+    "backend": "cuda",
+    "device_type": "cuda",
+    "device_name": "NVIDIA GeForce RTX 3090",
+    "device_count": 1,
+    "compute_capability": [
+      8,
+      6
+    ],
+    "architecture": "sm_86",
+    "driver_version": "610.88",
+    "runtime_version": "12.1",
+    "device_total_bytes": 25769148416,
+    "device_free_bytes": 24361566208,
+    "host_total_bytes": 17023365120,
+    "host_available_bytes": 2921902080,
+    "commit_total_bytes": 23586099200,
+    "commit_available_bytes": 4997324800,
+    "commit_charges_mappings": true,
+    "commit_source": "GlobalMemoryStatusEx",
+    "cpu_count": 8,
+    "device_memory_bandwidth": 806718120622.4341,
+    "host_to_device_pinned_bandwidth": 10316663443.408653,
+    "host_to_device_pageable_bandwidth": 6015396398.87764,
+    "storage": {
+      "path": "C:\\Users\\Hadi\\hf\\hub\\models--TinyLlama--TinyLlama-1.1B-Chat-v1.0\\snapshots\\fe8a4ea1ffedaf415f4da2f062534de366a451e6\\splitted_model",
+      "probed_real_shards": true,
+      "synthetic_probe": false,
+      "queue_depth_1_bytes_per_s": 185890539.11365643,
+      "by_concurrency": {
+        "1": 185890539.11365643,
+        "2": 414556254.73674345,
+        "4": 499670633.1380847,
+        "8": 647667681.4333825,
+        "16": 797227108.9987817
+      },
+      "best_bytes_per_s": 797227108.9987817,
+      "saturating_concurrency": 16,
+      "page_cache_dropped": false,
+      "page_cache_influence": "likely: this platform cannot drop the page cache, so some reads may have been served from RAM",
+      "rotational": null,
+      "bytes_read": 260046848,
+      "seconds": 0.4433984000061173,
+      "error": null
+    },
+    "dtypes": {
+      "bf16": true,
+      "fp16": true,
+      "fp8": false,
+      "fp4": false
+    },
+    "pinned_memory": true,
+    "async_copy_streams": true,
+    "triton": false,
+    "fused_4bit": {
+      "torch_int4pack": true,
+      "bitsandbytes": false,
+      "awq_ext": false,
+      "gptqmodel": false,
+      "exllamav2": false,
+      "marlin_kernels": false,
+      "any_usable": true
+    },
+    "allocator": {
+      "peak_allocated_bytes": 72496128,
+      "peak_reserved_bytes": 77594624,
+      "fragmentation_ratio": 0.06570682010135136,
+      "workspace_bytes": 54525952,
+      "expandable_segments": false
+    },
+    "versions": {
+      "python": "3.10.11",
+      "torch": "2.5.1+cu121",
+      "platform": "Windows-10-10.0.19044-SP0",
+      "machine": "AMD64",
+      "executable": "python.exe"
+    },
+    "derived": {
+      "reserve_bytes": {
+        "value": 1693208799,
+        "formula": "min(max(measured_workspace, total_device * measured_fragmentation_ratio), total_device * reserve_ceiling_fraction)",
+        "inputs": {
+          "total_device_bytes": 25769148416,
+          "measured_workspace_bytes": 54525952,
+          "measured_fragmentation_ratio": 0.06570682010135136,
+          "reserve_ceiling_fraction": 0.25,
+          "ceiling_bytes": 6442287104
+        },
+        "source": "derived"
+      },
+      "host_cache_bytes": {
+        "value": 609782784,
+        "formula": "max(0, (host_available - host_total * os_headroom_fraction) * host_cache_fraction)",
+        "inputs": {
+          "host_total_bytes": 17023365120,
+          "host_available_bytes": 2921902080,
+          "os_headroom_fraction": 0.1,
+          "os_headroom_bytes": 1702336512,
+          "host_cache_fraction": 0.5
+        },
+        "source": "derived"
+      },
+      "staging_pool_bytes": {
+        "value": 121956556,
+        "formula": "max(0, (host_available - host_total * os_headroom_fraction) * staging_pool_fraction)",
+        "inputs": {
+          "host_total_bytes": 17023365120,
+          "host_available_bytes": 2921902080,
+          "os_headroom_fraction": 0.1,
+          "os_headroom_bytes": 1702336512,
+          "staging_pool_fraction": 0.1
+        },
+        "source": "derived"
+      },
+      "prefix_cache_bytes": {
+        "value": 182934835,
+        "formula": "max(0, (host_available - host_total * os_headroom_fraction) * prefix_cache_fraction)",
+        "inputs": {
+          "host_total_bytes": 17023365120,
+          "host_available_bytes": 2921902080,
+          "os_headroom_fraction": 0.1,
+          "os_headroom_bytes": 1702336512,
+          "prefix_cache_fraction": 0.15
+        },
+        "source": "derived"
+      },
+      "prefix_spill_bytes": {
+        "value": 731739340,
+        "formula": "prefix_cache_bytes * prefix_spill_multiple",
+        "inputs": {
+          "prefix_cache_bytes": 182934835,
+          "prefix_spill_multiple": 4.0
+        },
+        "source": "derived"
+      },
+      "prefix_block_tokens": {
+        "value": 256,
+        "formula": "policy constant: the granularity a partial prefix match is reusable at",
+        "inputs": {
+          "prefix_block_tokens": 256
+        },
+        "source": "derived"
+      },
+      "io_workers": {
+        "value": 8,
+        "formula": "clamp(measured_saturating_concurrency, 1, cpu_count)",
+        "inputs": {
+          "measured_saturating_concurrency": 16,
+          "cpu_count": 8,
+          "measured_by_concurrency": {
+            "1": 185890539.11365643,
+            "2": 414556254.73674345,
+            "4": 499670633.1380847,
+            "8": 647667681.4333825,
+            "16": 797227108.9987817
+          }
+        },
+        "source": "derived"
+      },
+      "shard_mapping_budget_bytes": {
+        "value": 1249331200,
+        "formula": "commit_available_bytes * shard_mapping_fraction",
+        "inputs": {
+          "commit_available_bytes": 4997324800,
+          "commit_total_bytes": 23586099200,
+          "shard_mapping_fraction": 0.25,
+          "commit_source": "GlobalMemoryStatusEx"
+        },
+        "source": "derived"
+      },
+      "shard_handle_limit": {
+        "value": 4,
+        "formula": "shard_handle_ceiling, clamped by the loader against the checkpoint's own shard sizes (0 means unbounded)",
+        "inputs": {
+          "shard_handle_floor": 2,
+          "shard_handle_ceiling": 4,
+          "shard_mapping_budget_bytes": 1249331200
+        },
+        "source": "derived"
+      },
+      "window_budget_bytes": {
+        "value": 12037969808,
+        "formula": "(total_device - reserve) * window_fraction",
+        "inputs": {
+          "total_device_bytes": 25769148416,
+          "reserve_bytes": 1693208799,
+          "usable_device_bytes": 24075939617,
+          "window_fraction": 0.5
+        },
+        "source": "derived"
+      },
+      "usable_device_bytes": {
+        "value": 24075939617,
+        "formula": "total_device - reserve",
+        "inputs": {
+          "total_device_bytes": 25769148416,
+          "reserve_bytes": 1693208799
+        },
+        "source": "derived"
+      },
+      "budget_hysteresis_ratio": {
+        "value": 0.06570682010135136,
+        "formula": "max(budget_hysteresis_fraction, measured_fragmentation_ratio), applied to the live budget rather than to the card",
+        "inputs": {
+          "usable_device_bytes": 24075939617,
+          "budget_hysteresis_fraction": 0.02,
+          "measured_fragmentation_ratio": 0.06570682010135136,
+          "band_at_full_usable_bytes": 1581953433
+        },
+        "source": "derived"
+      },
+      "budget_hysteresis_samples": {
+        "value": 3,
+        "formula": "policy: consecutive deviating samples before the published budget moves",
+        "inputs": {
+          "budget_hysteresis_samples": 3
+        },
+        "source": "derived"
+      },
+      "pin_replan_bytes": {
+        "value": 2407593961,
+        "formula": "usable_device * pin_replan_fraction",
+        "inputs": {
+          "usable_device_bytes": 24075939617,
+          "pin_replan_fraction": 0.1
+        },
+        "source": "derived"
+      },
+      "expert_aging_interval": {
+        "value": 4096,
+        "formula": "policy: expert accesses between halvings of the popularity counts",
+        "inputs": {
+          "expert_aging_interval": 4096
+        },
+        "source": "derived"
+      },
+      "expert_replan_interval": {
+        "value": 512,
+        "formula": "expert_aging_interval * expert_replan_fraction",
+        "inputs": {
+          "expert_aging_interval": 4096,
+          "expert_replan_fraction": 0.125
+        },
+        "source": "derived"
+      },
+      "compute_dtype": {
+        "value": "bfloat16",
+        "formula": "bf16 where the backend supports it",
+        "inputs": {
+          "dtype_support": {
+            "bf16": true,
+            "fp16": true,
+            "fp8": false,
+            "fp4": false
+          }
+        },
+        "source": "derived"
+      },
+      "kv_dtype": {
+        "value": "auto",
+        "formula": "deferred: decided at load from measured weight bytes against the device budget",
+        "inputs": {
+          "usable_device_bytes": 24075939617,
+          "compute_dtype": "bfloat16",
+          "rule": "weights fitting resident with kv_fit_headroom left over -> the compute dtype; otherwise int4",
+          "quantization": "K per-channel, V per-token, group size 64",
+          "note": "the most recent ~128 tokens stay in an fp16 residual window either way, so the tokens most sensitive to quantization are never quantized"
+        },
+        "source": "derived"
+      },
+      "kv_group_size": {
+        "value": 64,
+        "formula": "policy: values sharing one KV scale",
+        "inputs": {
+          "kv_group_size": 64
+        },
+        "source": "derived"
+      },
+      "kv_residual_tokens": {
+        "value": 128,
+        "formula": "policy: most recent tokens left unquantized",
+        "inputs": {
+          "kv_residual_tokens": 128
+        },
+        "source": "derived"
+      },
+      "kv_fit_headroom_percent": {
+        "value": 15,
+        "formula": "policy: free room beyond the weights required before the context is kept exact",
+        "inputs": {
+          "kv_fit_headroom_fraction": 0.15
+        },
+        "source": "derived"
+      },
+      "quant_compute_path": {
+        "value": "fused_packed",
+        "formula": "fused_packed: a fused 4-bit kernel is present and the device can run it",
+        "inputs": {
+          "kernels_found": [
+            "torch_int4pack"
+          ],
+          "device_can_run_them": true,
+          "native_fp4": false
+        },
+        "source": "derived"
+      },
+      "speculative_recommended": {
+        "value": true,
+        "formula": "device_memory_bandwidth / slowest_weight_tier_bandwidth >= speculative_amortization_threshold",
+        "inputs": {
+          "device_memory_bandwidth": 806718120622.4341,
+          "slowest_weight_tier_bandwidth": 797227108.9987817,
+          "amortization_ratio": 1011.9050287133009,
+          "threshold": 10.0
+        },
+        "source": "derived"
+      },
+      "speculative_lookahead": {
+        "value": 8,
+        "formula": "clamp(round(amortization_ratio / speculative_amortization_threshold) + 1, 1, speculative_lookahead_ceiling)",
+        "inputs": {
+          "amortization_ratio": 1011.9050287133009,
+          "threshold": 10.0,
+          "ceiling": 8
+        },
+        "source": "derived"
+      }
+    },
+    "warnings": [
+      "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is not set; the caching allocator will fragment more under a streaming workload. Set it before the first CUDA allocation."
+    ],
+    "policy": {
+      "reserve_ceiling_fraction": 0.25,
+      "os_headroom_fraction": 0.1,
+      "host_cache_fraction": 0.5,
+      "staging_pool_fraction": 0.1,
+      "window_fraction": 0.5,
+      "speculative_amortization_threshold": 10.0,
+      "speculative_lookahead_ceiling": 8,
+      "io_concurrency_improvement": 0.1,
+      "slow_storage_bytes_per_s": 150000000.0,
+      "budget_hysteresis_fraction": 0.02,
+      "budget_hysteresis_samples": 3,
+      "pin_replan_fraction": 0.1,
+      "expert_aging_interval": 4096,
+      "kv_group_size": 64,
+      "kv_residual_tokens": 128,
+      "kv_fit_headroom_fraction": 0.15,
+      "prefix_cache_fraction": 0.15,
+      "prefix_block_tokens": 256,
+      "prefix_spill_multiple": 4.0,
+      "shard_mapping_fraction": 0.25,
+      "shard_handle_floor": 2,
+      "shard_handle_ceiling": 4,
+      "expert_replan_fraction": 0.125
+    },
+    "profile_key": "155f406eaba3b273"
+  },
+  "software": {
+    "python": "3.10.11",
+    "torch": "2.5.1+cu121",
+    "transformers": "5.15.0"
+  },
+  "run": {
+    "model": "C:\\Users\\Hadi\\hf\\hub\\models--TinyLlama--TinyLlama-1.1B-Chat-v1.0\\snapshots\\fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+    "prompt_tokens": 6,
+    "new_tokens": 16,
+    "max_vram_gb": 4.0,
+    "prefetching": true,
+    "sync_phases": true,
+    "dtype": "torch.bfloat16",
+    "draft_model": null,
+    "output_preview": "<s> The capital of France is Paris.\n\n2. B. The capital of Germany is Berlin.\n"
+  },
+  "throughput": {
+    "wall_seconds": 2.493963199999598,
+    "model_build_seconds": 2.402350000000297,
+    "prefill_seconds": 1.5752277000001413,
+    "prefill_tokens_per_second": 3.808973140835107,
+    "decode_seconds": 0.9187354999994568,
+    "decode_tokens_per_second": 16.326788286736356
+  },
+  "bytes_per_token": {
+    "device": 256,
+    "host": 137506048.0,
+    "storage": 137507447.0
+  },
+  "bytes_total": {
+    "device_resident": 256,
+    "host_transferred": 2200096768,
+    "storage_read": 2200119152,
+    "storage_read_exact": true,
+    "storage_physical_read": null,
+    "prefill": {
+      "host": 2200096768,
+      "storage": 2200119152
+    },
+    "decode": {
+      "host": 0,
+      "storage": 0
+    }
+  },
+  "cache_hit_rate": {
+    "device": 0.9375,
+    "host": 0.0,
+    "stub": false,
+    "acquires": 400,
+    "hits_device": 375,
+    "hits_host": 0,
+    "misses": 25,
+    "evicted_to_host": 0,
+    "evicted_to_storage": 0,
+    "prefetches": 24,
+    "prefetch_hits": 24,
+    "pinned": 25,
+    "window": 91,
+    "note": "window 91 layers, 25 pinned, 25 resident on the device"
+  },
+  "expert_cache": null,
+  "speculation": {
+    "enabled": false
+  },
+  "phases_seconds": {
+    "storage_wait": 0.05829140000514599,
+    "host_to_device": 0.9808331000003818,
+    "dequant": 7.870000081311446e-05,
+    "compute": 1.0243064000051163,
+    "evict": 0.0019052999996347353,
+    "unattributed": 0.4285482999885062,
+    "storage_read_overlapped": 0.1679588999995758,
+    "note": "storage_wait is what the forward actually blocked for; storage_read_overlapped is the loader's own read time, which runs on the prefetch worker and hides behind compute"
+  },
+  "counts": {
+    "storage_reads": 25,
+    "device_placements": 25
+  },
+  "memory": {
+    "peak_device_bytes": 2211918848,
+    "peak_host_rss_bytes": 3555991552
+  }
+}
