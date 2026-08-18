@@ -301,6 +301,129 @@ def host_memory():
         return total, None
 
 
+@dataclasses.dataclass(frozen=True)
+class CommitHeadroom:
+    """How much memory this OS will let the process *charge*, and whether mappings count.
+
+    Distinct from free RAM, and the distinction is the whole point. A read-only mapping of a file is
+    nearly free on Linux -- it is page cache, reclaimable, charged to nothing -- while Windows
+    charges every mapped section against a system-wide commit limit of RAM plus page file, whether
+    or not a byte of it is ever touched. A streaming engine holding one mapping per shard therefore
+    costs nothing on one platform and exhausts the machine on the other, with no difference in the
+    code and none in the hardware.
+
+    ``charges_mappings`` is what callers branch on, and it is queried rather than assumed from a
+    platform name: on Linux it comes from the kernel's own overcommit setting, on Windows from the
+    figures GlobalMemoryStatusEx returns.
+
+    ``total`` and ``available`` are None where nothing could be measured. ``source`` records which
+    query answered, because a number in a bug report is worth much less than where it came from.
+    """
+
+    total: object = None
+    available: object = None
+    charges_mappings: bool = False
+    source: str = "unavailable"
+
+    @property
+    def measured(self):
+        return self.available is not None
+
+    def describe(self):
+        if not self.measured:
+            return f"commit headroom: unknown ({self.source})"
+        return (f"commit headroom: {self.available / 1024 ** 3:.1f}GB available of "
+                f"{(self.total or 0) / 1024 ** 3:.1f}GB, mappings "
+                f"{'charged' if self.charges_mappings else 'not charged'} -- {self.source}")
+
+
+def _windows_commit():
+    import ctypes
+
+    class _MemStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    status = _MemStatus()
+    status.dwLength = ctypes.sizeof(_MemStatus)
+    # Needs no privilege of any kind: it reports the caller's own view of system memory. The field
+    # names are historical -- ullTotalPageFile is the commit LIMIT (RAM plus page file), not the
+    # size of the page file, and ullAvailPageFile is what is left of it.
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return CommitHeadroom(total=int(status.ullTotalPageFile),
+                          available=int(status.ullAvailPageFile),
+                          charges_mappings=True,
+                          source="GlobalMemoryStatusEx")
+
+
+def _linux_commit():
+    """The kernel's overcommit policy, and the commit limit only where it is actually enforced."""
+    try:
+        with open("/proc/sys/vm/overcommit_memory", "r") as handle:
+            mode = int(handle.read().strip())
+    except (OSError, ValueError):
+        mode = 0
+
+    if mode != 2:
+        # Heuristic (0) or always (1). A read-only file mapping is page cache either way: never
+        # charged, so there is no headroom to exhaust and nothing to bound.
+        return CommitHeadroom(charges_mappings=False, source="/proc/sys/vm/overcommit_memory")
+
+    fields = {}
+    try:
+        with open("/proc/meminfo", "r") as handle:
+            for line in handle:
+                name, _, rest = line.partition(":")
+                if name in ("CommitLimit", "Committed_AS"):
+                    fields[name] = int(rest.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    if "CommitLimit" not in fields:
+        return None
+    available = max(0, fields["CommitLimit"] - fields.get("Committed_AS", 0))
+    return CommitHeadroom(total=fields["CommitLimit"], available=available,
+                          charges_mappings=True, source="/proc/meminfo CommitLimit")
+
+
+def commit_headroom():
+    """What this machine will let the process charge, measured rather than assumed.
+
+    Falls back in order: the OS's own commit accounting, then psutil where it happens to be
+    installed, then plain available host RAM. The last is a degradation and says so in ``source``.
+    RAM is not the commit limit, but it is a conservative stand-in for one, and using it keeps the
+    engine running with a cautious answer rather than refusing to start over a number it could not
+    read -- which is what the degradation rules ask for.
+    """
+    try:
+        headroom = _windows_commit() if os.name == "nt" else _linux_commit()
+    except Exception:  # noqa: BLE001 - a probe must never be what stops a load
+        headroom = None
+    if headroom is not None:
+        return headroom
+
+    try:
+        import psutil
+
+        virtual = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        return CommitHeadroom(total=int(virtual.total + swap.total),
+                              available=int(virtual.available + swap.free),
+                              charges_mappings=True, source="psutil")
+    except Exception:  # noqa: BLE001 - optional, and its absence costs only precision
+        pass
+
+    total, available = host_memory()
+    if available is None:
+        return CommitHeadroom(source="unavailable")
+    return CommitHeadroom(total=total, available=available, charges_mappings=True,
+                          source="host RAM (commit accounting unavailable)")
+
 # ---------------------------------------------------------------------------------------------
 # dtype support
 #

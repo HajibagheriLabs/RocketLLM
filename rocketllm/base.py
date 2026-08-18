@@ -204,8 +204,8 @@ class RocketModel:
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
                  vram_reserve=None, host_cache_gb=None, io_workers=None, window_max=None,
-                 pin_policy="auto", expert_residency="auto", kv_cache="auto",
-                 draft_model=None, speculative="auto"):
+                 shard_handle_limit="auto", pin_policy="auto", expert_residency="auto",
+                 kv_cache="auto", draft_model=None, speculative="auto"):
         """
         Parameters
         ----------
@@ -259,6 +259,13 @@ class RocketModel:
         window_max: int, optional
             hard cap on how many decoder layers the prefetch window may hold. Default: profile
             `window_budget_bytes` divided by the largest layer, which is the memory-derived answer.
+        shard_handle_limit: str or int, optional
+            how many shard files may stay memory-mapped at once. "auto" (default) compares this
+            checkpoint's size against the commit headroom the profile measured, and bounds the
+            handles only where holding them all would exhaust it -- which is a property of the
+            operating system's memory accounting, not of the card. "unbounded" keeps every handle
+            open; an integer forces that many. This changes only what stays OPEN, never what is
+            read, so it cannot change a single token.
         pin_policy: str, optional
             "auto" (default) ranks candidates by access-frequency-per-packed-byte and fills the pin
             budget; "off" pins nothing and streams everything, which is the pure-streaming
@@ -425,7 +432,8 @@ class RocketModel:
         self.transfer = WeightTransfer(self.caps, pool=self.staging_pool)
         # Header-only reads for sizing, and the byte-range reads the cache's storage tier uses.
         self.loader = LayerLoader(self.checkpoint_path, self.staging_pool, profile=self.profile,
-                                  io_workers=self._overrides.get("io_workers"))
+                                  io_workers=self._overrides.get("io_workers"),
+                                  shard_handle_limit=shard_handle_limit)
 
         self.init_model()
 

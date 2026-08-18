@@ -45,6 +45,13 @@ def make_profile(**overrides):
         device_free_bytes=23 * GB,
         host_total_bytes=64 * GB,
         host_available_bytes=48 * GB,
+        # A machine whose commit limit is far larger than anything it would map. The constrained
+        # case has its own tests in tests/test_loader.py; here it must simply never be the thing
+        # that changes an unrelated derivation.
+        commit_total_bytes=128 * GB,
+        commit_available_bytes=96 * GB,
+        commit_charges_mappings=False,
+        commit_source="test",
         cpu_count=16,
         device_memory_bandwidth=900e9,
         host_to_device_pinned_bandwidth=25e9,

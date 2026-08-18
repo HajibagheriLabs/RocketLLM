@@ -42,7 +42,7 @@ log = logging.getLogger(__name__)
 #: would pin the band to a byte count measured against the whole card, which is the bug that change
 #: exists to fix. Version 3 added speculative_lookahead; a cache without it leaves speculation on a
 #: stated fallback rather than on this machine's measured amortization ratio.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Dimensionless policy factors. Not hardware facts -- design choices, gathered here so they are
 # visible and overridable rather than sprinkled through the engine as literals.
@@ -114,6 +114,17 @@ class Policy:
     #: How much more than the host budget may be spilled to storage. Storage is the tier a prefix
     #: can afford to sit on: reloading one is a read, and the alternative is a full re-prefill.
     prefix_spill_multiple: float = 4.0
+    #: Share of measured commit headroom that memory-mapped shard handles may hold open at once.
+    #: Well under half: a mapping is charged in full the moment it is made, on an OS that charges
+    #: for them at all, and the engine has to leave room for the staging pool, the host cache and
+    #: everything else the process is about to commit. This governs only how many shards stay
+    #: OPEN -- it never changes what is read.
+    shard_mapping_fraction: float = 0.25
+    #: Shard handles kept open when the budget will not hold them all. Two is the floor that keeps
+    #: a plan and the read that follows it from reopening the same file; beyond a handful there is
+    #: nothing left to win, because a layer's reads all target one shard.
+    shard_handle_floor: int = 2
+    shard_handle_ceiling: int = 4
     #: Router firings between rebuilds of the expert pin plan, as a share of the aging interval.
     #: The two describe one timescale: re-ranking experts far more often than the counts they are
     #: ranked by can move only pays for evictions and refetches that the next rebuild undoes.
@@ -133,6 +144,8 @@ _OVERRIDABLE = {
     "prefix_spill_bytes": int,
     "prefix_block_tokens": int,
     "io_workers": int,
+    "shard_handle_limit": int,
+    "shard_mapping_budget_bytes": int,
     "window_fraction": float,
     # An absolute band is the escape hatch for reproducing a suspected bad measurement; the ratio is
     # what is normally derived, because a band has to scale with the budget it governs.
@@ -535,6 +548,10 @@ class HardwareProfile:
     device_free_bytes: object
     host_total_bytes: object
     host_available_bytes: object
+    commit_total_bytes: object
+    commit_available_bytes: object
+    commit_charges_mappings: bool
+    commit_source: str
     cpu_count: object
 
     device_memory_bandwidth: object
@@ -565,6 +582,7 @@ class HardwareProfile:
 
         total_device, free_device = caps.device_memory(dev)
         total_host, available_host = caps.host_memory()
+        commit = caps.commit_headroom()
         cpu_count = os.cpu_count()
 
         dtypes = caps.dtype_support(dev)
@@ -596,6 +614,10 @@ class HardwareProfile:
             device_free_bytes=free_device,
             host_total_bytes=total_host,
             host_available_bytes=available_host,
+            commit_total_bytes=commit.total,
+            commit_available_bytes=commit.available,
+            commit_charges_mappings=commit.charges_mappings,
+            commit_source=commit.source,
             cpu_count=cpu_count,
             device_memory_bandwidth=device_bw,
             host_to_device_pinned_bandwidth=pinned_bw,
@@ -654,6 +676,7 @@ class HardwareProfile:
         self._derive_staging_pool(policy, chosen)
         self._derive_prefix_cache(policy, chosen)
         self._derive_io_workers(policy, chosen)
+        self._derive_shard_mapping(policy, chosen)
         self._derive_window(policy, chosen)
         self._derive_budget_hysteresis(policy, chosen)
         self._derive_dtypes(policy, chosen)
@@ -799,6 +822,57 @@ class HardwareProfile:
             "cpu_count": cpu,
             "measured_by_concurrency": self.storage.get("by_concurrency"),
         }, overrides)
+
+    def _derive_shard_mapping(self, policy, overrides):
+        """How much of the commit limit memory-mapped shard handles may hold, and how many that is.
+
+        Only one platform makes this a question, and it is not a question about the GPU. A shard is
+        read through a memory mapping, and an OS that charges mappings against a commit limit --
+        Windows charges RAM plus page file, whether or not a page is ever touched -- is charged the
+        FULL size of every shard the loader keeps open. A 67GB checkpoint sized on a machine whose
+        commit limit is 18GB therefore dies while merely looking at its own headers, on hardware
+        that streams it perfectly well.
+
+        Nothing here is inferred from the platform: `caps.commit_headroom` asks the OS whether
+        mappings are charged and how much room is left, and where it cannot find out it says so and
+        this budget stays unbounded rather than guessing a limit onto a machine that has none.
+
+        The handle count is what falls out of the budget once a checkpoint's own shard sizes are
+        known, which is the loader's business rather than this one's -- see
+        `LayerLoader._resolve_handle_limit`. What is decided here is the budget, and the floor and
+        ceiling the count is clamped into.
+        """
+        available = self.commit_available_bytes or 0
+        if not self.commit_charges_mappings or not available:
+            # Nothing charges for a mapping, or nothing could be measured. Either way there is no
+            # budget to enforce, and enforcing an invented one would only cost reopens.
+            self._set("shard_mapping_budget_bytes", 0,
+                      "0 (mappings are not charged against a commit limit here, or it could not "
+                      "be measured, so shard handles are not bounded)",
+                      {"commit_charges_mappings": self.commit_charges_mappings,
+                       "commit_available_bytes": self.commit_available_bytes,
+                       "commit_source": self.commit_source}, overrides)
+            self._set("shard_handle_limit", 0,
+                      "0 (unbounded: no commit budget applies)",
+                      {"shard_mapping_budget_bytes": 0}, overrides)
+            return
+
+        budget = int(available * policy.shard_mapping_fraction)
+        self._set("shard_mapping_budget_bytes", budget,
+                  "commit_available_bytes * shard_mapping_fraction",
+                  {"commit_available_bytes": available,
+                   "commit_total_bytes": self.commit_total_bytes,
+                   "shard_mapping_fraction": policy.shard_mapping_fraction,
+                   "commit_source": self.commit_source}, overrides)
+        # A count cannot be derived without the checkpoint, so what is published is the bound the
+        # loader clamps into once it has measured its own shards. Recorded as a knob anyway so an
+        # override reaches it and `rocketllm profile` shows what the loader will be working from.
+        self._set("shard_handle_limit", int(policy.shard_handle_ceiling),
+                  "shard_handle_ceiling, clamped by the loader against the checkpoint's own shard "
+                  "sizes (0 means unbounded)",
+                  {"shard_handle_floor": policy.shard_handle_floor,
+                   "shard_handle_ceiling": policy.shard_handle_ceiling,
+                   "shard_mapping_budget_bytes": budget}, overrides)
 
     def _derive_window(self, policy, overrides):
         """Byte budget for the prefetch window of decoder layers."""
@@ -1074,7 +1148,13 @@ class HardwareProfile:
         derived = {name: Derivation(**value) for name, value in (data.get("derived") or {}).items()}
         data["derived"] = derived
         fields = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in fields})
+        known = {k: v for k, v in data.items() if k in fields}
+        # A record written before a field existed is still readable. The schema version gates
+        # whether a cached profile is REPLAYED at all; this only keeps a hand-written or older
+        # payload from failing to construct, which is what a bug report frequently is.
+        for name in fields - known.keys():
+            known[name] = False if name == "commit_charges_mappings" else None
+        return cls(**known)
 
     # -- caching -------------------------------------------------------------------------------
 
@@ -1186,6 +1266,15 @@ class HardwareProfile:
             f"{_bytes(self.device_free_bytes)} free")
         add(f"    host RAM          {_bytes(self.host_total_bytes)} total, "
             f"{_bytes(self.host_available_bytes)} available")
+        # Reported next to RAM because it is routinely mistaken for it, and the two diverge on the
+        # machines where it matters: a memory mapping is charged against this and not against RAM.
+        if self.commit_available_bytes is None:
+            add(f"    commit headroom   unknown ({self.commit_source})")
+        else:
+            add(f"    commit headroom   {_bytes(self.commit_total_bytes)} limit, "
+                f"{_bytes(self.commit_available_bytes)} available; mappings "
+                f"{'charged' if self.commit_charges_mappings else 'not charged'} "
+                f"({self.commit_source})")
         add(f"    cpu cores         {_fmt(self.cpu_count)}")
 
         add("")

@@ -211,6 +211,12 @@ def _add_serve_parser(subparsers):
     tuning.add_argument("--window-max", type=int, default=None,
                         help="hard cap on decoder layers held in the prefetch window. Default: the "
                              "window budget divided by the largest layer")
+    tuning.add_argument("--shard-handle-limit", default="auto",
+                        help="how many shard files may stay memory-mapped at once: 'auto', "
+                             "'unbounded', or a count. 'auto' bounds them only where the measured "
+                             "commit headroom says holding them all would exhaust it -- a property "
+                             "of the OS's memory accounting rather than of the card. Reads are "
+                             "unaffected either way (default: auto)")
     tuning.add_argument("--pin-policy", choices=["auto", "off"], default="auto",
                         help="'auto' fills the pin budget by bytes-saved-per-resident-byte; 'off' "
                              "pins nothing and streams everything (default: auto)")
@@ -240,6 +246,17 @@ def _add_serve_parser(subparsers):
 
     parser.set_defaults(handler=_run_serve, prefetching=True)
     return parser
+
+
+def _shard_handle_limit(value):
+    """'auto' / 'unbounded' pass through; anything numeric becomes a count."""
+    if value in ("auto", "unbounded"):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"--shard-handle-limit takes 'auto', 'unbounded' or a count, not {value!r}")
 
 
 def _run_serve(args):
@@ -272,6 +289,7 @@ def _run_serve(args):
         host_cache_gb=args.host_cache_gb,
         io_workers=args.io_workers,
         window_max=args.window_max,
+        shard_handle_limit=_shard_handle_limit(args.shard_handle_limit),
         pin_policy=args.pin_policy,
         expert_residency=args.expert_residency,
         kv_cache=args.kv_cache,

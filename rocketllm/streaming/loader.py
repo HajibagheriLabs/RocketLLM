@@ -17,6 +17,7 @@ rated bandwidth because it is latency-bound rather than bandwidth-bound; too man
 slow or rotational device thrash. There is no correct constant for that, which is exactly why it is
 probed.
 """
+import collections
 import dataclasses
 import logging
 import threading
@@ -25,6 +26,8 @@ from pathlib import Path
 
 import torch
 from safetensors import safe_open
+
+from ..hw import caps
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +58,22 @@ def torch_dtype_of(code):
 
 def _align_up(value, to=ALIGNMENT):
     return (value + to - 1) // to * to
+
+
+def _close_handle(handle):
+    """Unmap a shard handle now, rather than whenever the collector gets to it.
+
+    safetensors exposes the release through the context-manager protocol and nothing else, so that
+    is what is called. Measured on Windows: twenty shards totalling 50GB took 7.7GB of commit while
+    open and gave 50GB back the moment this ran, which is the whole mechanism this file relies on.
+    """
+    closer = getattr(handle, "__exit__", None)
+    if closer is None:
+        return
+    try:
+        closer(None, None, None)
+    except Exception:  # noqa: BLE001 - a handle that will not close must not fail a read
+        log.debug("a shard handle did not close cleanly", exc_info=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,23 +141,132 @@ class LoadedLayer:
 
 
 class LayerLoader:
-    """Reads modules out of the split checkpoint into pooled host buffers."""
+    """Reads modules out of the split checkpoint into pooled host buffers.
 
-    def __init__(self, checkpoint_path, pool, profile=None, io_workers=None):
+    One open ``safe_open`` handle per shard used to be kept for the loader's lifetime, on the
+    reasoning that a handle is cheap. It is cheap in file descriptors and it is not cheap in
+    address space: a handle holds the shard MEMORY-MAPPED, and an OS that charges mappings against
+    a commit limit is charged the shard's full size the moment it is opened, touched or not. Sizing
+    a 67GB checkpoint reads every shard's header once, which meant mapping all of it at once -- so
+    the engine died in ``safe_open`` on a machine with an 18GB commit limit while doing nothing but
+    reading headers, having never come close to running out of the memory it actually uses.
+
+    So the cache is bounded when, and only when, the machine says it has to be. See
+    :meth:`_resolve_handle_limit`: the budget comes from measured commit headroom via the hardware
+    profile, the footprint from this checkpoint's own shards, and where the two allow it every
+    handle stays open exactly as before.
+    """
+
+    #: Handle-limit settings other than a plain count.
+    AUTO = "auto"
+    UNBOUNDED = "unbounded"
+
+    def __init__(self, checkpoint_path, pool, profile=None, io_workers=None,
+                 shard_handle_limit=AUTO):
         self.checkpoint_path = Path(checkpoint_path)
         self.pool = pool
         self.io_workers = self._resolve_workers(profile, io_workers)
         self._executor = (ThreadPoolExecutor(max_workers=self.io_workers,
                                              thread_name_prefix="rocketllm-io")
                           if self.io_workers > 1 else None)
+        self.handle_limit, self.handle_mode, self.handle_reason = self._resolve_handle_limit(
+            profile, shard_handle_limit)
+        #: Handles per reader thread. Zero means unbounded; otherwise the total is shared out, so
+        #: the bound holds across the pool rather than being applied to each worker separately.
+        self._per_thread_limit = (0 if self.handle_limit <= 0
+                                  else max(1, self.handle_limit // max(1, self.io_workers)))
+        if self._per_thread_limit:
+            # A reader cannot hold fewer than the one handle it is reading through, so a limit
+            # below the worker count cannot be met. Publish what will actually be held rather than
+            # what was asked for: this number goes into the report, and a bound that is quietly
+            # exceeded is worse than one that is honestly larger.
+            effective = self._per_thread_limit * self.io_workers
+            if effective != self.handle_limit:
+                self.handle_reason += (f" (raised from {self.handle_limit} to {effective}: "
+                                       f"{self.io_workers} readers cannot share fewer)")
+                self.handle_limit = effective
         # safetensors handles are cheap but not documented as thread-safe, so each worker opens its
         # own rather than sharing one across the pool. Every one of them is also recorded centrally,
         # because thread-local state is not reachable from the thread that shuts the loader down.
         self._local = threading.local()
-        self._handles = []
+        self._handles = set()
         self._handles_lock = threading.Lock()
         self.reads = 0
         self.bytes_read = 0
+        self.handle_opens = 0
+        self.handle_evictions = 0
+        if self.handle_mode == "bounded":
+            caps.announce_once(
+                "shard-handle-bound",
+                f"holding at most {self.handle_limit} shard file(s) mapped at a time "
+                f"({self._per_thread_limit} per reader): {self.handle_reason}. Reads are "
+                f"unaffected; a shard is reopened when it comes round again.", logging.INFO)
+
+    # -- how many shards may stay mapped ---------------------------------------------------------
+
+    def checkpoint_bytes(self):
+        """What this checkpoint would cost to hold mapped in its entirety."""
+        try:
+            return sum(path.stat().st_size for path in self.checkpoint_path.glob("*.safetensors"))
+        except OSError:
+            return 0
+
+    def largest_shard_bytes(self):
+        try:
+            return max((path.stat().st_size
+                        for path in self.checkpoint_path.glob("*.safetensors")), default=0)
+        except OSError:
+            return 0
+
+    def _resolve_handle_limit(self, profile, setting):
+        """``(limit, mode, why)``. A limit of 0 means every handle stays open.
+
+        The decision is a comparison of two measured numbers -- what the checkpoint would cost to
+        keep mapped, against what this machine will let the process charge -- and never a platform
+        test. A machine that does not charge for mappings publishes no budget, so this returns
+        unbounded there without knowing or caring which machine it is.
+        """
+        if isinstance(setting, str):
+            if setting == self.UNBOUNDED:
+                return 0, "unbounded", "requested explicitly"
+            if setting != self.AUTO:
+                raise ValueError(
+                    f"shard_handle_limit must be {self.AUTO!r}, {self.UNBOUNDED!r} or an integer, "
+                    f"not {setting!r}")
+        elif setting is not None:
+            limit = int(setting)
+            if limit <= 0:
+                return 0, "unbounded", "requested explicitly"
+            return limit, "bounded", f"requested explicitly ({limit})"
+
+        budget = 0
+        floor, ceiling = 2, 4
+        if profile is not None:
+            derivation = profile.derived.get("shard_mapping_budget_bytes")
+            if derivation is not None:
+                budget = max(0, int(derivation.value))
+            inputs = getattr(profile.derived.get("shard_handle_limit"), "inputs", None) or {}
+            floor = int(inputs.get("shard_handle_floor", floor))
+            ceiling = int(inputs.get("shard_handle_ceiling", ceiling))
+        if budget <= 0:
+            return 0, "unbounded", ("this machine does not charge memory mappings against a commit "
+                                    "limit, or it could not be measured")
+
+        footprint = self.checkpoint_bytes()
+        if footprint <= budget:
+            # Includes a footprint of zero, which means the shards could not be measured or are not
+            # there yet. Bounding on the strength of a number we do not have would trade a real
+            # cost -- reopening a shard per layer -- for a risk we have no evidence of.
+            return 0, "unbounded", (f"the whole checkpoint ({footprint / 1024 ** 3:.1f}GB) fits in "
+                                    f"the {budget / 1024 ** 3:.1f}GB that may be held mapped")
+
+        largest = self.largest_shard_bytes()
+        affordable = int(budget // largest) if largest else ceiling
+        limit = max(floor, min(ceiling, affordable))
+        return limit, "bounded", (
+            f"the checkpoint would cost {footprint / 1024 ** 3:.1f}GB held mapped against a "
+            f"{budget / 1024 ** 3:.1f}GB budget, and the largest shard is "
+            f"{largest / 1024 ** 3:.2f}GB")
 
     @staticmethod
     def _resolve_workers(profile, override):
@@ -155,15 +283,38 @@ class LayerLoader:
         return self.checkpoint_path / (layer_name + ".safetensors")
 
     def _open(self, layer_name):
+        """A handle for this shard, opening it if the calling thread does not already hold one.
+
+        Least-recently-used order, and eviction closes the handle rather than dropping the
+        reference: an unmapped section is what gives the commit charge back, and waiting for the
+        collector to notice defeats the point of bounding this at all.
+
+        Per thread, never shared. Evicting is therefore safe without any coordination -- a handle
+        can only be evicted by the thread that owns it, which is not inside a read when it does so.
+        Every read copies out of the mapping before returning, so nothing outlives the handle.
+        """
         handles = getattr(self._local, "handles", None)
         if handles is None:
-            handles = self._local.handles = {}
+            handles = self._local.handles = collections.OrderedDict()
         path = str(self.shard_path(layer_name))
+
         handle = handles.get(path)
-        if handle is None:
-            handle = handles[path] = safe_open(path, framework="pt")
+        if handle is not None:
+            handles.move_to_end(path)
+            return handle
+
+        handle = safe_open(path, framework="pt")
+        handles[path] = handle
+        with self._handles_lock:
+            self._handles.add(handle)
+            self.handle_opens += 1
+
+        while self._per_thread_limit and len(handles) > self._per_thread_limit:
+            _, evicted = handles.popitem(last=False)
             with self._handles_lock:
-                self._handles.append(handle)
+                self._handles.discard(evicted)
+                self.handle_evictions += 1
+            _close_handle(evicted)
         return handle
 
     # -- planning ------------------------------------------------------------------------------
@@ -244,6 +395,12 @@ class LayerLoader:
             "io_workers": self.io_workers,
             "reads": self.reads,
             "bytes_read": self.bytes_read,
+            # Reported because a bounded run reopens shards, and "why is this slower than the same
+            # model on the other box" is answered by these three numbers and nothing else.
+            "shard_handle_mode": self.handle_mode,
+            "shard_handle_limit": self.handle_limit,
+            "shard_handle_opens": self.handle_opens,
+            "shard_handle_evictions": self.handle_evictions,
         }
 
     def close(self):
@@ -255,14 +412,9 @@ class LayerLoader:
         # shard mapped, which on Windows means the file cannot be deleted while the loader lives.
         # Waiting for the garbage collector to notice is not good enough for either.
         with self._handles_lock:
-            handles, self._handles = self._handles, []
+            handles, self._handles = self._handles, set()
         for handle in handles:
-            closer = getattr(handle, "__exit__", None)
-            if closer is not None:
-                try:
-                    closer(None, None, None)
-                except Exception:  # noqa: BLE001 - shutting down; a stuck handle must not propagate
-                    pass
+            _close_handle(handle)
         self._local = threading.local()
 
     def __enter__(self):

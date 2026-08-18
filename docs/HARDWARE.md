@@ -37,6 +37,7 @@ token and a per-layer notice would bury the console.
 | Native fp4 | An fp4 tensor is allocated | 4-bit formats are dequantized before the matmul | This is the usual path. Native fp4 needs CC >= 10.0. |
 | Fused 4-bit matmul | A kernel package imports **and** the device can run it | Packed weights are expanded into a small reusable scratch buffer immediately before the layer runs, and freed after | Extra device memory traffic per layer. Identical numbers. |
 | Pinned host memory | A page-locked host buffer is actually allocated | Pageable staging buffers | The same bytes, transferred more slowly. Running *out* of pinned memory mid-run degrades the same way rather than failing. |
+| Shard handles held open | `caps.commit_headroom()` — the OS's own commit accounting, then psutil, then plain host RAM | A small LRU pool of open shards instead of all of them | Only what stays *mapped* changes; every byte read is the same. On an OS that charges memory mappings against a commit limit, holding one handle per shard charges the whole checkpoint — a 67GB model on an 18GB limit died inside `safe_open` while merely reading headers. Linux under default overcommit charges nothing for a read-only mapping and keeps the fast path. |
 | Async copy streams | A copy stream is created on the backend | The synchronous transfer path | Reads no longer overlap compute, so a streaming pass costs its full time instead of hiding behind the previous layer. |
 | Triton | The `triton` package imports | The PyTorch dequant implementation | Slower dequantization, identical numbers. |
 
